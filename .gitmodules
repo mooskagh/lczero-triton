@@ -1,0 +1,3 @@
+[submodule "lc0"]
+	path = submodules/lc0
+	url = /home/crem/dev/lc0
