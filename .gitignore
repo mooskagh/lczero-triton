@@ -1,1 +1,29 @@
 .juggler/
+
+# Virtual environments.
+.venv/
+venv/
+env/
+
+# Python bytecode and caches.
+__pycache__/
+__cached__/
+*.py[cod]
+*$py.class
+
+# Test, type-checker, linter, and coverage caches.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging outputs.
+build/
+dist/
+*.egg-info/
+
+# Generated lc0ex protobuf bindings.
+src/lc0ex/proto/lc0ex_pb2.py
+src/lc0ex/proto/lc0ex_pb2.pyi
