@@ -1,0 +1,57 @@
+[project]
+name = "lczero-triton"
+version = "0.1.0"
+description = "Triton executable builder and compiler for Lc0 networks"
+requires-python = ">=3.13"
+dependencies = [
+    "protobuf>=7.35.1",
+]
+
+[dependency-groups]
+dev = [
+    "grpcio-tools>=1.83.0",
+    "mypy>=2.3.0",
+    "pytest>=9.1.1",
+    "ruff>=0.16.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lc0ex", "src/lczero_triton"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+extend-exclude = ["src/lc0ex/proto/lc0ex_pb2.py"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812", # Conflicts with the formatter.
+    "D203",   # Use D211: no blank line before class docstrings.
+    "D213",   # Use D212: summary starts on the first docstring line.
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101", # Assertions are the idiomatic pytest API.
+]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["src", "tests"]
+enable_error_code = [
+    "explicit-override",
+    "ignore-without-code",
+    "redundant-expr",
+]
+warn_unreachable = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers"]
+testpaths = ["tests"]
