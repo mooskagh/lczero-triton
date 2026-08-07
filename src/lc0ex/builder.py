@@ -13,16 +13,20 @@ class ExecutableBuilder:
         """Initialize a builder containing an empty executable."""
         self._executable = lc0ex_pb2.NeuralExecutable()
 
-    @property
-    def executable(self) -> lc0ex_pb2.NeuralExecutable:
+    def build(self) -> lc0ex_pb2.NeuralExecutable:
         """Return the executable being built."""
         return self._executable
 
-    def write_to_file(self, path: str | PathLike[str]) -> None:
-        """Serialize the executable to *path*.
+    def build_and_write(
+        self,
+        path: str | PathLike[str],
+    ) -> lc0ex_pb2.NeuralExecutable:
+        """Build the executable, serialize it to *path*, and return it.
 
         Raises:
             google.protobuf.message.EncodeError: If required fields are unset.
 
         """
-        Path(path).write_bytes(self._executable.SerializeToString())
+        executable = self.build()
+        Path(path).write_bytes(executable.SerializeToString())
+        return executable
