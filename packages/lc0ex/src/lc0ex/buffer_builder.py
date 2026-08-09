@@ -22,7 +22,7 @@ def data_type_size_bytes(dtype: lc0ex_pb2.Buffer.DataType) -> int:
     """Return the size in bytes of one value of *dtype*.
 
     Raises:
-        ValueError: If *dtype* is not a supported concrete data type.
+        KeyError: If *dtype* is not a supported concrete data type.
 
     """
     sizes = {
@@ -32,11 +32,7 @@ def data_type_size_bytes(dtype: lc0ex_pb2.Buffer.DataType) -> int:
         lc0ex_pb2.Buffer.DATA_TYPE_U64: 8,
         lc0ex_pb2.Buffer.DATA_TYPE_BF16: 2,
     }
-    try:
-        return sizes[dtype]
-    except KeyError as error:
-        message = f"unsupported buffer data type: {dtype}"
-        raise ValueError(message) from error
+    return sizes[dtype]
 
 
 class PersistentBufferBuilder:
@@ -73,14 +69,13 @@ class PersistentBufferBuilder:
         if normalized_shape is None or dtype is None:
             message = f"shape and data type are required for new buffer {name!r}"
             raise ValueError(message)
-        if any(dimension < 0 for dimension in normalized_shape):
-            message = "buffer dimensions cannot be negative"
-            raise ValueError(message)
-        data_type_size_bytes(dtype)
-
         result = Buffer(name=name, shape=normalized_shape, dtype=dtype)
         self._buffers[name] = result
         return result
+
+    def owns(self, buffer: Buffer) -> bool:
+        """Return whether *buffer* is a handle created by this collection."""
+        return self._buffers.get(buffer.name) is buffer
 
     def build(self, executable: lc0ex_pb2.NeuralExecutable) -> None:
         """Append the collected buffers and their allocation to *executable*."""

@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 from google.protobuf.message import EncodeError
-
 from lc0ex import Buffer, ExecutableBuilder
 from lc0ex.buffer_builder import data_type_size_bytes
 from lc0ex.proto import lc0ex_pb2
@@ -86,7 +85,7 @@ def test_data_type_size_bytes(
 
 def test_data_type_size_bytes_rejects_unknown_type() -> None:
     """The unknown data type has no element size."""
-    with pytest.raises(ValueError, match="unsupported buffer data type"):
+    with pytest.raises(KeyError):
         data_type_size_bytes(lc0ex_pb2.Buffer.DATA_TYPE_UNKNOWN)
 
 
@@ -125,22 +124,25 @@ def test_buffer_reuses_existing_handle() -> None:
         (None, None, "shape and data type are required"),
         ((2, 3), None, "shape and data type are required"),
         (None, lc0ex_pb2.Buffer.DATA_TYPE_F16, "shape and data type are required"),
-        ((2, -1), lc0ex_pb2.Buffer.DATA_TYPE_F16, "cannot be negative"),
-        (
-            (2, 3),
-            lc0ex_pb2.Buffer.DATA_TYPE_UNKNOWN,
-            "unsupported buffer data type",
-        ),
     ],
 )
-def test_new_buffer_rejects_invalid_definition(
+def test_new_buffer_requires_complete_definition(
     shape: tuple[int, ...] | None,
     dtype: lc0ex_pb2.Buffer.DataType | None,
     message: str,
 ) -> None:
-    """A new buffer requires a complete, valid definition."""
+    """A new buffer requires a complete definition."""
     with pytest.raises(ValueError, match=message):
         ExecutableBuilder().buffer("weights", shape, dtype)
+
+
+def test_unknown_buffer_type_fails_when_building() -> None:
+    """An unknown data type fails when its allocation size is needed."""
+    builder = ExecutableBuilder()
+    builder.buffer("weights", (2, 3), lc0ex_pb2.Buffer.DATA_TYPE_UNKNOWN)
+
+    with pytest.raises(KeyError):
+        builder.build()
 
 
 def test_existing_buffer_rejects_mismatched_definition() -> None:

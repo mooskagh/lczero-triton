@@ -22,8 +22,9 @@ htmlcov/
 # Build and packaging outputs.
 build/
 dist/
+modules/
 *.egg-info/
 
-# Generated lc0ex protobuf bindings.
-src/lc0ex/proto/lc0ex_pb2.py
-src/lc0ex/proto/lc0ex_pb2.pyi
+# Generated protobuf bindings.
+packages/lc0ex/src/*_pb2.py
+packages/lc0ex/src/*_pb2.pyi

@@ -1,11 +1,9 @@
 [project]
-name = "lczero-triton"
+name = "lczero-triton-workspace"
 version = "0.1.0"
-description = "Triton executable builder and compiler for Lc0 networks"
+description = "Workspace for Lc0 graph construction and Triton kernel compilation"
 requires-python = ">=3.13"
-dependencies = [
-    "protobuf>=7.35.1",
-]
+dependencies = []
 
 [dependency-groups]
 dev = [
@@ -16,17 +14,22 @@ dev = [
     "types-protobuf>=7.34.1.20260518",
 ]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[tool.uv.workspace]
+members = [
+    "packages/lc0ex",
+    "packages/lczero-triton",
+]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/lc0ex", "src/lczero_triton"]
+[tool.uv]
+package = false
 
 [tool.ruff]
 line-length = 88
 target-version = "py313"
-extend-exclude = ["src/lc0ex/proto/lc0ex_pb2.py"]
+extend-exclude = [
+    "packages/lc0ex/src/*_pb2.py",
+    "packages/lczero-triton/typings",
+]
 
 [tool.ruff.lint]
 select = ["ALL"]
@@ -38,14 +41,22 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = [
+"packages/lc0ex/src/lc0ex/triton_module_compiler.py" = [
+    "ANN401", # Triton's compiled-kernel API is intentionally unchecked.
+]
+"packages/**/tests/**/*.py" = [
     "S101", # Assertions are the idiomatic pytest API.
+    "INP001", # Test directories are discovered by pytest.
+]
+"packages/lczero-triton/src/lczero_triton/kernels/**/*.py" = [
+    "PLR0913", # Triton kernels expose their explicit device ABI.
+    "PLR0917", # Triton kernels expose their explicit device ABI.
 ]
 
 [tool.mypy]
 python_version = "3.13"
 strict = true
-files = ["src", "tests"]
+files = ["packages"]
 enable_error_code = [
     "explicit-override",
     "ignore-without-code",
@@ -55,9 +66,22 @@ warn_unreachable = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = "lc0ex.proto.lc0ex_pb2"
+module = ["lczero_triton.kernels.matmul"]
+disable_error_code = [
+    "import-untyped", # Triton does not provide typing information.
+    "untyped-decorator", # Triton's decorators consequently remain untyped.
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "lc0ex_pb2",
+    "module_manifest_pb2",
+]
 disable_error_code = ["type-arg"] # grpcio-tools emits bare Mapping types.
 
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers"]
-testpaths = ["tests"]
+testpaths = [
+    "packages/lc0ex/tests",
+    "packages/lczero-triton/tests",
+]
