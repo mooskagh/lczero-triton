@@ -6,7 +6,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Self
 
-from lc0ex.buffer_builder import Buffer, PersistentBufferBuilder
+from lc0ex.buffer_builder import Buffer, BufferBuilder
 from lc0ex.kernel_builder import KernelArtifact
 from lc0ex.module_loader import load_module
 from lc0ex.proto import lc0ex_pb2
@@ -32,7 +32,7 @@ class ExecutableBuilder:
     def __init__(self) -> None:
         """Initialize an empty executable builder."""
         self._target: tuple[lc0ex_pb2.Target.Vendor, str] | None = None
-        self._buffers = PersistentBufferBuilder()
+        self._buffers = BufferBuilder()
         self._kernels: dict[str, KernelArtifact] = {}
         self._invocations: list[_KernelInvocation] = []
 
@@ -44,6 +44,14 @@ class ExecutableBuilder:
     ) -> Buffer:
         """Create or retrieve a persistent logical buffer."""
         return self._buffers.buffer(name, shape, dtype)
+
+    def tmp_buffer(
+        self,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+    ) -> Buffer:
+        """Create an execution-lifetime temporary logical buffer."""
+        return self._buffers.tmp_buffer(shape, dtype)
 
     def set_target(
         self,
@@ -138,9 +146,9 @@ class ExecutableBuilder:
             vendor, architecture = self._target
             executable.target.vendor = vendor
             executable.target.architecture = architecture
-        self._buffers.build(executable)
+        temporary_conflicts = self._build_invocations(executable)
+        self._buffers.build(executable, temporary_conflicts)
         self._build_kernels(executable)
-        self._build_invocations(executable)
         return executable
 
     def build_and_write(
@@ -177,45 +185,33 @@ class ExecutableBuilder:
                 parameters=artifact.parameters,
             )
 
-    def _build_invocations(self, executable: lc0ex_pb2.NeuralExecutable) -> None:
-        """Append the invocation program."""
-        if not self._invocations:
-            return
-
-        program = executable.programs.add(name=_PROGRAM_NAME)
+    def _build_invocations(
+        self,
+        executable: lc0ex_pb2.NeuralExecutable,
+    ) -> dict[Buffer, set[Buffer]]:
+        """Append the invocation program and return temporary buffer conflicts."""
         latest_writer: dict[Buffer, int] = {}
         readers: dict[Buffer, set[int]] = {}
         ancestors: list[int] = []
+        accesses: dict[Buffer, set[int]] = {}
+
+        if not self._invocations:
+            return self._temporary_conflicts(accesses, ancestors)
+
+        program = executable.programs.add(name=_PROGRAM_NAME)
 
         for index, invocation in enumerate(self._invocations):
             artifact = self._kernels[invocation.kernel]
-            dependencies: set[int] = set()
             for buffer in set(invocation.arguments):
-                if buffer in invocation.readonly:
-                    writer = latest_writer.get(buffer)
-                    if writer is not None:
-                        dependencies.add(writer)
-                    readers.setdefault(buffer, set()).add(index)
-                    continue
-
-                writer = latest_writer.get(buffer)
-                if writer is not None:
-                    dependencies.add(writer)
-                dependencies.update(readers.get(buffer, set()))
-                latest_writer[buffer] = index
-                readers[buffer] = set()
-
-            reduced_dependencies: list[int] = []
-            covered_ancestors = 0
-            for dependency in sorted(dependencies, reverse=True):
-                if covered_ancestors & (1 << dependency):
-                    continue
-                reduced_dependencies.append(dependency)
-                covered_ancestors |= ancestors[dependency] | (1 << dependency)
-            reduced_dependencies.reverse()
-            ancestor_mask = 0
-            for dependency in reduced_dependencies:
-                ancestor_mask |= ancestors[dependency] | (1 << dependency)
+                if self._buffers.is_temporary(buffer):
+                    accesses.setdefault(buffer, set()).add(index)
+            reduced_dependencies, ancestor_mask = self._invocation_dependencies(
+                invocation,
+                index,
+                latest_writer,
+                readers,
+                ancestors,
+            )
             ancestors.append(ancestor_mask)
 
             program.nodes.add(
@@ -230,3 +226,71 @@ class ExecutableBuilder:
                 block=artifact.block,
                 dynamic_shared_memory_bytes=artifact.dynamic_shared_memory_bytes,
             )
+
+        return self._temporary_conflicts(accesses, ancestors)
+
+    def _invocation_dependencies(
+        self,
+        invocation: _KernelInvocation,
+        index: int,
+        latest_writer: dict[Buffer, int],
+        readers: dict[Buffer, set[int]],
+        ancestors: list[int],
+    ) -> tuple[list[int], int]:
+        """Update access hazards and return reduced dependencies for one node."""
+        dependencies: set[int] = set()
+        for buffer in set(invocation.arguments):
+            if buffer in invocation.readonly:
+                writer = latest_writer.get(buffer)
+                if writer is not None:
+                    dependencies.add(writer)
+                readers.setdefault(buffer, set()).add(index)
+                continue
+
+            writer = latest_writer.get(buffer)
+            if writer is not None:
+                dependencies.add(writer)
+            dependencies.update(readers.get(buffer, set()))
+            latest_writer[buffer] = index
+            readers[buffer] = set()
+
+        reduced_dependencies: list[int] = []
+        covered_ancestors = 0
+        for dependency in sorted(dependencies, reverse=True):
+            if covered_ancestors & (1 << dependency):
+                continue
+            reduced_dependencies.append(dependency)
+            covered_ancestors |= ancestors[dependency] | (1 << dependency)
+        reduced_dependencies.reverse()
+        ancestor_mask = 0
+        for dependency in reduced_dependencies:
+            ancestor_mask |= ancestors[dependency] | (1 << dependency)
+        return reduced_dependencies, ancestor_mask
+
+    def _temporary_conflicts(
+        self,
+        accesses: dict[Buffer, set[int]],
+        ancestors: list[int],
+    ) -> dict[Buffer, set[Buffer]]:
+        """Return temporary-buffer pairs whose accesses can overlap."""
+        buffers = list(accesses)
+        conflicts: dict[Buffer, set[Buffer]] = {
+            buffer: set() for buffer in self._buffers.temporary_buffers()
+        }
+        for first_index, first in enumerate(buffers):
+            for second in buffers[first_index + 1 :]:
+                first_before_second = all(
+                    ancestors[second_access] & (1 << first_access)
+                    for first_access in accesses[first]
+                    for second_access in accesses[second]
+                )
+                second_before_first = all(
+                    ancestors[first_access] & (1 << second_access)
+                    for first_access in accesses[first]
+                    for second_access in accesses[second]
+                )
+                if first_before_second or second_before_first:
+                    continue
+                conflicts[first].add(second)
+                conflicts[second].add(first)
+        return conflicts

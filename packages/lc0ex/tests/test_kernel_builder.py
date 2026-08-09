@@ -7,6 +7,8 @@ from lc0ex.proto import lc0ex_pb2
 TARGET_ARCHITECTURE = "sm_80"
 DYNAMIC_SHARED_MEMORY_BYTES = 256
 EXPECTED_CALL_COUNT = 2
+TEMPORARY_BUFFER_SIZE_BYTES = 8
+TWO_TEMPORARY_BUFFER_SIZE_BYTES = 16
 F16 = lc0ex_pb2.Buffer.DATA_TYPE_F16
 POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
 
@@ -166,6 +168,65 @@ def test_dependencies_are_reduced_across_buffers() -> None:
 
     assert list(nodes[1].dependencies) == ["node_0"]
     assert list(nodes[2].dependencies) == ["node_1"]
+
+
+def test_sequential_temporary_buffers_reuse_one_allocation_range() -> None:
+    """Temporaries whose accesses are ordered by the graph share storage."""
+    builder = _builder()
+    builder.add_kernel("access", _artifact(parameters=(POINTER, POINTER)))
+    first = builder.tmp_buffer((4,), F16)
+    second = builder.tmp_buffer((4,), F16)
+    bridge = builder.buffer("bridge", (1,), F16)
+    builder.call("access", first, bridge)
+    builder.call("access", bridge, second, readonly=(bridge,))
+
+    executable = builder.build()
+    buffers = {buffer.name: buffer for buffer in executable.buffers}
+
+    assert executable.allocations[-1].name == "execution"
+    assert executable.allocations[-1].size_bytes == TEMPORARY_BUFFER_SIZE_BYTES
+    assert buffers[first.name].allocation_block.offset_bytes == 0
+    assert buffers[second.name].allocation_block.offset_bytes == 0
+    assert list(executable.programs[0].nodes[1].dependencies) == ["node_0"]
+
+
+def test_independent_temporary_buffers_do_not_reuse_storage() -> None:
+    """Independent nodes may execute concurrently and therefore cannot alias."""
+    builder = _builder()
+    builder.add_kernel("access", _artifact(parameters=(POINTER,)))
+    first = builder.tmp_buffer((4,), F16)
+    second = builder.tmp_buffer((4,), F16)
+    builder.call("access", first)
+    builder.call("access", second)
+
+    executable = builder.build()
+    buffers = {buffer.name: buffer for buffer in executable.buffers}
+
+    assert executable.allocations[0].name == "execution"
+    assert executable.allocations[0].size_bytes == TWO_TEMPORARY_BUFFER_SIZE_BYTES
+    assert buffers[first.name].allocation_block.offset_bytes == 0
+    assert (
+        buffers[second.name].allocation_block.offset_bytes
+        == TEMPORARY_BUFFER_SIZE_BYTES
+    )
+    assert not executable.programs[0].nodes[1].dependencies
+
+
+def test_temporary_buffers_used_by_one_node_do_not_reuse_storage() -> None:
+    """Buffers accessed by the same invocation have overlapping lifetimes."""
+    builder = _builder()
+    builder.add_kernel("access", _artifact(parameters=(POINTER, POINTER)))
+    first = builder.tmp_buffer((4,), F16)
+    second = builder.tmp_buffer((4,), F16)
+    builder.call("access", first, second)
+
+    executable = builder.build()
+    buffers = {buffer.name: buffer for buffer in executable.buffers}
+
+    assert executable.allocations[0].size_bytes == TWO_TEMPORARY_BUFFER_SIZE_BYTES
+    assert buffers[first.name].allocation_block.offset_bytes != (
+        buffers[second.name].allocation_block.offset_bytes
+    )
 
 
 def test_unused_registered_kernel_is_serialized() -> None:

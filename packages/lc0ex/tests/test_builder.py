@@ -12,6 +12,8 @@ EXPECTED_MAGIC = 0x1C0E
 EXPECTED_FORMAT = 1
 EXPECTED_PERSISTENT_SIZE = 36
 EXPECTED_PERSISTENT_ALIGNMENT = 8
+EXPECTED_EXECUTION_SIZE = 4
+EXPECTED_EXECUTION_ALIGNMENT = 2
 TARGET_ARCHITECTURE = "sm_80"
 
 
@@ -118,6 +120,20 @@ def test_buffer_reuses_existing_handle() -> None:
     assert builder.buffer("weights", (2, 3), lc0ex_pb2.Buffer.DATA_TYPE_F16) is original
 
 
+def test_tmp_buffer_generates_unique_names() -> None:
+    """Temporary buffers receive generated names from the shared namespace."""
+    builder = ExecutableBuilder()
+    builder.buffer("tmp_0", (1,), lc0ex_pb2.Buffer.DATA_TYPE_U8)
+
+    first = builder.tmp_buffer((2,), lc0ex_pb2.Buffer.DATA_TYPE_F16)
+    second = builder.tmp_buffer((3,), lc0ex_pb2.Buffer.DATA_TYPE_F32)
+
+    assert first.name == "tmp_1"
+    assert second.name == "tmp_2"
+    assert first.shape == (2,)
+    assert second.dtype == lc0ex_pb2.Buffer.DATA_TYPE_F32
+
+
 @pytest.mark.parametrize(
     ("shape", "dtype", "message"),
     [
@@ -205,6 +221,31 @@ def test_build_without_buffers_has_no_allocation() -> None:
 
     assert not executable.allocations
     assert not executable.buffers
+
+
+def test_build_places_temporary_buffers_in_execution_allocation() -> None:
+    """Temporary buffers use an execution-lifetime allocation."""
+    builder = ExecutableBuilder()
+    first = builder.tmp_buffer((3,), lc0ex_pb2.Buffer.DATA_TYPE_U8)
+    second = builder.tmp_buffer((2,), lc0ex_pb2.Buffer.DATA_TYPE_F16)
+
+    executable = builder.build()
+
+    assert len(executable.allocations) == 1
+    allocation = executable.allocations[0]
+    assert allocation.name == "execution"
+    assert allocation.size_bytes == EXPECTED_EXECUTION_SIZE
+    assert allocation.alignment_bytes == EXPECTED_EXECUTION_ALIGNMENT
+    assert allocation.lifetime == lc0ex_pb2.Allocation.LIFETIME_EXECUTION
+    assert [buffer.name for buffer in executable.buffers] == [first.name, second.name]
+    assert [buffer.allocation_block.allocation for buffer in executable.buffers] == [
+        "execution",
+        "execution",
+    ]
+    assert [buffer.allocation_block.offset_bytes for buffer in executable.buffers] == [
+        0,
+        0,
+    ]
 
 
 def test_repeated_builds_have_independent_buffer_messages() -> None:
