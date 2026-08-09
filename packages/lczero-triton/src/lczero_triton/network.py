@@ -24,5 +24,5 @@ def build_matmul_graph(
     """Append the statically shaped matmul graph to *builder*."""
     a = builder.buffer("a", (m, k), _F16)
     b = builder.buffer("b", (k, n), _F16)
-    c = builder.buffer("c", (m, n), _F16)
+    c = builder.buffer("c", (m, n), _F16, writable=True)
     builder.call(matmul_kernel_name(m, n, k), a, b, c, readonly=(a, b))

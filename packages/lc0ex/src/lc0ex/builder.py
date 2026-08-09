@@ -33,6 +33,7 @@ class ExecutableBuilder:
         """Initialize an empty executable builder."""
         self._target: tuple[lc0ex_pb2.Target.Vendor, str] | None = None
         self._buffers = BufferBuilder()
+        self._writable_buffers: set[Buffer] = set()
         self._kernels: dict[str, KernelArtifact] = {}
         self._invocations: list[_KernelInvocation] = []
 
@@ -41,9 +42,18 @@ class ExecutableBuilder:
         name: str,
         shape: Sequence[int] | None = None,
         dtype: lc0ex_pb2.Buffer.DataType | None = None,
+        *,
+        writable: bool = False,
     ) -> Buffer:
-        """Create or retrieve a persistent logical buffer."""
-        return self._buffers.buffer(name, shape, dtype)
+        """Create or retrieve a persistent logical buffer.
+
+        Persistent buffers are read-only by default. Passing ``writable=True``
+        permits calls that use the buffer to write to it.
+        """
+        buffer = self._buffers.buffer(name, shape, dtype)
+        if writable:
+            self._writable_buffers.add(buffer)
+        return buffer
 
     def tmp_buffer(
         self,
@@ -135,7 +145,15 @@ class ExecutableBuilder:
                 name=f"node_{len(self._invocations)}",
                 kernel=kernel,
                 arguments=arguments,
-                readonly=frozenset(readonly),
+                readonly=frozenset(
+                    set(readonly)
+                    | {
+                        argument
+                        for argument in arguments
+                        if not self._buffers.is_temporary(argument)
+                        and argument not in self._writable_buffers
+                    },
+                ),
             ),
         )
 

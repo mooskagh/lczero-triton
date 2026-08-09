@@ -112,11 +112,25 @@ def test_readonly_calls_to_same_buffer_have_no_dependency() -> None:
     assert not nodes[1].dependencies
 
 
+def test_persistent_buffers_are_readonly_by_default() -> None:
+    """Persistent buffers are read-only unless declared writable."""
+    builder = _builder()
+    builder.add_kernel("read", _artifact(parameters=(POINTER,)))
+    buffer = builder.buffer("buffer", (1,), F16)
+    builder.call("read", buffer)
+    builder.call("read", buffer)
+
+    nodes = builder.build().programs[0].nodes
+
+    assert not nodes[0].dependencies
+    assert not nodes[1].dependencies
+
+
 def test_readonly_call_depends_on_previous_writer() -> None:
     """A reader waits for the most recent writer of its buffer."""
     builder = _builder()
     builder.add_kernel("access", _artifact(parameters=(POINTER,)))
-    buffer = builder.buffer("buffer", (1,), F16)
+    buffer = builder.buffer("buffer", (1,), F16, writable=True)
     builder.call("access", buffer)
     builder.call("access", buffer, readonly=(buffer,))
 
@@ -129,7 +143,7 @@ def test_writer_depends_on_all_readers_since_previous_write() -> None:
     """A writer waits for every outstanding read of its buffer."""
     builder = _builder()
     builder.add_kernel("access", _artifact(parameters=(POINTER,)))
-    buffer = builder.buffer("buffer", (1,), F16)
+    buffer = builder.buffer("buffer", (1,), F16, writable=True)
     builder.call("access", buffer, readonly=(buffer,))
     builder.call("access", buffer, readonly=(buffer,))
     builder.call("access", buffer)
@@ -143,7 +157,7 @@ def test_redundant_transitive_dependencies_are_removed() -> None:
     """A dependency implied through another dependency is not emitted."""
     builder = _builder()
     builder.add_kernel("access", _artifact(parameters=(POINTER,)))
-    buffer = builder.buffer("buffer", (1,), F16)
+    buffer = builder.buffer("buffer", (1,), F16, writable=True)
     builder.call("access", buffer)
     builder.call("access", buffer, readonly=(buffer,))
     builder.call("access", buffer)
@@ -158,8 +172,8 @@ def test_dependencies_are_reduced_across_buffers() -> None:
     """Reduction removes dependencies implied through another buffer's writer."""
     builder = _builder()
     builder.add_kernel("access", _artifact(parameters=(POINTER, POINTER)))
-    first = builder.buffer("first", (1,), F16)
-    second = builder.buffer("second", (1,), F16)
+    first = builder.buffer("first", (1,), F16, writable=True)
+    second = builder.buffer("second", (1,), F16, writable=True)
     builder.call("access", first, second, readonly=(second,))
     builder.call("access", first, second, readonly=(first,))
     builder.call("access", first, second)
@@ -176,7 +190,7 @@ def test_sequential_temporary_buffers_reuse_one_allocation_range() -> None:
     builder.add_kernel("access", _artifact(parameters=(POINTER, POINTER)))
     first = builder.tmp_buffer((4,), F16)
     second = builder.tmp_buffer((4,), F16)
-    bridge = builder.buffer("bridge", (1,), F16)
+    bridge = builder.buffer("bridge", (1,), F16, writable=True)
     builder.call("access", first, bridge)
     builder.call("access", bridge, second, readonly=(bridge,))
 
