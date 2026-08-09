@@ -23,6 +23,7 @@ class _KernelInvocation:
     name: str
     kernel: str
     arguments: tuple[Buffer, ...]
+    readonly: frozenset[Buffer]
 
 
 class ExecutableBuilder:
@@ -93,8 +94,17 @@ class ExecutableBuilder:
         self._kernels[name] = kernel
         return self
 
-    def call(self, kernel: str, *arguments: Buffer) -> None:
-        """Append a call to a registered kernel to the executable graph."""
+    def call(
+        self,
+        kernel: str,
+        *arguments: Buffer,
+        readonly: Sequence[Buffer] = (),
+    ) -> None:
+        """Append a call to a registered kernel to the executable graph.
+
+        Arguments not included in *readonly* are treated as writable. Read-only
+        accesses to the same buffer may execute concurrently.
+        """
         artifact = self._kernels[kernel]
 
         if len(arguments) != len(artifact.parameters):
@@ -103,12 +113,21 @@ class ExecutableBuilder:
         if any(not self._buffers.owns(argument) for argument in arguments):
             message = "kernel arguments must belong to this executable builder"
             raise ValueError(message)
+        if any(not self._buffers.owns(buffer) for buffer in readonly):
+            message = "read-only buffers must belong to this executable builder"
+            raise ValueError(message)
+        if any(
+            not any(buffer is argument for argument in arguments) for buffer in readonly
+        ):
+            message = "read-only buffers must be kernel arguments"
+            raise ValueError(message)
 
         self._invocations.append(
             _KernelInvocation(
                 name=f"node_{len(self._invocations)}",
                 kernel=kernel,
                 arguments=arguments,
+                readonly=frozenset(readonly),
             ),
         )
 
@@ -164,11 +183,48 @@ class ExecutableBuilder:
             return
 
         program = executable.programs.add(name=_PROGRAM_NAME)
-        for invocation in self._invocations:
+        latest_writer: dict[Buffer, int] = {}
+        readers: dict[Buffer, set[int]] = {}
+        ancestors: list[int] = []
+
+        for index, invocation in enumerate(self._invocations):
             artifact = self._kernels[invocation.kernel]
+            dependencies: set[int] = set()
+            for buffer in set(invocation.arguments):
+                if buffer in invocation.readonly:
+                    writer = latest_writer.get(buffer)
+                    if writer is not None:
+                        dependencies.add(writer)
+                    readers.setdefault(buffer, set()).add(index)
+                    continue
+
+                writer = latest_writer.get(buffer)
+                if writer is not None:
+                    dependencies.add(writer)
+                dependencies.update(readers.get(buffer, set()))
+                latest_writer[buffer] = index
+                readers[buffer] = set()
+
+            reduced_dependencies: list[int] = []
+            covered_ancestors = 0
+            for dependency in sorted(dependencies, reverse=True):
+                if covered_ancestors & (1 << dependency):
+                    continue
+                reduced_dependencies.append(dependency)
+                covered_ancestors |= ancestors[dependency] | (1 << dependency)
+            reduced_dependencies.reverse()
+            ancestor_mask = 0
+            for dependency in reduced_dependencies:
+                ancestor_mask |= ancestors[dependency] | (1 << dependency)
+            ancestors.append(ancestor_mask)
+
             program.nodes.add(
                 name=invocation.name,
                 kernel=invocation.kernel,
+                dependencies=[
+                    self._invocations[dependency].name
+                    for dependency in reduced_dependencies
+                ],
                 arguments=[argument.name for argument in invocation.arguments],
                 grid=artifact.grid,
                 block=artifact.block,

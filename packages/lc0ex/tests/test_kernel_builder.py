@@ -96,6 +96,78 @@ def test_repeated_calls_reuse_one_registered_kernel() -> None:
     ]
 
 
+def test_readonly_calls_to_same_buffer_have_no_dependency() -> None:
+    """Read-only accesses to one buffer may run concurrently."""
+    builder = _builder()
+    builder.add_kernel("read", _artifact(parameters=(POINTER,)))
+    buffer = builder.buffer("buffer", (1,), F16)
+    builder.call("read", buffer, readonly=(buffer,))
+    builder.call("read", buffer, readonly=(buffer,))
+
+    nodes = builder.build().programs[0].nodes
+
+    assert not nodes[0].dependencies
+    assert not nodes[1].dependencies
+
+
+def test_readonly_call_depends_on_previous_writer() -> None:
+    """A reader waits for the most recent writer of its buffer."""
+    builder = _builder()
+    builder.add_kernel("access", _artifact(parameters=(POINTER,)))
+    buffer = builder.buffer("buffer", (1,), F16)
+    builder.call("access", buffer)
+    builder.call("access", buffer, readonly=(buffer,))
+
+    nodes = builder.build().programs[0].nodes
+
+    assert list(nodes[1].dependencies) == ["node_0"]
+
+
+def test_writer_depends_on_all_readers_since_previous_write() -> None:
+    """A writer waits for every outstanding read of its buffer."""
+    builder = _builder()
+    builder.add_kernel("access", _artifact(parameters=(POINTER,)))
+    buffer = builder.buffer("buffer", (1,), F16)
+    builder.call("access", buffer, readonly=(buffer,))
+    builder.call("access", buffer, readonly=(buffer,))
+    builder.call("access", buffer)
+
+    nodes = builder.build().programs[0].nodes
+
+    assert list(nodes[2].dependencies) == ["node_0", "node_1"]
+
+
+def test_redundant_transitive_dependencies_are_removed() -> None:
+    """A dependency implied through another dependency is not emitted."""
+    builder = _builder()
+    builder.add_kernel("access", _artifact(parameters=(POINTER,)))
+    buffer = builder.buffer("buffer", (1,), F16)
+    builder.call("access", buffer)
+    builder.call("access", buffer, readonly=(buffer,))
+    builder.call("access", buffer)
+
+    nodes = builder.build().programs[0].nodes
+
+    assert list(nodes[1].dependencies) == ["node_0"]
+    assert list(nodes[2].dependencies) == ["node_1"]
+
+
+def test_dependencies_are_reduced_across_buffers() -> None:
+    """Reduction removes dependencies implied through another buffer's writer."""
+    builder = _builder()
+    builder.add_kernel("access", _artifact(parameters=(POINTER, POINTER)))
+    first = builder.buffer("first", (1,), F16)
+    second = builder.buffer("second", (1,), F16)
+    builder.call("access", first, second, readonly=(second,))
+    builder.call("access", first, second, readonly=(first,))
+    builder.call("access", first, second)
+
+    nodes = builder.build().programs[0].nodes
+
+    assert list(nodes[1].dependencies) == ["node_0"]
+    assert list(nodes[2].dependencies) == ["node_1"]
+
+
 def test_unused_registered_kernel_is_serialized() -> None:
     """Adding a kernel registers it even when no graph node uses it."""
     builder = _builder()
@@ -153,6 +225,28 @@ def test_call_rejects_foreign_buffer_handles() -> None:
 
     with pytest.raises(ValueError, match="belong to this executable builder"):
         builder.call("matmul", *_buffers(foreign))
+
+
+def test_call_rejects_foreign_readonly_buffer() -> None:
+    """Read-only buffers must be owned by the executable builder."""
+    builder = _builder()
+    foreign = _builder()
+    builder.add_kernel("access", _artifact(parameters=(POINTER,)))
+    buffer = builder.buffer("buffer", (1,), F16)
+
+    with pytest.raises(ValueError, match="read-only buffers must belong"):
+        builder.call("access", buffer, readonly=(foreign.buffer("foreign", (1,), F16),))
+
+
+def test_call_rejects_readonly_buffer_not_passed_to_kernel() -> None:
+    """Read-only buffers must be among the invocation arguments."""
+    builder = _builder()
+    builder.add_kernel("access", _artifact(parameters=(POINTER,)))
+    argument = builder.buffer("argument", (1,), F16)
+    readonly = builder.buffer("readonly", (1,), F16)
+
+    with pytest.raises(ValueError, match="read-only buffers must be kernel arguments"):
+        builder.call("access", argument, readonly=(readonly,))
 
 
 def test_call_rejects_abi_argument_count_mismatch() -> None:
