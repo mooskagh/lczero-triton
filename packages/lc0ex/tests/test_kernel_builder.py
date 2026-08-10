@@ -3,7 +3,14 @@
 # ruff: noqa: PLR2004
 
 import pytest
-from lc0ex import Buffer, ExecutableBuilder, KernelArtifact, KernelHandle
+from lc0ex import (
+    Buffer,
+    ExecutableBuilder,
+    KernelArtifact,
+    KernelHandle,
+    SymbolArtifact,
+    SymbolHandle,
+)
 from lc0ex.proto import lc0ex_pb2
 
 F16 = lc0ex_pb2.Buffer.DATA_TYPE_F16
@@ -68,7 +75,7 @@ def test_add_kernel_and_call_serializes_generic_metadata() -> None:
     assert executable.kernels[0].function == "kernel"
     assert list(executable.programs[0].nodes[0].grid) == [2, 3, 1]
     assert [
-        argument.allocation_offset
+        argument.allocation.offset
         for argument in executable.programs[0].nodes[0].arguments
     ] == [0, 0, 0]
 
@@ -118,8 +125,8 @@ def test_ordered_raw_temporaries_reuse_one_range() -> None:
 
     assert executable.allocations[0].size_bytes == 64
     assert (
-        nodes[0].arguments[0].allocation_offset
-        == nodes[1].arguments[1].allocation_offset
+        nodes[0].arguments[0].allocation.offset
+        == nodes[1].arguments[1].allocation.offset
     )
     assert list(nodes[1].dependencies) == [0]
 
@@ -162,3 +169,27 @@ def test_add_kernel_deduplicates_identical_artifacts() -> None:
 
     assert isinstance(first, KernelHandle)
     assert second is first
+
+
+def test_symbol_argument_serializes_as_immutable_module_pointer() -> None:
+    """A module symbol is a pointer argument, not a callable graph node."""
+    builder = _builder()
+    kernel = builder.add_kernel(_artifact(parameters=(POINTER, POINTER)))
+    output = _external(builder, "output", writable=True)
+    symbol = builder.add_symbol(
+        SymbolArtifact(
+            binary_format=lc0ex_pb2.Binary.FORMAT_CUBIN,
+            binary_data=b"fake cubin",
+            symbol_name="mapping_table",
+        )
+    )
+    builder.call(kernel, output, symbol)
+
+    executable = builder.build()
+    argument = executable.programs[0].nodes[0].arguments[1]
+
+    assert isinstance(symbol, SymbolHandle)
+    assert len(executable.binaries) == 1
+    assert argument.symbol.binary_idx == 0
+    assert argument.symbol.symbol_name == "mapping_table"
+    assert not argument.HasField("allocation")

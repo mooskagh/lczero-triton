@@ -55,6 +55,7 @@ def test_write_module_emits_artifacts_and_manifest(tmp_path: Path) -> None:
         compiled,
         grid=(2, 3, 1),
         parameters=(2, 2, 2),
+        symbols=("mapping_table",),
     )
 
     manifest = module_manifest_pb2.ModuleManifest()
@@ -71,6 +72,7 @@ def test_write_module_emits_artifacts_and_manifest(tmp_path: Path) -> None:
     assert tuple(kernel.grid) == (2, 3, 1)
     assert tuple(kernel.block) == (128, 1, 1)
     assert kernel.dynamic_shared_memory_bytes == _SHARED_MEMORY_BYTES
+    assert manifest.symbols[0].symbol_name == "mapping_table"
     assert (tmp_path / "module.ttir").read_text(encoding="utf-8") == "fake ttir"
     assert (tmp_path / "module.ttgir").read_text(encoding="utf-8") == "fake ttgir"
     assert (tmp_path / "module.llir").read_text(encoding="utf-8") == "fake llir"

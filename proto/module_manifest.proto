@@ -16,6 +16,10 @@ message ModuleManifest {
     optional uint32 dynamic_shared_memory_bytes = 5 [default = 0];
   }
 
+  message Symbol {
+    required string symbol_name = 1;
+  }
+
   required uint32 format = 1;
 
   // Resolved relative to the manifest file by the linker.
@@ -24,4 +28,5 @@ message ModuleManifest {
   required Target target = 4;
 
   repeated Kernel kernels = 10;
+  repeated Symbol symbols = 11;
 }

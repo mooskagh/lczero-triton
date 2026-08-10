@@ -73,6 +73,20 @@ def test_add_module_registers_multiple_kernels_from_one_binary(tmp_path: Path) -
     ]
 
 
+def test_load_module_exposes_symbols_from_the_module_binary(tmp_path: Path) -> None:
+    """Module symbols are loaded beside ordinary kernel exports."""
+    manifest = _write_manifest(
+        tmp_path,
+        MANIFEST + '\nsymbols { symbol_name: "mapping_table" }\n',
+    )
+
+    module = load_module(manifest)
+
+    assert len(module.symbols) == 1
+    assert module.symbols[0].symbol_name == "mapping_table"
+    assert module.symbols[0].binary_data == b"fake cubin"
+
+
 def test_load_module_rejects_binary_path_escape(tmp_path: Path) -> None:
     """A manifest cannot make the linker read outside its artifact directory."""
     manifest = _write_manifest(tmp_path)

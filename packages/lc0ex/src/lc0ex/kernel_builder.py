@@ -21,3 +21,17 @@ class KernelArtifact:
 @dataclass(frozen=True, slots=True, eq=False)
 class KernelHandle:
     """An opaque linker-side reference to one registered kernel."""
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolArtifact:
+    """One immutable pointer symbol exported by a compiled module."""
+
+    binary_format: lc0ex_pb2.Binary.Format
+    binary_data: bytes
+    symbol_name: str
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class SymbolHandle:
+    """An opaque linker-side reference to one registered module symbol."""

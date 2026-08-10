@@ -8,7 +8,7 @@ from typing import NoReturn
 
 from google.protobuf import text_format
 
-from lc0ex.kernel_builder import KernelArtifact
+from lc0ex.kernel_builder import KernelArtifact, SymbolArtifact
 from lc0ex.proto import lc0ex_pb2, module_manifest_pb2
 
 _MANIFEST_FORMAT = 1
@@ -27,6 +27,7 @@ class ModuleArtifact:
     target_vendor: lc0ex_pb2.Target.Vendor
     target_architecture: str
     kernels: tuple[KernelArtifact, ...]
+    symbols: tuple[SymbolArtifact, ...]
 
 
 def load_module(manifest_path: str | PathLike[str]) -> ModuleArtifact:
@@ -57,11 +58,20 @@ def load_module(manifest_path: str | PathLike[str]) -> ModuleArtifact:
         )
         for kernel in manifest.kernels
     )
+    symbols = tuple(
+        SymbolArtifact(
+            binary_format=binary_format,
+            binary_data=binary_data,
+            symbol_name=symbol.symbol_name,
+        )
+        for symbol in manifest.symbols
+    )
     return ModuleArtifact(
         binary_path=binary_path,
         target_vendor=manifest.target.vendor,
         target_architecture=manifest.target.architecture,
         kernels=kernels,
+        symbols=symbols,
     )
 
 
@@ -74,7 +84,7 @@ def _validate_manifest(
         message = f"unsupported module manifest format: {manifest.format}"
         raise ValueError(message)
     _validate_manifest_header(manifest)
-    _validate_kernels(manifest, manifest_path)
+    _validate_exports(manifest, manifest_path)
 
 
 def _validate_manifest_header(manifest: module_manifest_pb2.ModuleManifest) -> None:
@@ -86,13 +96,13 @@ def _validate_manifest_header(manifest: module_manifest_pb2.ModuleManifest) -> N
         _raise("module target architecture cannot be empty")
 
 
-def _validate_kernels(
+def _validate_exports(
     manifest: module_manifest_pb2.ModuleManifest,
     manifest_path: Path,
 ) -> None:
-    """Validate the module's exported kernels."""
-    if not manifest.kernels:
-        message = f"module manifest {manifest_path} contains no kernels"
+    """Validate the module's exported functions and symbols."""
+    if not manifest.kernels and not manifest.symbols:
+        message = f"module manifest {manifest_path} contains no exports"
         _raise(message)
 
     functions: set[str] = set()
@@ -102,6 +112,15 @@ def _validate_kernels(
         if kernel.function in functions:
             message = f"module function {kernel.function!r} is declared more than once"
             _raise(message)
+
+    symbols: set[str] = set()
+    for symbol in manifest.symbols:
+        if not symbol.symbol_name:
+            _raise("module symbol name cannot be empty")
+        if symbol.symbol_name in symbols:
+            message = f"module symbol {symbol.symbol_name!r} is declared more than once"
+            _raise(message)
+        symbols.add(symbol.symbol_name)
 
 
 def _normalize_dimensions(

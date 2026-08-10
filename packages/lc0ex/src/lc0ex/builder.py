@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Self
 
 from lc0ex.buffer_builder import Allocation, Buffer, BufferBuilder, BufferLocation
-from lc0ex.kernel_builder import KernelArtifact, KernelHandle
+from lc0ex.kernel_builder import (
+    KernelArtifact,
+    KernelHandle,
+    SymbolArtifact,
+    SymbolHandle,
+)
 from lc0ex.module_loader import load_module
 from lc0ex.proto import lc0ex_pb2
 
@@ -21,7 +26,7 @@ class _KernelInvocation:
     """One invocation of a registered kernel."""
 
     kernel: KernelHandle
-    arguments: tuple[Buffer, ...]
+    arguments: tuple[Buffer | SymbolHandle, ...]
     readonly: frozenset[Buffer]
 
 
@@ -37,6 +42,8 @@ class ExecutableBuilder:
         self._binary_functions: dict[
             tuple[lc0ex_pb2.Binary.Format, bytes, str], KernelArtifact
         ] = {}
+        self._symbols: dict[SymbolHandle, SymbolArtifact] = {}
+        self._symbol_handles: dict[SymbolArtifact, SymbolHandle] = {}
         self._invocations: list[_KernelInvocation] = []
 
     def allocation(
@@ -58,8 +65,8 @@ class ExecutableBuilder:
     def add_module(
         self,
         manifest_path: str | PathLike[str],
-    ) -> tuple[KernelHandle, ...]:
-        """Load a compiled module manifest and return its kernel handles."""
+    ) -> tuple[KernelHandle | SymbolHandle, ...]:
+        """Load a compiled module manifest and return its export handles."""
         module = load_module(manifest_path)
         target = (module.target_vendor, module.target_architecture)
         if self._target is None:
@@ -68,7 +75,10 @@ class ExecutableBuilder:
             message = "module target does not match the executable target"
             raise ValueError(message)
 
-        return tuple(self.add_kernel(kernel) for kernel in module.kernels)
+        return (
+            *(self.add_kernel(kernel) for kernel in module.kernels),
+            *(self.add_symbol(symbol) for symbol in module.symbols),
+        )
 
     def add_kernel(self, kernel: KernelArtifact) -> KernelHandle:
         """Register a compiled kernel and return its opaque handle."""
@@ -94,10 +104,24 @@ class ExecutableBuilder:
         self._binary_functions[symbol] = kernel
         return handle
 
+    def add_symbol(self, symbol: SymbolArtifact) -> SymbolHandle:
+        """Register an immutable module symbol and return its opaque handle."""
+        if not symbol.symbol_name:
+            message = "symbol name cannot be empty"
+            raise ValueError(message)
+        existing = self._symbol_handles.get(symbol)
+        if existing is not None:
+            return existing
+
+        handle = SymbolHandle()
+        self._symbols[handle] = symbol
+        self._symbol_handles[symbol] = handle
+        return handle
+
     def call(
         self,
         kernel: KernelHandle,
-        *arguments: Buffer,
+        *arguments: Buffer | SymbolHandle,
         readonly: Sequence[Buffer] = (),
     ) -> None:
         """Append a call to a registered kernel to the executable graph.
@@ -119,7 +143,18 @@ class ExecutableBuilder:
         ):
             message = "kernel calls only support pointer parameters"
             raise ValueError(message)
-        if any(not self._buffers.owns(argument) for argument in arguments):
+        if any(
+            not isinstance(argument, Buffer | SymbolHandle) for argument in arguments
+        ):
+            message = "kernel arguments must be buffers or symbols"
+            raise ValueError(message)
+        if any(
+            isinstance(argument, Buffer) and not self._buffers.owns(argument)
+            for argument in arguments
+        ) or any(
+            isinstance(argument, SymbolHandle) and argument not in self._symbols
+            for argument in arguments
+        ):
             message = "kernel arguments must belong to this executable builder"
             raise ValueError(message)
         if any(not self._buffers.owns(buffer) for buffer in readonly):
@@ -140,6 +175,7 @@ class ExecutableBuilder:
                     | {
                         argument
                         for argument in arguments
+                        if isinstance(argument, Buffer)
                         if not self._buffers.is_reusable(argument)
                         and not self._buffers.is_writable(argument)
                     },
@@ -156,8 +192,14 @@ class ExecutableBuilder:
             executable.target.architecture = architecture
         dependencies, reusable_conflicts = self._analyze_invocations()
         locations = self._buffers.build(executable, reusable_conflicts)
-        kernel_indices = self._build_kernels(executable)
-        self._build_invocations(executable, dependencies, locations, kernel_indices)
+        kernel_indices, symbol_locations = self._build_exports(executable)
+        self._build_invocations(
+            executable,
+            dependencies,
+            locations,
+            kernel_indices,
+            symbol_locations,
+        )
         return executable
 
     def build_and_write(
@@ -176,30 +218,42 @@ class ExecutableBuilder:
         output_path.write_bytes(executable.SerializeToString())
         return executable
 
-    def _build_kernels(
+    def _build_exports(
         self,
         executable: lc0ex_pb2.NeuralExecutable,
-    ) -> dict[KernelHandle, int]:
-        """Append registered binaries and kernels and return their indices."""
+    ) -> tuple[dict[KernelHandle, int], dict[SymbolHandle, tuple[int, str]]]:
+        """Append registered binaries and kernels and return export locations."""
         binary_indices: dict[tuple[lc0ex_pb2.Binary.Format, bytes], int] = {}
         kernel_indices: dict[KernelHandle, int] = {}
-        for handle, artifact in self._kernels.items():
-            binary = (artifact.binary_format, artifact.binary_data)
+
+        def binary_index(
+            binary_format: lc0ex_pb2.Binary.Format,
+            binary_data: bytes,
+        ) -> int:
+            binary = (binary_format, binary_data)
             binary_idx = binary_indices.get(binary)
             if binary_idx is None:
-                executable.binaries.add(
-                    format=artifact.binary_format,
-                    data=artifact.binary_data,
-                )
+                executable.binaries.add(format=binary_format, data=binary_data)
                 binary_idx = len(executable.binaries) - 1
                 binary_indices[binary] = binary_idx
+            return binary_idx
+
+        for handle, artifact in self._kernels.items():
+            binary_idx = binary_index(artifact.binary_format, artifact.binary_data)
             executable.kernels.add(
                 binary_idx=binary_idx,
                 function=artifact.function,
                 parameters=artifact.parameters,
             )
             kernel_indices[handle] = len(executable.kernels) - 1
-        return kernel_indices
+        symbol_locations = {
+            handle: (
+                binary_index(artifact.binary_format, artifact.binary_data),
+                artifact.symbol_name,
+            )
+            for handle, artifact in self._symbols.items()
+        }
+        return kernel_indices, symbol_locations
 
     def _analyze_invocations(
         self,
@@ -212,7 +266,11 @@ class ExecutableBuilder:
 
         dependencies: list[list[int]] = []
         for index, invocation in enumerate(self._invocations):
-            for buffer in set(invocation.arguments):
+            for buffer in {
+                argument
+                for argument in invocation.arguments
+                if isinstance(argument, Buffer)
+            }:
                 if self._buffers.is_reusable(buffer):
                     accesses.setdefault(buffer, set()).add(index)
             reduced_dependencies, ancestor_mask = self._invocation_dependencies(
@@ -233,6 +291,7 @@ class ExecutableBuilder:
         dependencies: list[list[int]],
         locations: dict[Buffer, BufferLocation],
         kernel_indices: dict[KernelHandle, int],
+        symbol_locations: dict[SymbolHandle, tuple[int, str]],
     ) -> None:
         """Append the invocation program using precomputed resource indices."""
         if not self._invocations:
@@ -253,11 +312,22 @@ class ExecutableBuilder:
                 dynamic_shared_memory_bytes=artifact.dynamic_shared_memory_bytes,
             )
             for argument in invocation.arguments:
-                location = locations[argument]
-                node.arguments.add(
-                    allocation_idx=location.allocation_idx,
-                    allocation_offset=location.allocation_offset,
-                )
+                if isinstance(argument, Buffer):
+                    location = locations[argument]
+                    node.arguments.add(
+                        allocation=lc0ex_pb2.Node.Argument.AllocationLocation(
+                            index=location.allocation_idx,
+                            offset=location.allocation_offset,
+                        )
+                    )
+                else:
+                    binary_idx, symbol_name = symbol_locations[argument]
+                    node.arguments.add(
+                        symbol=lc0ex_pb2.Node.Argument.Symbol(
+                            binary_idx=binary_idx,
+                            symbol_name=symbol_name,
+                        )
+                    )
 
     def _invocation_dependencies(
         self,
@@ -269,7 +339,11 @@ class ExecutableBuilder:
     ) -> tuple[list[int], int]:
         """Update access hazards and return reduced dependencies for one node."""
         dependencies: set[int] = set()
-        for buffer in set(invocation.arguments):
+        for buffer in {
+            argument
+            for argument in invocation.arguments
+            if isinstance(argument, Buffer)
+        }:
             if buffer in invocation.readonly:
                 writer = latest_writer.get(buffer)
                 if writer is not None:
