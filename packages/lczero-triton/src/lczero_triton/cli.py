@@ -5,7 +5,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from lc0ex import ExecutableBuilder
+from lc0ex import ExecutableBuilder, KernelHandle
 
 from lczero_triton.network import K, M, N, build_matmul_graph
 
@@ -25,9 +25,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         builder = ExecutableBuilder()
+        kernels: list[KernelHandle] = []
         for manifest_path in arguments.module:
-            builder.add_module(manifest_path)
-        build_matmul_graph(builder, arguments.m, arguments.n, arguments.k)
+            kernels.extend(builder.add_module(manifest_path))
+        if len(kernels) != 1:
+            message = "the matmul graph requires exactly one kernel"
+            raise ValueError(message)
+        build_matmul_graph(builder, kernels[0], arguments.m, arguments.n, arguments.k)
         builder.build_and_write(arguments.output)
         manifest_path = arguments.output
     sys.stdout.write(f"{manifest_path}\n")

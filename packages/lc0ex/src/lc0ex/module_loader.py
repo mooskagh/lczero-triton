@@ -23,19 +23,10 @@ _LAUNCH_DIMENSION_COUNT = 3
 class ModuleArtifact:
     """A validated module loaded from a manifest and its binary file."""
 
-    name: str
     binary_path: Path
     target_vendor: lc0ex_pb2.Target.Vendor
     target_architecture: str
-    kernels: tuple["ModuleKernelArtifact", ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ModuleKernelArtifact:
-    """A logical kernel name paired with its linker registration data."""
-
-    name: str
-    artifact: KernelArtifact
+    kernels: tuple[KernelArtifact, ...]
 
 
 def load_module(manifest_path: str | PathLike[str]) -> ModuleArtifact:
@@ -53,27 +44,22 @@ def load_module(manifest_path: str | PathLike[str]) -> ModuleArtifact:
 
     binary_format = _binary_format(manifest.binary_format)
     kernels = tuple(
-        ModuleKernelArtifact(
-            name=kernel.name,
-            artifact=KernelArtifact(
-                binary_name=manifest.name,
-                binary_format=binary_format,
-                binary_data=binary_data,
-                function=kernel.function,
-                parameters=tuple(
-                    _parameter_type(parameter) for parameter in kernel.parameters
-                ),
-                grid=_normalize_dimensions("grid", kernel.name, kernel.grid),
-                block=_normalize_dimensions("block", kernel.name, kernel.block),
-                dynamic_shared_memory_bytes=kernel.dynamic_shared_memory_bytes,
+        KernelArtifact(
+            binary_format=binary_format,
+            binary_data=binary_data,
+            function=kernel.function,
+            parameters=tuple(
+                _parameter_type(parameter) for parameter in kernel.parameters
             ),
+            grid=_normalize_dimensions("grid", kernel.function, kernel.grid),
+            block=_normalize_dimensions("block", kernel.function, kernel.block),
+            dynamic_shared_memory_bytes=kernel.dynamic_shared_memory_bytes,
         )
         for kernel in manifest.kernels
     )
     return ModuleArtifact(
-        name=manifest.name,
         binary_path=binary_path,
-        target_vendor=lc0ex_pb2.Target.VENDOR_NVIDIA,
+        target_vendor=manifest.target.vendor,
         target_architecture=manifest.target.architecture,
         kernels=kernels,
     )
@@ -93,8 +79,6 @@ def _validate_manifest(
 
 def _validate_manifest_header(manifest: module_manifest_pb2.ModuleManifest) -> None:
     """Validate the scalar fields shared by all module kernels."""
-    if not manifest.name:
-        _raise("module manifest name cannot be empty")
     if manifest.target.vendor != _NVIDIA:
         message = f"unsupported module target vendor: {manifest.target.vendor}"
         _raise(message)
@@ -111,16 +95,12 @@ def _validate_kernels(
         message = f"module manifest {manifest_path} contains no kernels"
         _raise(message)
 
-    names: set[str] = set()
+    functions: set[str] = set()
     for kernel in manifest.kernels:
-        if not kernel.name:
-            _raise("module kernel name cannot be empty")
-        if kernel.name in names:
-            message = f"module kernel {kernel.name!r} is declared more than once"
-            _raise(message)
-        names.add(kernel.name)
         if not kernel.function:
-            message = f"module kernel {kernel.name!r} function cannot be empty"
+            _raise("module kernel function cannot be empty")
+        if kernel.function in functions:
+            message = f"module function {kernel.function!r} is declared more than once"
             _raise(message)
 
 

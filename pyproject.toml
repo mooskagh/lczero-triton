@@ -81,6 +81,10 @@ disable_error_code = ["type-arg"] # grpcio-tools emits bare Mapping types.
 
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers"]
+pythonpath = [
+    "packages/lc0ex/src",
+    "packages/lczero-triton/src",
+]
 testpaths = [
     "packages/lc0ex/tests",
     "packages/lczero-triton/tests",

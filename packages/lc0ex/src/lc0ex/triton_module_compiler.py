@@ -17,7 +17,6 @@ def write_module(
     output_basename: str | PathLike[str],
     compiled: Any,
     *,
-    name: str,
     grid: Grid,
     parameters: tuple[int, ...],
 ) -> Path:
@@ -29,14 +28,12 @@ def write_module(
     )
     module = module_manifest_pb2.ModuleManifest(
         format=_MANIFEST_FORMAT,
-        name=name,
         binary_path=f"{Path(output_basename).name}.cubin",
         binary_format=lc0ex_pb2.Binary.FORMAT_CUBIN,
     )
     module.target.vendor = lc0ex_pb2.Target.VENDOR_NVIDIA
     module.target.architecture = f"sm_{compiled.metadata.target.arch}"
     module.kernels.add(
-        name=name,
         function=compiled.name,
         parameters=parameters,
         grid=grid,

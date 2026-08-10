@@ -127,7 +127,6 @@ def compile_matmul(
     return write_module(
         output_basename,
         compiled,
-        name=f"matmul_{m}_{n}_{k}",
         grid=resolved_grid,
         parameters=(_POINTER, _POINTER, _POINTER),
     )

@@ -53,7 +53,6 @@ def test_write_module_emits_artifacts_and_manifest(tmp_path: Path) -> None:
     manifest_path = write_module(
         output_basename,
         compiled,
-        name="module",
         grid=(2, 3, 1),
         parameters=(2, 2, 2),
     )
@@ -62,13 +61,11 @@ def test_write_module_emits_artifacts_and_manifest(tmp_path: Path) -> None:
     text_format.Parse(manifest_path.read_text(encoding="utf-8"), manifest)
     kernel = manifest.kernels[0]
 
-    assert manifest.name == "module"
     assert manifest_path == tmp_path / "module.manifest"
     assert manifest.binary_path == "module.cubin"
     assert manifest.binary_format == lc0ex_pb2.Binary.FORMAT_CUBIN
     assert manifest.target.vendor == lc0ex_pb2.Target.VENDOR_NVIDIA
     assert manifest.target.architecture == "sm_120"
-    assert kernel.name == "module"
     assert kernel.function == "kernel_exported"
     assert tuple(kernel.parameters) == (2, 2, 2)
     assert tuple(kernel.grid) == (2, 3, 1)
@@ -98,7 +95,6 @@ def test_write_module_appends_extensions_to_basename(
     manifest_path = write_module(
         tmp_path / "module.v1",
         compiled,
-        name="module",
         grid=(2, 3, 1),
         parameters=(2, 2, 2),
     )

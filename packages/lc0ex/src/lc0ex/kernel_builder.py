@@ -9,7 +9,6 @@ from lc0ex.proto import lc0ex_pb2
 class KernelArtifact:
     """One exported module function and its launch metadata."""
 
-    binary_name: str
     binary_format: lc0ex_pb2.Binary.Format
     binary_data: bytes
     function: str
@@ -17,3 +16,8 @@ class KernelArtifact:
     grid: tuple[int, int, int]
     block: tuple[int, int, int]
     dynamic_shared_memory_bytes: int
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class KernelHandle:
+    """An opaque linker-side reference to one registered kernel."""
