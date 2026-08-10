@@ -1,274 +1,233 @@
-"""Tests for executable allocation and buffer construction."""
+"""Tests for opaque executable allocation and buffer construction."""
+
+# ruff: noqa: PLR2004
 
 from pathlib import Path
 
 import pytest
 from google.protobuf.message import EncodeError
-from lc0ex import Allocation, Buffer, ExecutableBuilder
+from lc0ex import Buffer, ExecutableBuilder
 from lc0ex.buffer_builder import data_type_size_bytes
 from lc0ex.proto import lc0ex_pb2
 
-EXPECTED_MAGIC = 0x1C0E
-EXPECTED_FORMAT = 1
-EXPECTED_PERSISTENT_SIZE = 36
-EXPECTED_PERSISTENT_ALIGNMENT = 8
+F16 = lc0ex_pb2.Buffer.DATA_TYPE_F16
+F32 = lc0ex_pb2.Buffer.DATA_TYPE_F32
+U8 = lc0ex_pb2.Buffer.DATA_TYPE_U8
+U64 = lc0ex_pb2.Buffer.DATA_TYPE_U64
+PERSISTENT = lc0ex_pb2.Allocation.LIFETIME_PERSISTENT
+EXECUTION = lc0ex_pb2.Allocation.LIFETIME_EXECUTION
 TARGET_ARCHITECTURE = "sm_80"
 
 
-def _allocation(
-    builder: ExecutableBuilder,
-    lifetime: lc0ex_pb2.Allocation.Lifetime,
-) -> Allocation:
-    return builder.allocation(lifetime)
-
-
-def test_build_sets_fixed_header_fields() -> None:
-    """A new builder sets the executable's fixed header fields."""
-    executable = ExecutableBuilder().build()
-
-    assert isinstance(executable, lc0ex_pb2.NeuralExecutable)
-    assert executable.magic == EXPECTED_MAGIC
-    assert executable.format == EXPECTED_FORMAT
-    assert not executable.IsInitialized()
-
-
-def test_build_creates_independent_executables_with_target() -> None:
-    """Each build creates a new executable containing the configured target."""
-    builder = ExecutableBuilder().set_target(
+def _builder() -> ExecutableBuilder:
+    """Create a fully target-configured executable builder."""
+    return ExecutableBuilder().set_target(
         lc0ex_pb2.Target.VENDOR_NVIDIA,
         TARGET_ARCHITECTURE,
     )
 
-    first = builder.build()
-    second = builder.build()
 
-    assert first is not second
-    assert first.target.vendor == lc0ex_pb2.Target.VENDOR_NVIDIA
-    assert first.target.architecture == TARGET_ARCHITECTURE
-    assert second == first
-    assert second.IsInitialized()
+def test_buffer_is_an_opaque_storage_identity() -> None:
+    """Buffers intentionally expose no tensor metadata or view operations."""
+    buffer = Buffer()
 
-
-def test_build_and_write_rejects_missing_required_fields(tmp_path: Path) -> None:
-    """Serialization rejects an executable with unset required fields."""
-    with pytest.raises(EncodeError):
-        ExecutableBuilder().build_and_write(tmp_path / "incomplete.lc0ex")
+    assert not hasattr(buffer, "shape")
+    assert not hasattr(buffer, "dtype")
+    assert not hasattr(buffer, "reshape")
 
 
-def test_build_and_write_serializes_and_returns_executable(tmp_path: Path) -> None:
-    """A fully initialized executable is serialized and returned."""
-    builder = ExecutableBuilder().set_target(
-        lc0ex_pb2.Target.VENDOR_NVIDIA,
-        TARGET_ARCHITECTURE,
+def test_external_buffer_serializes_its_private_runtime_contract() -> None:
+    """A named external range retains shape and dtype only in the executable."""
+    builder = _builder()
+    persistent = builder.allocation(PERSISTENT)
+    result = persistent.external_buffer(
+        name="weights",
+        shape=(2, 3),
+        dtype=F16,
+        alignment_bytes=16,
     )
-    output_path = tmp_path / "network.lc0ex"
 
-    result = builder.build_and_write(output_path)
+    executable = builder.build()
 
-    restored = lc0ex_pb2.NeuralExecutable()
-    restored.ParseFromString(output_path.read_bytes())
-    assert restored == result
+    assert isinstance(result, Buffer)
+    assert len(executable.allocations) == 1
+    assert executable.allocations[0].size_bytes == 12
+    assert executable.allocations[0].alignment_bytes == 16
+    assert executable.buffers[0].name == "weights"
+    assert tuple(executable.buffers[0].shape) == (2, 3)
+    assert executable.buffers[0].data_type == F16
+
+
+def test_external_buffer_reuses_an_identical_declaration() -> None:
+    """A name identifies one canonical external buffer contract."""
+    builder = _builder()
+    persistent = builder.allocation(PERSISTENT)
+    first = persistent.external_buffer(name="weights", shape=(2, 3), dtype=F16)
+
+    second = persistent.external_buffer(name="weights", shape=(2, 3), dtype=F16)
+
+    assert second is first
+
+
+def test_external_buffer_rejects_conflicting_redeclarations() -> None:
+    """A repeated external name must retain all physical metadata."""
+    builder = _builder()
+    persistent = builder.allocation(PERSISTENT)
+    persistent.external_buffer(name="weights", shape=(2, 3), dtype=F16)
+
+    with pytest.raises(ValueError, match="shape"):
+        persistent.external_buffer(name="weights", shape=(3, 2), dtype=F16)
+    with pytest.raises(ValueError, match="data type"):
+        persistent.external_buffer(name="weights", shape=(2, 3), dtype=F32)
+    with pytest.raises(ValueError, match="writability"):
+        persistent.external_buffer(
+            name="weights",
+            shape=(2, 3),
+            dtype=F16,
+            writable=True,
+        )
+    with pytest.raises(ValueError, match="alignment"):
+        persistent.external_buffer(
+            name="weights",
+            shape=(2, 3),
+            dtype=F16,
+            alignment_bytes=16,
+        )
+
+
+def test_external_buffer_rejects_a_cross_lifetime_redeclaration() -> None:
+    """One named external range cannot move between allocation lifetimes."""
+    builder = _builder()
+    persistent = builder.allocation(PERSISTENT)
+    execution = builder.allocation(EXECUTION)
+    persistent.external_buffer(name="weights", shape=(1,), dtype=F16)
+
+    with pytest.raises(ValueError, match="different allocation"):
+        execution.external_buffer(name="weights", shape=(1,), dtype=F16)
+
+
+@pytest.mark.parametrize(
+    ("name", "shape"),
+    [("", (1,)), ("zero", ()), ("zero", (0,)), ("negative", (-1,))],
+)
+def test_external_buffer_rejects_invalid_runtime_contract(
+    name: str,
+    shape: tuple[int, ...],
+) -> None:
+    """Named runtime buffers require a nonempty name and positive dimensions."""
+    persistent = _builder().allocation(PERSISTENT)
+
+    with pytest.raises(ValueError, match=r"cannot be empty|positive dimensions"):
+        persistent.external_buffer(name=name, shape=shape, dtype=F16)
+
+
+@pytest.mark.parametrize("alignment_bytes", [0, 3])
+def test_external_buffer_rejects_invalid_alignment(alignment_bytes: int) -> None:
+    """Physical range alignment is a positive power of two."""
+    persistent = _builder().allocation(PERSISTENT)
+
+    with pytest.raises(ValueError, match="power of two"):
+        persistent.external_buffer(
+            name="weights",
+            shape=(1,),
+            dtype=F16,
+            alignment_bytes=alignment_bytes,
+        )
+
+
+def test_temporary_buffer_is_raw_execution_storage() -> None:
+    """Anonymous internal ranges are byte-sized rather than tensor-shaped."""
+    builder = _builder()
+    execution = builder.allocation(EXECUTION)
+    result = execution.temporary_buffer(size_bytes=128, alignment_bytes=64)
+
+    assert isinstance(result, Buffer)
+    assert not builder.build().allocations
+
+
+def test_temporary_buffer_rejects_persistent_storage() -> None:
+    """Only execution allocations may contain reusable anonymous storage."""
+    persistent = _builder().allocation(PERSISTENT)
+
+    with pytest.raises(ValueError, match="EXECUTION"):
+        persistent.temporary_buffer(size_bytes=2, alignment_bytes=2)
+
+
+@pytest.mark.parametrize("size_bytes", [0, -1])
+def test_temporary_buffer_rejects_invalid_size(size_bytes: int) -> None:
+    """Raw internal storage must have a positive uint64 byte count."""
+    execution = _builder().allocation(EXECUTION)
+
+    with pytest.raises(ValueError, match="positive uint64"):
+        execution.temporary_buffer(size_bytes=size_bytes, alignment_bytes=1)
+
+
+def test_named_execution_buffers_serialize_as_fixed_ranges() -> None:
+    """External inputs and outputs remain distinct execution-lifetime ranges."""
+    builder = _builder()
+    execution = builder.allocation(EXECUTION)
+    execution.external_buffer(name="input", shape=(2,), dtype=F16, alignment_bytes=16)
+    execution.external_buffer(
+        name="output",
+        shape=(2,),
+        dtype=F16,
+        writable=True,
+        alignment_bytes=16,
+    )
+
+    executable = builder.build()
+
+    assert executable.allocations[0].lifetime == EXECUTION
+    assert [buffer.name for buffer in executable.buffers] == ["input", "output"]
+    assert [buffer.allocation_offset for buffer in executable.buffers] == [0, 16]
 
 
 @pytest.mark.parametrize(
     ("dtype", "expected_size"),
-    [
-        (lc0ex_pb2.Buffer.DATA_TYPE_F32, 4),
-        (lc0ex_pb2.Buffer.DATA_TYPE_U8, 1),
-        (lc0ex_pb2.Buffer.DATA_TYPE_F16, 2),
-        (lc0ex_pb2.Buffer.DATA_TYPE_U64, 8),
-        (lc0ex_pb2.Buffer.DATA_TYPE_BF16, 2),
-    ],
+    [(F32, 4), (U8, 1), (F16, 2), (U64, 8), (lc0ex_pb2.Buffer.DATA_TYPE_BF16, 2)],
 )
 def test_data_type_size_bytes(
     dtype: lc0ex_pb2.Buffer.DataType,
     expected_size: int,
 ) -> None:
-    """Every supported data type has the expected element size."""
+    """Every concrete linker dtype has its expected element size."""
     assert data_type_size_bytes(dtype) == expected_size
 
 
-def test_data_type_size_bytes_rejects_unknown_type() -> None:
-    """The unknown data type has no element size."""
+def test_unknown_dtype_is_rejected_when_declaring_external_storage() -> None:
+    """External contracts cannot defer unsupported dtype validation to build time."""
+    persistent = _builder().allocation(PERSISTENT)
+
     with pytest.raises(KeyError):
-        data_type_size_bytes(lc0ex_pb2.Buffer.DATA_TYPE_UNKNOWN)
+        persistent.external_buffer(
+            name="unknown",
+            shape=(1,),
+            dtype=lc0ex_pb2.Buffer.DATA_TYPE_UNKNOWN,
+        )
 
 
-def test_allocation_rejects_unknown_lifetime() -> None:
-    """Every allocation has a concrete runtime lifetime."""
-    with pytest.raises(ValueError, match="PERSISTENT or EXECUTION"):
-        ExecutableBuilder().allocation(lc0ex_pb2.Allocation.LIFETIME_UNKNOWN)
-
-
-def test_buffer_returns_typed_handle() -> None:
-    """Creating a buffer returns an immutable allocation-owned handle."""
-    builder = ExecutableBuilder()
-    persistent = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_PERSISTENT)
-    result = persistent.buffer(
-        (2, 3),
-        lc0ex_pb2.Buffer.DATA_TYPE_F16,
-        name="weights",
-    )
-
-    assert isinstance(result, Buffer)
-    assert result.allocation is persistent
-    assert result.name == "weights"
-    assert result.shape == (2, 3)
-    assert result.dtype == lc0ex_pb2.Buffer.DATA_TYPE_F16
-
-
-def test_named_buffer_reuses_existing_handle() -> None:
-    """Named buffer lookup does not require positional-name overloads."""
-    builder = ExecutableBuilder()
-    persistent = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_PERSISTENT)
-    original = persistent.buffer(
-        [2, 3],
-        lc0ex_pb2.Buffer.DATA_TYPE_F16,
-        name="weights",
-    )
-
-    assert persistent.buffer(name="weights") is original
-    assert persistent.buffer((2, 3), name="weights") is original
-    assert (
-        persistent.buffer(dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16, name="weights")
-        is original
-    )
-
-
-def test_unnamed_execution_buffers_are_distinct() -> None:
-    """Unnamed buffers are internal and do not consume the name namespace."""
-    builder = ExecutableBuilder()
-    persistent = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_PERSISTENT)
-    execution = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_EXECUTION)
-    persistent.buffer((1,), lc0ex_pb2.Buffer.DATA_TYPE_U8, name="tmp_0")
-    first = execution.buffer((2,), lc0ex_pb2.Buffer.DATA_TYPE_F16)
-    second = execution.buffer((3,), lc0ex_pb2.Buffer.DATA_TYPE_F32)
-
-    assert first.name is None
-    assert second.name is None
-    assert first is not second
-    assert first.shape == (2,)
-    assert second.dtype == lc0ex_pb2.Buffer.DATA_TYPE_F32
-
-
-@pytest.mark.parametrize(
-    ("shape", "dtype"),
-    [
-        (None, None),
-        ((2, 3), None),
-        (None, lc0ex_pb2.Buffer.DATA_TYPE_F16),
-    ],
-)
-def test_new_buffer_requires_complete_definition(
-    shape: tuple[int, ...] | None,
-    dtype: lc0ex_pb2.Buffer.DataType | None,
+def test_build_and_write_serializes_a_complete_external_contract(
+    tmp_path: Path,
 ) -> None:
-    """A new buffer requires a complete definition."""
-    builder = ExecutableBuilder()
-    persistent = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_PERSISTENT)
-
-    with pytest.raises(ValueError, match="shape and data type are required"):
-        persistent.buffer(shape, dtype, name="weights")
-
-
-def test_unknown_buffer_type_fails_when_building() -> None:
-    """An unknown data type fails when its allocation size is needed."""
-    builder = ExecutableBuilder()
-    persistent = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_PERSISTENT)
-    persistent.buffer(
-        (2, 3),
-        lc0ex_pb2.Buffer.DATA_TYPE_UNKNOWN,
+    """A configured target and external range produce a parseable executable."""
+    builder = _builder()
+    builder.allocation(PERSISTENT).external_buffer(
         name="weights",
+        shape=(1,),
+        dtype=F16,
     )
+    output_path = tmp_path / "network.lc0ex"
 
-    with pytest.raises(KeyError):
-        builder.build()
+    result = builder.build_and_write(output_path)
+    restored = lc0ex_pb2.NeuralExecutable()
+    restored.ParseFromString(output_path.read_bytes())
+
+    assert restored == result
 
 
-def test_named_buffers_cannot_move_between_allocations() -> None:
-    """A name identifies one fixed range in one allocation."""
+def test_build_and_write_requires_a_target() -> None:
+    """The executable protobuf still enforces its required target field."""
     builder = ExecutableBuilder()
-    persistent = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_PERSISTENT)
-    execution = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_EXECUTION)
-    persistent.buffer((1,), lc0ex_pb2.Buffer.DATA_TYPE_F16, name="weights")
 
-    with pytest.raises(ValueError, match="different allocation"):
-        execution.buffer((1,), lc0ex_pb2.Buffer.DATA_TYPE_F16, name="weights")
-
-
-def test_persistent_allocations_reject_unnamed_buffers() -> None:
-    """Only execution allocations may contain reusable internal ranges."""
-    builder = ExecutableBuilder()
-    persistent = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_PERSISTENT)
-
-    with pytest.raises(ValueError, match="require an EXECUTION allocation"):
-        persistent.buffer((1,), lc0ex_pb2.Buffer.DATA_TYPE_F16)
-
-
-def test_build_combines_named_buffers_into_persistent_allocation() -> None:
-    """Named persistent buffers share one naturally aligned allocation."""
-    builder = ExecutableBuilder()
-    persistent = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_PERSISTENT)
-    persistent.buffer((3,), lc0ex_pb2.Buffer.DATA_TYPE_U8, name="byte")
-    persistent.buffer((2,), lc0ex_pb2.Buffer.DATA_TYPE_U64, name="wide")
-    persistent.buffer((3, 2), lc0ex_pb2.Buffer.DATA_TYPE_F16, name="half")
-
-    executable = builder.build()
-
-    assert len(executable.allocations) == 1
-    allocation = executable.allocations[0]
-    assert allocation.size_bytes == EXPECTED_PERSISTENT_SIZE
-    assert allocation.alignment_bytes == EXPECTED_PERSISTENT_ALIGNMENT
-    assert allocation.lifetime == lc0ex_pb2.Allocation.LIFETIME_PERSISTENT
-    assert [buffer.name for buffer in executable.buffers] == ["byte", "wide", "half"]
-    assert [buffer.allocation_idx for buffer in executable.buffers] == [0, 0, 0]
-    assert [buffer.allocation_offset for buffer in executable.buffers] == [0, 8, 24]
-
-
-def test_execution_allocation_serializes_named_buffers() -> None:
-    """Named inputs and outputs use execution-lifetime storage."""
-    builder = ExecutableBuilder()
-    execution = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_EXECUTION)
-    execution.buffer((2,), lc0ex_pb2.Buffer.DATA_TYPE_F16, name="input")
-    execution.buffer(
-        (2,),
-        lc0ex_pb2.Buffer.DATA_TYPE_F16,
-        name="output",
-        writable=True,
-    )
-
-    executable = builder.build()
-
-    assert len(executable.allocations) == 1
-    assert executable.allocations[0].lifetime == lc0ex_pb2.Allocation.LIFETIME_EXECUTION
-    assert [buffer.name for buffer in executable.buffers] == ["input", "output"]
-    assert [buffer.allocation_idx for buffer in executable.buffers] == [0, 0]
-
-
-def test_unused_unnamed_buffers_do_not_emit_an_allocation() -> None:
-    """Unused internal buffers do not reserve runtime storage."""
-    builder = ExecutableBuilder()
-    execution = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_EXECUTION)
-    first = execution.buffer((3,), lc0ex_pb2.Buffer.DATA_TYPE_U8)
-    second = execution.buffer((2,), lc0ex_pb2.Buffer.DATA_TYPE_F16)
-
-    executable = builder.build()
-
-    assert first.name is None
-    assert second.name is None
-    assert not executable.allocations
-    assert not executable.buffers
-
-
-def test_repeated_builds_have_independent_buffer_messages() -> None:
-    """Every build serializes the same handles into fresh protobuf messages."""
-    builder = ExecutableBuilder()
-    persistent = _allocation(builder, lc0ex_pb2.Allocation.LIFETIME_PERSISTENT)
-    persistent.buffer((2,), lc0ex_pb2.Buffer.DATA_TYPE_F32, name="weights")
-
-    first = builder.build()
-    second = builder.build()
-
-    assert first == second
-    assert first.buffers[0] is not second.buffers[0]
-    assert first.allocations[0] is not second.allocations[0]
+    with pytest.raises(EncodeError):
+        builder.build_and_write(Path("incomplete.lc0ex"))

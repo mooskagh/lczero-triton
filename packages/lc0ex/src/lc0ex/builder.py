@@ -307,7 +307,7 @@ class ExecutableBuilder:
         conflicts: dict[Buffer, set[Buffer]] = {buffer: set() for buffer in accesses}
         for first_index, first in enumerate(buffers):
             for second in buffers[first_index + 1 :]:
-                if first.allocation is not second.allocation:
+                if not self._buffers.share_allocation(first, second):
                     continue
                 first_before_second = all(
                     ancestors[second_access] & (1 << first_access)

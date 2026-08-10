@@ -1,10 +1,12 @@
-"""Logical buffer handles and executable allocation serialization support."""
+"""Opaque logical buffer handles and executable allocation serialization."""
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from math import prod
 
 from lc0ex.proto import lc0ex_pb2
+
+_MAX_ALLOCATION_SIZE_BYTES = (1 << 64) - 1
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -14,20 +16,37 @@ class Allocation:
     lifetime: lc0ex_pb2.Allocation.Lifetime
     _owner: "BufferBuilder" = field(repr=False)
 
-    def buffer(
+    def external_buffer(
         self,
-        shape: Sequence[int] | None = None,
-        dtype: lc0ex_pb2.Buffer.DataType | None = None,
         *,
-        name: str | None = None,
+        name: str,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
         writable: bool = False,
+        alignment_bytes: int | None = None,
     ) -> "Buffer":
-        """Create or retrieve a buffer within this allocation.
+        """Create or retrieve a named external range in this allocation."""
+        return self._owner.external_buffer(
+            self,
+            name=name,
+            shape=shape,
+            dtype=dtype,
+            writable=writable,
+            alignment_bytes=alignment_bytes,
+        )
 
-        Named buffers are runtime-visible fixed ranges. Unnamed execution
-        buffers are internal ranges whose storage can be reused by the graph.
-        """
-        return self._owner.buffer(self, shape, dtype, name=name, writable=writable)
+    def temporary_buffer(
+        self,
+        *,
+        size_bytes: int,
+        alignment_bytes: int,
+    ) -> "Buffer":
+        """Create an unnamed reusable execution range with raw storage size."""
+        return self._owner.temporary_buffer(
+            self,
+            size_bytes=size_bytes,
+            alignment_bytes=alignment_bytes,
+        )
 
     def belongs_to(self, owner: "BufferBuilder") -> bool:
         """Return whether this allocation belongs to *owner*."""
@@ -36,12 +55,32 @@ class Allocation:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class Buffer:
-    """A logical buffer that can be passed to other executable builders."""
+    """An opaque identity for one logical device-memory range.
 
-    allocation: Allocation
-    name: str | None
+    Do not add shape, data-type, layout, or stride accessors. Kernels receive
+    pointers only, so their dimensions and element types must be explicit
+    specialization parameters at graph-construction call sites.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class _ExternalBuffer:
+    """Canonical runtime metadata for one named external range."""
+
+    name: str
     shape: tuple[int, ...]
     dtype: lc0ex_pb2.Buffer.DataType
+
+
+@dataclass(frozen=True, slots=True)
+class _BufferRecord:
+    """Private physical metadata for one opaque buffer handle."""
+
+    allocation: Allocation
+    size_bytes: int
+    alignment_bytes: int
+    external: _ExternalBuffer | None
+    writable: bool
 
 
 def data_type_size_bytes(dtype: lc0ex_pb2.Buffer.DataType) -> int:
@@ -63,7 +102,7 @@ def data_type_size_bytes(dtype: lc0ex_pb2.Buffer.DataType) -> int:
 
 @dataclass(slots=True)
 class _AllocationSlot:
-    """One reusable range in an allocation."""
+    """One reusable raw-storage range in an allocation."""
 
     buffers: list[Buffer]
     size_bytes: int
@@ -79,14 +118,14 @@ class BufferLocation:
 
 
 class BufferBuilder:
-    """Collect logical allocations and their buffers."""
+    """Collect opaque logical buffers and serialize their physical storage."""
 
     def __init__(self) -> None:
         """Initialize an empty buffer collection."""
         self._allocations: list[Allocation] = []
         self._buffers_by_allocation: dict[Allocation, list[Buffer]] = {}
-        self._named_buffers: dict[str, Buffer] = {}
-        self._writable_buffers: set[Buffer] = set()
+        self._records: dict[Buffer, _BufferRecord] = {}
+        self._external_by_name: dict[str, Buffer] = {}
 
     def allocation(
         self,
@@ -104,86 +143,99 @@ class BufferBuilder:
         self._buffers_by_allocation[allocation] = []
         return allocation
 
-    def buffer(
+    def external_buffer(  # noqa: PLR0913
         self,
         allocation: Allocation,
-        shape: Sequence[int] | None = None,
-        dtype: lc0ex_pb2.Buffer.DataType | None = None,
         *,
-        name: str | None = None,
-        writable: bool = False,
+        name: str,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+        writable: bool,
+        alignment_bytes: int | None,
     ) -> Buffer:
-        """Create or retrieve a buffer in *allocation*.
+        """Create or retrieve a named external buffer in *allocation*."""
+        self._require_owned_allocation(allocation)
+        normalized_shape = tuple(shape)
+        element_size = data_type_size_bytes(dtype)
+        _validate_name(name)
+        _validate_shape(normalized_shape)
+        resolved_alignment = (
+            element_size if alignment_bytes is None else alignment_bytes
+        )
+        _validate_alignment(resolved_alignment, minimum=element_size)
+        size_bytes = _checked_product(normalized_shape, element_size)
 
-        A new buffer requires both *shape* and *dtype*. Named buffers are
-        looked up globally; supplied values must match an existing definition.
-        """
-        normalized_shape = tuple(shape) if shape is not None else None
-        existing = self._existing_buffer(allocation, name)
-
+        existing = self._external_by_name.get(name)
         if existing is not None:
-            if existing.allocation is not allocation:
-                message = f"buffer {name!r} belongs to a different allocation"
-                raise ValueError(message)
-            if normalized_shape is not None and normalized_shape != existing.shape:
-                message = f"shape does not match existing buffer {name!r}"
-                raise ValueError(message)
-            if dtype is not None and dtype != existing.dtype:
-                message = f"data type does not match existing buffer {name!r}"
-                raise ValueError(message)
-            if writable:
-                self._writable_buffers.add(existing)
+            record = self._records[existing]
+            _validate_matching_external(
+                record,
+                allocation=allocation,
+                name=name,
+                shape=normalized_shape,
+                dtype=dtype,
+                writable=writable,
+                alignment_bytes=resolved_alignment,
+            )
             return existing
 
-        if normalized_shape is None or dtype is None:
-            message = "shape and data type are required for new buffers"
-            raise ValueError(message)
-        result = Buffer(
-            allocation=allocation,
-            name=name,
-            shape=normalized_shape,
-            dtype=dtype,
+        buffer = Buffer()
+        external = _ExternalBuffer(name, normalized_shape, dtype)
+        self._add_buffer(
+            buffer,
+            _BufferRecord(
+                allocation,
+                size_bytes,
+                resolved_alignment,
+                external,
+                writable,
+            ),
         )
-        self._buffers_by_allocation[allocation].append(result)
-        if name is not None:
-            self._named_buffers[name] = result
-        if writable:
-            self._writable_buffers.add(result)
-        return result
+        self._external_by_name[name] = buffer
+        return buffer
 
-    def _existing_buffer(
+    def temporary_buffer(
         self,
         allocation: Allocation,
-        name: str | None,
-    ) -> Buffer | None:
-        """Validate *allocation* and look up its named buffer, if any."""
-        if not allocation.belongs_to(self):
-            message = "allocation does not belong to this executable builder"
-            raise ValueError(message)
-        if name is not None:
-            return self._named_buffers.get(name)
+        *,
+        size_bytes: int,
+        alignment_bytes: int,
+    ) -> Buffer:
+        """Create an unnamed raw-storage buffer in an execution allocation."""
+        self._require_owned_allocation(allocation)
         if allocation.lifetime != lc0ex_pb2.Allocation.LIFETIME_EXECUTION:
-            message = "unnamed buffers require an EXECUTION allocation"
+            message = "temporary buffers require an EXECUTION allocation"
             raise ValueError(message)
-        return None
+        _validate_size(size_bytes)
+        _validate_alignment(alignment_bytes, minimum=1)
+        buffer = Buffer()
+        self._add_buffer(
+            buffer,
+            _BufferRecord(
+                allocation,
+                size_bytes,
+                alignment_bytes,
+                None,
+                writable=True,
+            ),
+        )
+        return buffer
 
     def owns(self, buffer: Buffer) -> bool:
         """Return whether *buffer* is a handle created by this collection."""
-        if not buffer.allocation.belongs_to(self):
-            return False
-        return any(
-            buffer is candidate
-            for buffers in self._buffers_by_allocation.values()
-            for candidate in buffers
-        )
+        return buffer in self._records
 
     def is_reusable(self, buffer: Buffer) -> bool:
         """Return whether *buffer* is an internal reusable execution range."""
-        return buffer.name is None
+        return self._records[buffer].external is None
 
     def is_writable(self, buffer: Buffer) -> bool:
-        """Return whether *buffer* was declared writable."""
-        return buffer in self._writable_buffers
+        """Return whether *buffer* may be modified by graph nodes."""
+        return self._records[buffer].writable
+
+    def share_allocation(self, first: Buffer, second: Buffer) -> bool:
+        """Return whether two opaque ranges belong to one allocation."""
+        return self._records[first].allocation is self._records[second].allocation
 
     def build(
         self,
@@ -194,7 +246,11 @@ class BufferBuilder:
         locations: dict[Buffer, BufferLocation] = {}
         for allocation in self._allocations:
             buffers = self._buffers_by_allocation[allocation]
-            fixed_buffers = [buffer for buffer in buffers if buffer.name is not None]
+            fixed_buffers = [
+                buffer
+                for buffer in buffers
+                if self._records[buffer].external is not None
+            ]
             reusable_buffers = [
                 buffer for buffer in buffers if buffer in reusable_conflicts
             ]
@@ -205,11 +261,11 @@ class BufferBuilder:
             allocation_size = 0
             allocation_alignment = 1
             for buffer in fixed_buffers:
-                alignment = data_type_size_bytes(buffer.dtype)
-                allocation_alignment = max(allocation_alignment, alignment)
-                allocation_size = _align_up(allocation_size, alignment)
+                record = self._records[buffer]
+                allocation_alignment = max(allocation_alignment, record.alignment_bytes)
+                allocation_size = _align_up(allocation_size, record.alignment_bytes)
                 locations[buffer] = BufferLocation(allocation_idx, allocation_size)
-                allocation_size += prod(buffer.shape) * alignment
+                allocation_size = _checked_add(allocation_size, record.size_bytes)
 
             allocation_size, reusable_alignment, reusable_offsets = (
                 self._build_reusable_ranges(
@@ -228,15 +284,31 @@ class BufferBuilder:
                 lifetime=allocation.lifetime,
             )
             for buffer in fixed_buffers:
+                record = self._records[buffer]
+                external = record.external
+                if external is None:
+                    message = "internal error: fixed buffer is not external"
+                    raise RuntimeError(message)
                 location = locations[buffer]
                 executable.buffers.add(
-                    name=buffer.name,
+                    name=external.name,
                     allocation_idx=location.allocation_idx,
                     allocation_offset=location.allocation_offset,
-                    data_type=buffer.dtype,
-                    shape=buffer.shape,
+                    data_type=external.dtype,
+                    shape=external.shape,
                 )
         return locations
+
+    def _add_buffer(self, buffer: Buffer, record: _BufferRecord) -> None:
+        """Register one newly created opaque handle and its private metadata."""
+        self._buffers_by_allocation[record.allocation].append(buffer)
+        self._records[buffer] = record
+
+    def _require_owned_allocation(self, allocation: Allocation) -> None:
+        """Reject allocations created by another executable builder."""
+        if not allocation.belongs_to(self):
+            message = "allocation does not belong to this executable builder"
+            raise ValueError(message)
 
     def _build_reusable_ranges(
         self,
@@ -244,11 +316,10 @@ class BufferBuilder:
         conflicts: dict[Buffer, set[Buffer]],
         allocation_size: int,
     ) -> tuple[int, int, dict[Buffer, int]]:
-        """Pack internal buffers into reusable ranges after fixed buffers."""
+        """Pack internal raw ranges into reusable slots after external ranges."""
         slots: list[_AllocationSlot] = []
         for buffer in buffers:
-            size_bytes = prod(buffer.shape) * data_type_size_bytes(buffer.dtype)
-            alignment_bytes = data_type_size_bytes(buffer.dtype)
+            record = self._records[buffer]
             compatible_slots = [
                 slot
                 for slot in slots
@@ -258,17 +329,18 @@ class BufferBuilder:
                 slot = min(
                     compatible_slots,
                     key=lambda candidate: (
-                        candidate.size_bytes != size_bytes,
-                        max(candidate.size_bytes, size_bytes),
-                        max(candidate.alignment_bytes, alignment_bytes),
+                        candidate.size_bytes != record.size_bytes,
+                        max(candidate.size_bytes, record.size_bytes),
+                        max(candidate.alignment_bytes, record.alignment_bytes),
                     ),
                 )
-                slot.size_bytes = max(slot.size_bytes, size_bytes)
-                slot.alignment_bytes = max(slot.alignment_bytes, alignment_bytes)
+                slot.size_bytes = max(slot.size_bytes, record.size_bytes)
+                slot.alignment_bytes = max(slot.alignment_bytes, record.alignment_bytes)
                 slot.buffers.append(buffer)
             else:
-                slot = _AllocationSlot([buffer], size_bytes, alignment_bytes)
-                slots.append(slot)
+                slots.append(
+                    _AllocationSlot([buffer], record.size_bytes, record.alignment_bytes)
+                )
 
         allocation_alignment = 1
         offsets: dict[Buffer, int] = {}
@@ -277,8 +349,89 @@ class BufferBuilder:
             allocation_size = _align_up(allocation_size, slot.alignment_bytes)
             for buffer in slot.buffers:
                 offsets[buffer] = allocation_size
-            allocation_size += slot.size_bytes
+            allocation_size = _checked_add(allocation_size, slot.size_bytes)
         return allocation_size, allocation_alignment, offsets
+
+
+def _validate_name(name: str) -> None:
+    """Reject an empty runtime-visible external-buffer name."""
+    if not name:
+        message = "external buffer name cannot be empty"
+        raise ValueError(message)
+
+
+def _validate_shape(shape: tuple[int, ...]) -> None:
+    """Reject external buffers with empty or non-positive dimensions."""
+    if not shape or any(dimension <= 0 for dimension in shape):
+        message = "external buffer shape must contain only positive dimensions"
+        raise ValueError(message)
+
+
+def _validate_size(size_bytes: int) -> None:
+    """Reject raw allocation sizes outside the executable uint64 range."""
+    if size_bytes <= 0 or size_bytes > _MAX_ALLOCATION_SIZE_BYTES:
+        message = "buffer size must be a positive uint64 value"
+        raise ValueError(message)
+
+
+def _validate_alignment(alignment_bytes: int, *, minimum: int) -> None:
+    """Validate one power-of-two alignment suitable for a raw memory range."""
+    if (
+        alignment_bytes < minimum
+        or alignment_bytes > _MAX_ALLOCATION_SIZE_BYTES
+        or alignment_bytes & (alignment_bytes - 1)
+    ):
+        message = f"alignment must be a power of two no smaller than {minimum}"
+        raise ValueError(message)
+
+
+def _checked_product(shape: tuple[int, ...], element_size: int) -> int:
+    """Return a checked external-buffer byte count."""
+    value = prod(shape)
+    if value > _MAX_ALLOCATION_SIZE_BYTES // element_size:
+        message = "buffer allocation size exceeds uint64"
+        raise ValueError(message)
+    return value * element_size
+
+
+def _checked_add(first: int, second: int) -> int:
+    """Add two allocation sizes without exceeding protobuf uint64 capacity."""
+    if first > _MAX_ALLOCATION_SIZE_BYTES - second:
+        message = "allocation size exceeds uint64"
+        raise ValueError(message)
+    return first + second
+
+
+def _validate_matching_external(  # noqa: PLR0913
+    record: _BufferRecord,
+    *,
+    allocation: Allocation,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: lc0ex_pb2.Buffer.DataType,
+    writable: bool,
+    alignment_bytes: int,
+) -> None:
+    """Ensure repeated declarations describe one identical external range."""
+    external = record.external
+    if record.allocation is not allocation:
+        message = f"buffer {name!r} belongs to a different allocation"
+        raise ValueError(message)
+    if external is None:
+        message = f"buffer {name!r} is not external"
+        raise RuntimeError(message)
+    if external.shape != shape:
+        message = f"shape does not match existing buffer {name!r}"
+        raise ValueError(message)
+    if external.dtype != dtype:
+        message = f"data type does not match existing buffer {name!r}"
+        raise ValueError(message)
+    if record.writable != writable:
+        message = f"writability does not match existing buffer {name!r}"
+        raise ValueError(message)
+    if record.alignment_bytes != alignment_bytes:
+        message = f"alignment does not match existing buffer {name!r}"
+        raise ValueError(message)
 
 
 def _align_up(value: int, alignment: int) -> int:

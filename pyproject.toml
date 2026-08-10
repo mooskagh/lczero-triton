@@ -76,6 +76,7 @@ disable_error_code = [
 module = [
     "lc0ex_pb2",
     "module_manifest_pb2",
+    "net_pb2",
 ]
 disable_error_code = ["type-arg"] # grpcio-tools emits bare Mapping types.
 

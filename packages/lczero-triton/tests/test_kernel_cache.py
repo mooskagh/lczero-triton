@@ -1,0 +1,49 @@
+"""Tests for on-demand BT4 kernel specialization caching."""
+
+from dataclasses import dataclass
+
+from lc0ex import ExecutableBuilder, KernelArtifact
+from lc0ex.proto import lc0ex_pb2
+from lczero_triton.bt4.kernels._cache import KernelCache
+
+POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
+
+
+@dataclass(frozen=True, slots=True)
+class _Specialization:
+    """A minimal immutable compile-time kernel contract."""
+
+    width: int
+
+
+def _compiler(spec: _Specialization) -> KernelArtifact:
+    """Build a unique test artifact for one specialization."""
+    return KernelArtifact(
+        binary_format=lc0ex_pb2.Binary.FORMAT_CUBIN,
+        binary_data=spec.width.to_bytes(),
+        function=f"kernel_{spec.width}",
+        parameters=(POINTER,),
+        grid=(1, 1, 1),
+        block=(32, 1, 1),
+        dynamic_shared_memory_bytes=0,
+    )
+
+
+def test_kernel_cache_reuses_one_compiler_specialization_pair() -> None:
+    """Equivalent immutable requests compile once and reuse one handle."""
+    cache = KernelCache(ExecutableBuilder())
+
+    first = cache.get(_compiler, _Specialization(32))
+    second = cache.get(_compiler, _Specialization(32))
+
+    assert second is first
+
+
+def test_kernel_cache_keeps_distinct_specializations_separate() -> None:
+    """A changed compile-time parameter receives a distinct artifact handle."""
+    cache = KernelCache(ExecutableBuilder())
+
+    first = cache.get(_compiler, _Specialization(32))
+    second = cache.get(_compiler, _Specialization(64))
+
+    assert second is not first
