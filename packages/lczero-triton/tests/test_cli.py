@@ -26,3 +26,10 @@ def test_parser_rejects_retired_command(command: str) -> None:
     """The old build-phase terminology is no longer accepted."""
     with pytest.raises(SystemExit):
         _build_parser().parse_args([command])
+
+
+@pytest.mark.parametrize("option", ["--m", "--n", "--k"])
+def test_parser_rejects_toy_dimensions(option: str) -> None:
+    """The CLI no longer exposes generic matmul dimensions."""
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["kernels", "--output", "module.pb", option, "1"])
