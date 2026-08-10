@@ -2,7 +2,7 @@
 
 from lc0ex import ExecutableBuilder, KernelArtifact
 from lc0ex.proto import lc0ex_pb2
-from lczero_triton.network import MATMUL_KERNEL_NAME, build_matmul_graph
+from lczero_triton.network import build_matmul_graph
 
 
 def test_build_matmul_graph_is_separate_from_compilation() -> None:
@@ -11,10 +11,8 @@ def test_build_matmul_graph_is_separate_from_compilation() -> None:
         lc0ex_pb2.Target.VENDOR_NVIDIA,
         "sm_120",
     )
-    builder.add_kernel(
-        MATMUL_KERNEL_NAME,
+    kernel = builder.add_kernel(
         KernelArtifact(
-            binary_name="matmul_module",
             binary_format=lc0ex_pb2.Binary.FORMAT_CUBIN,
             binary_data=b"fake cubin",
             function="matmul_exported",
@@ -29,6 +27,14 @@ def test_build_matmul_graph_is_separate_from_compilation() -> None:
         ),
     )
 
-    build_matmul_graph(builder)
+    build_matmul_graph(builder, kernel)
 
-    assert builder.build().programs[0].nodes[0].kernel == MATMUL_KERNEL_NAME
+    executable = builder.build()
+
+    assert executable.programs[0].nodes[0].kernel_idx == 0
+    assert [allocation.lifetime for allocation in executable.allocations] == [
+        lc0ex_pb2.Allocation.LIFETIME_PERSISTENT,
+        lc0ex_pb2.Allocation.LIFETIME_EXECUTION,
+    ]
+    assert [buffer.name for buffer in executable.buffers] == ["b", "a", "c"]
+    assert [buffer.allocation_idx for buffer in executable.buffers] == [0, 1, 1]

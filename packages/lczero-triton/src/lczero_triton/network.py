@@ -1,28 +1,25 @@
 """Lc0 graph definitions used by the example network."""
 
-from lc0ex import ExecutableBuilder
+from lc0ex import ExecutableBuilder, KernelHandle
 from lc0ex.proto import lc0ex_pb2
 
 M = 128
 N = 256
 K = 64
-MATMUL_KERNEL_NAME = f"matmul_{M}_{N}_{K}"
 _F16 = lc0ex_pb2.Buffer.DATA_TYPE_F16
-
-
-def matmul_kernel_name(m: int, n: int, k: int) -> str:
-    """Return the logical name for one statically shaped matmul."""
-    return f"matmul_{m}_{n}_{k}"
 
 
 def build_matmul_graph(
     builder: ExecutableBuilder,
+    kernel: KernelHandle,
     m: int = M,
     n: int = N,
     k: int = K,
 ) -> None:
     """Append the statically shaped matmul graph to *builder*."""
-    a = builder.buffer("a", (m, k), _F16)
-    b = builder.buffer("b", (k, n), _F16)
-    c = builder.buffer("c", (m, n), _F16, writable=True)
-    builder.call(matmul_kernel_name(m, n, k), a, b, c, readonly=(a, b))
+    persistent = builder.allocation(lc0ex_pb2.Allocation.LIFETIME_PERSISTENT)
+    execution = builder.allocation(lc0ex_pb2.Allocation.LIFETIME_EXECUTION)
+    a = execution.buffer((m, k), _F16, name="a")
+    b = persistent.buffer((k, n), _F16, name="b")
+    c = execution.buffer((m, n), _F16, name="c", writable=True)
+    builder.call(kernel, a, b, c, readonly=(a, b))

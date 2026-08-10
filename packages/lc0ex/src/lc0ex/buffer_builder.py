@@ -1,20 +1,45 @@
 """Logical buffer handles and executable allocation serialization support."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import prod
 
 from lc0ex.proto import lc0ex_pb2
 
-_PERSISTENT_ALLOCATION_NAME = "persistent"
-_EXECUTION_ALLOCATION_NAME = "execution"
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Allocation:
+    """A logical device-memory allocation owned by an executable builder."""
+
+    lifetime: lc0ex_pb2.Allocation.Lifetime
+    _owner: "BufferBuilder" = field(repr=False)
+
+    def buffer(
+        self,
+        shape: Sequence[int] | None = None,
+        dtype: lc0ex_pb2.Buffer.DataType | None = None,
+        *,
+        name: str | None = None,
+        writable: bool = False,
+    ) -> "Buffer":
+        """Create or retrieve a buffer within this allocation.
+
+        Named buffers are runtime-visible fixed ranges. Unnamed execution
+        buffers are internal ranges whose storage can be reused by the graph.
+        """
+        return self._owner.buffer(self, shape, dtype, name=name, writable=writable)
+
+    def belongs_to(self, owner: "BufferBuilder") -> bool:
+        """Return whether this allocation belongs to *owner*."""
+        return self._owner is owner
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class Buffer:
     """A logical buffer that can be passed to other executable builders."""
 
-    name: str
+    allocation: Allocation
+    name: str | None
     shape: tuple[int, ...]
     dtype: lc0ex_pb2.Buffer.DataType
 
@@ -45,154 +70,181 @@ class _AllocationSlot:
     alignment_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class BufferLocation:
+    """The planned location of one logical buffer."""
+
+    allocation_idx: int
+    allocation_offset: int
+
+
 class BufferBuilder:
-    """Collect persistent and temporary logical buffers."""
+    """Collect logical allocations and their buffers."""
 
     def __init__(self) -> None:
         """Initialize an empty buffer collection."""
-        self._buffers: dict[str, Buffer] = {}
-        self._temporary_buffers: set[Buffer] = set()
-        self._next_temporary_buffer = 0
+        self._allocations: list[Allocation] = []
+        self._buffers_by_allocation: dict[Allocation, list[Buffer]] = {}
+        self._named_buffers: dict[str, Buffer] = {}
+        self._writable_buffers: set[Buffer] = set()
+
+    def allocation(
+        self,
+        lifetime: lc0ex_pb2.Allocation.Lifetime,
+    ) -> Allocation:
+        """Create an allocation with the given runtime lifetime."""
+        if lifetime not in {
+            lc0ex_pb2.Allocation.LIFETIME_PERSISTENT,
+            lc0ex_pb2.Allocation.LIFETIME_EXECUTION,
+        }:
+            message = "allocation lifetime must be PERSISTENT or EXECUTION"
+            raise ValueError(message)
+        allocation = Allocation(lifetime, self)
+        self._allocations.append(allocation)
+        self._buffers_by_allocation[allocation] = []
+        return allocation
 
     def buffer(
         self,
-        name: str,
+        allocation: Allocation,
         shape: Sequence[int] | None = None,
         dtype: lc0ex_pb2.Buffer.DataType | None = None,
+        *,
+        name: str | None = None,
+        writable: bool = False,
     ) -> Buffer:
-        """Create or retrieve a persistent buffer named *name*.
+        """Create or retrieve a buffer in *allocation*.
 
-        A new buffer requires both *shape* and *dtype*. When retrieving an
-        existing buffer, either may be omitted; supplied values must match the
-        original definition.
+        A new buffer requires both *shape* and *dtype*. Named buffers are
+        looked up globally; supplied values must match an existing definition.
         """
-        existing = self._buffers.get(name)
         normalized_shape = tuple(shape) if shape is not None else None
+        existing = self._existing_buffer(allocation, name)
 
         if existing is not None:
+            if existing.allocation is not allocation:
+                message = f"buffer {name!r} belongs to a different allocation"
+                raise ValueError(message)
             if normalized_shape is not None and normalized_shape != existing.shape:
                 message = f"shape does not match existing buffer {name!r}"
                 raise ValueError(message)
             if dtype is not None and dtype != existing.dtype:
                 message = f"data type does not match existing buffer {name!r}"
                 raise ValueError(message)
+            if writable:
+                self._writable_buffers.add(existing)
             return existing
 
         if normalized_shape is None or dtype is None:
-            message = f"shape and data type are required for new buffer {name!r}"
+            message = "shape and data type are required for new buffers"
             raise ValueError(message)
-        result = Buffer(name=name, shape=normalized_shape, dtype=dtype)
-        self._buffers[name] = result
+        result = Buffer(
+            allocation=allocation,
+            name=name,
+            shape=normalized_shape,
+            dtype=dtype,
+        )
+        self._buffers_by_allocation[allocation].append(result)
+        if name is not None:
+            self._named_buffers[name] = result
+        if writable:
+            self._writable_buffers.add(result)
         return result
 
-    def tmp_buffer(
+    def _existing_buffer(
         self,
-        shape: Sequence[int],
-        dtype: lc0ex_pb2.Buffer.DataType,
-    ) -> Buffer:
-        """Create a temporary buffer with an automatically generated name."""
-        while True:
-            name = f"tmp_{self._next_temporary_buffer}"
-            self._next_temporary_buffer += 1
-            if name not in self._buffers:
-                break
-
-        result = Buffer(name=name, shape=tuple(shape), dtype=dtype)
-        self._buffers[name] = result
-        self._temporary_buffers.add(result)
-        return result
+        allocation: Allocation,
+        name: str | None,
+    ) -> Buffer | None:
+        """Validate *allocation* and look up its named buffer, if any."""
+        if not allocation.belongs_to(self):
+            message = "allocation does not belong to this executable builder"
+            raise ValueError(message)
+        if name is not None:
+            return self._named_buffers.get(name)
+        if allocation.lifetime != lc0ex_pb2.Allocation.LIFETIME_EXECUTION:
+            message = "unnamed buffers require an EXECUTION allocation"
+            raise ValueError(message)
+        return None
 
     def owns(self, buffer: Buffer) -> bool:
         """Return whether *buffer* is a handle created by this collection."""
-        return self._buffers.get(buffer.name) is buffer
-
-    def is_temporary(self, buffer: Buffer) -> bool:
-        """Return whether *buffer* has execution lifetime."""
-        return buffer in self._temporary_buffers
-
-    def temporary_buffers(self) -> tuple[Buffer, ...]:
-        """Return every temporary buffer in declaration order."""
-        return tuple(
-            buffer
-            for buffer in self._buffers.values()
-            if buffer in self._temporary_buffers
+        if not buffer.allocation.belongs_to(self):
+            return False
+        return any(
+            buffer is candidate
+            for buffers in self._buffers_by_allocation.values()
+            for candidate in buffers
         )
+
+    def is_reusable(self, buffer: Buffer) -> bool:
+        """Return whether *buffer* is an internal reusable execution range."""
+        return buffer.name is None
+
+    def is_writable(self, buffer: Buffer) -> bool:
+        """Return whether *buffer* was declared writable."""
+        return buffer in self._writable_buffers
 
     def build(
         self,
         executable: lc0ex_pb2.NeuralExecutable,
-        temporary_conflicts: dict[Buffer, set[Buffer]],
-    ) -> None:
-        """Append collected buffers and their planned allocations to *executable*."""
-        persistent_buffers = [
-            buffer
-            for buffer in self._buffers.values()
-            if buffer not in self._temporary_buffers
-        ]
-        temporary_buffers = [
-            buffer
-            for buffer in self._buffers.values()
-            if buffer in self._temporary_buffers
-        ]
-        offsets: dict[Buffer, int] = {}
-        self._build_persistent_allocation(executable, persistent_buffers, offsets)
-        self._build_execution_allocation(
-            executable,
-            temporary_buffers,
-            temporary_conflicts,
-            offsets,
-        )
+        reusable_conflicts: dict[Buffer, set[Buffer]],
+    ) -> dict[Buffer, BufferLocation]:
+        """Append allocations and return locations for every used buffer."""
+        locations: dict[Buffer, BufferLocation] = {}
+        for allocation in self._allocations:
+            buffers = self._buffers_by_allocation[allocation]
+            fixed_buffers = [buffer for buffer in buffers if buffer.name is not None]
+            reusable_buffers = [
+                buffer for buffer in buffers if buffer in reusable_conflicts
+            ]
+            if not fixed_buffers and not reusable_buffers:
+                continue
 
-        for buffer in self._buffers.values():
-            serialized_buffer = executable.buffers.add(
-                name=buffer.name,
-                data_type=buffer.dtype,
-                shape=buffer.shape,
+            allocation_idx = len(executable.allocations)
+            allocation_size = 0
+            allocation_alignment = 1
+            for buffer in fixed_buffers:
+                alignment = data_type_size_bytes(buffer.dtype)
+                allocation_alignment = max(allocation_alignment, alignment)
+                allocation_size = _align_up(allocation_size, alignment)
+                locations[buffer] = BufferLocation(allocation_idx, allocation_size)
+                allocation_size += prod(buffer.shape) * alignment
+
+            allocation_size, reusable_alignment, reusable_offsets = (
+                self._build_reusable_ranges(
+                    reusable_buffers,
+                    reusable_conflicts,
+                    allocation_size,
+                )
             )
-            serialized_buffer.allocation_block.allocation = (
-                _EXECUTION_ALLOCATION_NAME
-                if buffer in self._temporary_buffers
-                else _PERSISTENT_ALLOCATION_NAME
+            allocation_alignment = max(allocation_alignment, reusable_alignment)
+            for buffer, offset in reusable_offsets.items():
+                locations[buffer] = BufferLocation(allocation_idx, offset)
+
+            executable.allocations.add(
+                size_bytes=allocation_size,
+                alignment_bytes=allocation_alignment,
+                lifetime=allocation.lifetime,
             )
-            serialized_buffer.allocation_block.offset_bytes = offsets[buffer]
+            for buffer in fixed_buffers:
+                location = locations[buffer]
+                executable.buffers.add(
+                    name=buffer.name,
+                    allocation_idx=location.allocation_idx,
+                    allocation_offset=location.allocation_offset,
+                    data_type=buffer.dtype,
+                    shape=buffer.shape,
+                )
+        return locations
 
-    def _build_persistent_allocation(
+    def _build_reusable_ranges(
         self,
-        executable: lc0ex_pb2.NeuralExecutable,
-        buffers: list[Buffer],
-        offsets: dict[Buffer, int],
-    ) -> None:
-        """Allocate persistent buffers in declaration order."""
-        if not buffers:
-            return
-
-        allocation_size = 0
-        allocation_alignment = 1
-        for buffer in buffers:
-            alignment = data_type_size_bytes(buffer.dtype)
-            allocation_alignment = max(allocation_alignment, alignment)
-            allocation_size = _align_up(allocation_size, alignment)
-            offsets[buffer] = allocation_size
-            allocation_size += prod(buffer.shape) * alignment
-
-        executable.allocations.add(
-            name=_PERSISTENT_ALLOCATION_NAME,
-            size_bytes=allocation_size,
-            alignment_bytes=allocation_alignment,
-            lifetime=lc0ex_pb2.Allocation.LIFETIME_PERSISTENT,
-        )
-
-    def _build_execution_allocation(
-        self,
-        executable: lc0ex_pb2.NeuralExecutable,
         buffers: list[Buffer],
         conflicts: dict[Buffer, set[Buffer]],
-        offsets: dict[Buffer, int],
-    ) -> None:
-        """Allocate non-overlapping temporary lifetimes into reusable slots."""
-        if not buffers:
-            return
-
+        allocation_size: int,
+    ) -> tuple[int, int, dict[Buffer, int]]:
+        """Pack internal buffers into reusable ranges after fixed buffers."""
         slots: list[_AllocationSlot] = []
         for buffer in buffers:
             size_bytes = prod(buffer.shape) * data_type_size_bytes(buffer.dtype)
@@ -218,21 +270,15 @@ class BufferBuilder:
                 slot = _AllocationSlot([buffer], size_bytes, alignment_bytes)
                 slots.append(slot)
 
-        allocation_size = 0
         allocation_alignment = 1
+        offsets: dict[Buffer, int] = {}
         for slot in slots:
             allocation_alignment = max(allocation_alignment, slot.alignment_bytes)
             allocation_size = _align_up(allocation_size, slot.alignment_bytes)
             for buffer in slot.buffers:
                 offsets[buffer] = allocation_size
             allocation_size += slot.size_bytes
-
-        executable.allocations.add(
-            name=_EXECUTION_ALLOCATION_NAME,
-            size_bytes=allocation_size,
-            alignment_bytes=allocation_alignment,
-            lifetime=lc0ex_pb2.Allocation.LIFETIME_EXECUTION,
-        )
+        return allocation_size, allocation_alignment, offsets
 
 
 def _align_up(value: int, alignment: int) -> int:
