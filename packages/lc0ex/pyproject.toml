@@ -15,15 +15,11 @@ packages = ["src/lc0ex"]
 [tool.hatch.build.targets.wheel.force-include]
 "src/lc0ex_pb2.py" = "lc0ex_pb2.py"
 "src/lc0ex_pb2.pyi" = "lc0ex_pb2.pyi"
-"src/module_manifest_pb2.py" = "module_manifest_pb2.py"
-"src/module_manifest_pb2.pyi" = "module_manifest_pb2.pyi"
 "src/net_pb2.py" = "net_pb2.py"
 "src/net_pb2.pyi" = "net_pb2.pyi"
 
 [tool.hatch.build.targets.sdist.force-include]
 "src/lc0ex_pb2.py" = "src/lc0ex_pb2.py"
 "src/lc0ex_pb2.pyi" = "src/lc0ex_pb2.pyi"
-"src/module_manifest_pb2.py" = "src/module_manifest_pb2.py"
-"src/module_manifest_pb2.pyi" = "src/module_manifest_pb2.pyi"
 "src/net_pb2.py" = "src/net_pb2.py"
 "src/net_pb2.pyi" = "src/net_pb2.pyi"

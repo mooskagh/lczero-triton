@@ -49,6 +49,7 @@ ignore = [
     "INP001", # Test directories are discovered by pytest.
 ]
 "packages/lczero-triton/src/lczero_triton/bt4/kernels/**/*.py" = [
+    "ANN001", # Triton pointer arguments cannot carry ordinary Python annotations.
     "PLR0913", # Triton kernels expose their explicit device ABI.
     "PLR0917", # Triton kernels expose their explicit device ABI.
 ]
@@ -66,22 +67,29 @@ warn_unreachable = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
+module = ["triton", "triton.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = ["lczero_triton.bt4.kernels.*"]
 disable_error_code = [
-    "import-untyped", # Triton does not provide typing information.
-    "untyped-decorator", # Triton's decorators consequently remain untyped.
+    "no-untyped-def", # Triton pointer parameters use its generated device ABI.
+    "untyped-decorator", # Triton's decorators do not preserve Python typing.
 ]
 
 [[tool.mypy.overrides]]
 module = [
     "lc0ex_pb2",
-    "module_manifest_pb2",
     "net_pb2",
 ]
 disable_error_code = ["type-arg"] # grpcio-tools emits bare Mapping types.
 
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers"]
+markers = [
+    "gpu: requires a CUDA-capable GPU and launches device kernels",
+]
 pythonpath = [
     "packages/lc0ex/src",
     "packages/lczero-triton/src",

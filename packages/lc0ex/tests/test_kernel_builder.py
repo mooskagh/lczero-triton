@@ -80,6 +80,14 @@ def test_add_kernel_and_call_serializes_generic_metadata() -> None:
     ] == [0, 0, 0]
 
 
+def test_set_target_rejects_conflicting_architecture() -> None:
+    """A later compilation target cannot replace the executable target."""
+    builder = _builder()
+
+    with pytest.raises(ValueError, match="does not match"):
+        builder.set_target(lc0ex_pb2.Target.VENDOR_NVIDIA, "sm_90")
+
+
 def test_readonly_external_buffers_have_no_dependency() -> None:
     """Named persistent ranges default to readonly accesses."""
     builder = _builder()

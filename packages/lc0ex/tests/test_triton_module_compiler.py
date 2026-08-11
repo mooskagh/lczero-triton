@@ -1,12 +1,11 @@
-"""Tests for manifest emission without requiring a GPU compilation."""
+"""Tests for adapting Triton compiler output to linker artifacts."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
-from google.protobuf import text_format
-from lc0ex.proto import lc0ex_pb2, module_manifest_pb2
-from lc0ex.triton_module_compiler import write_module
+import pytest
+from lc0ex.proto import lc0ex_pb2
+from lc0ex.triton_module_compiler import artifact_from_triton
 
 _SHARED_MEMORY_BYTES = 64
 
@@ -32,61 +31,44 @@ class _FakeCompiledKernel:
     name: str
 
 
-def test_write_module_emits_artifacts_and_manifest(tmp_path: Path) -> None:
-    """The compiler writer emits the complete linker contract."""
+def test_artifact_from_triton_preserves_binary_abi_and_launch() -> None:
+    """The adapter retains the complete in-memory linker contract."""
     compiled = _FakeCompiledKernel(
         name="kernel_exported",
-        asm={
-            "ttir": "fake ttir",
-            "ttgir": "fake ttgir",
-            "llir": "fake llir",
-            "ptx": "fake ptx",
-            "cubin": b"fake cubin",
-        },
+        asm={"cubin": b"fake cubin"},
         metadata=_FakeMetadata(
             num_warps=4,
             shared=_SHARED_MEMORY_BYTES,
             target=_FakeTarget(backend="cuda", arch=120, warp_size=32),
         ),
     )
-    output_basename = tmp_path / "module"
-    manifest_path = write_module(
-        output_basename,
+
+    artifact = artifact_from_triton(
         compiled,
         grid=(2, 3, 1),
-        parameters=(2, 2, 2),
-        symbols=("mapping_table",),
+        parameters=(
+            lc0ex_pb2.PARAMETER_TYPE_POINTER,
+            lc0ex_pb2.PARAMETER_TYPE_POINTER,
+        ),
     )
 
-    manifest = module_manifest_pb2.ModuleManifest()
-    text_format.Parse(manifest_path.read_text(encoding="utf-8"), manifest)
-    kernel = manifest.kernels[0]
-
-    assert manifest_path == tmp_path / "module.manifest"
-    assert manifest.binary_path == "module.cubin"
-    assert manifest.binary_format == lc0ex_pb2.Binary.FORMAT_CUBIN
-    assert manifest.target.vendor == lc0ex_pb2.Target.VENDOR_NVIDIA
-    assert manifest.target.architecture == "sm_120"
-    assert kernel.function == "kernel_exported"
-    assert tuple(kernel.parameters) == (2, 2, 2)
-    assert tuple(kernel.grid) == (2, 3, 1)
-    assert tuple(kernel.block) == (128, 1, 1)
-    assert kernel.dynamic_shared_memory_bytes == _SHARED_MEMORY_BYTES
-    assert manifest.symbols[0].symbol_name == "mapping_table"
-    assert (tmp_path / "module.ttir").read_text(encoding="utf-8") == "fake ttir"
-    assert (tmp_path / "module.ttgir").read_text(encoding="utf-8") == "fake ttgir"
-    assert (tmp_path / "module.llir").read_text(encoding="utf-8") == "fake llir"
-    assert (tmp_path / "module.ptx").read_text(encoding="utf-8") == "fake ptx"
-    assert (tmp_path / "module.cubin").read_bytes() == b"fake cubin"
+    assert artifact.binary_format == lc0ex_pb2.Binary.FORMAT_CUBIN
+    assert artifact.binary_data == b"fake cubin"
+    assert artifact.function == "kernel_exported"
+    assert artifact.parameters == (
+        lc0ex_pb2.PARAMETER_TYPE_POINTER,
+        lc0ex_pb2.PARAMETER_TYPE_POINTER,
+    )
+    assert artifact.grid == (2, 3, 1)
+    assert artifact.block == (128, 1, 1)
+    assert artifact.dynamic_shared_memory_bytes == _SHARED_MEMORY_BYTES
 
 
-def test_write_module_appends_extensions_to_basename(
-    tmp_path: Path,
-) -> None:
-    """Artifact extensions are appended without stripping the basename."""
+def test_artifact_from_triton_rejects_missing_cubin() -> None:
+    """A linker artifact always carries a non-empty device binary."""
     compiled = _FakeCompiledKernel(
         name="kernel_exported",
-        asm={"cubin": b"fake cubin"},
+        asm={"cubin": b""},
         metadata=_FakeMetadata(
             num_warps=4,
             shared=0,
@@ -94,12 +76,5 @@ def test_write_module_appends_extensions_to_basename(
         ),
     )
 
-    manifest_path = write_module(
-        tmp_path / "module.v1",
-        compiled,
-        grid=(2, 3, 1),
-        parameters=(2, 2, 2),
-    )
-
-    assert manifest_path == tmp_path / "module.v1.manifest"
-    assert (tmp_path / "module.v1.cubin").read_bytes() == b"fake cubin"
+    with pytest.raises(RuntimeError, match="non-empty CUBIN"):
+        artifact_from_triton(compiled, grid=(1, 1, 1), parameters=())

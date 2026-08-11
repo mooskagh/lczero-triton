@@ -13,7 +13,6 @@ from lc0ex.kernel_builder import (
     SymbolArtifact,
     SymbolHandle,
 )
-from lc0ex.module_loader import load_module
 from lc0ex.proto import lc0ex_pb2
 
 _MAGIC = 0x1C0E
@@ -59,26 +58,12 @@ class ExecutableBuilder:
         architecture: str,
     ) -> Self:
         """Set the executable's compilation target and return this builder."""
-        self._target = (vendor, architecture)
-        return self
-
-    def add_module(
-        self,
-        manifest_path: str | PathLike[str],
-    ) -> tuple[KernelHandle | SymbolHandle, ...]:
-        """Load a compiled module manifest and return its export handles."""
-        module = load_module(manifest_path)
-        target = (module.target_vendor, module.target_architecture)
-        if self._target is None:
-            self._target = target
-        elif self._target != target:
-            message = "module target does not match the executable target"
+        target = (vendor, architecture)
+        if self._target is not None and self._target != target:
+            message = "target does not match the executable target"
             raise ValueError(message)
-
-        return (
-            *(self.add_kernel(kernel) for kernel in module.kernels),
-            *(self.add_symbol(symbol) for symbol in module.symbols),
-        )
+        self._target = target
+        return self
 
     def add_kernel(self, kernel: KernelArtifact) -> KernelHandle:
         """Register a compiled kernel and return its opaque handle."""

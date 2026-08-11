@@ -8,7 +8,6 @@ from lc0ex.kernel_builder import (
     SymbolArtifact,
     SymbolHandle,
 )
-from lc0ex.module_loader import ModuleArtifact, load_module
 
 __all__ = [
     "Allocation",
@@ -16,8 +15,6 @@ __all__ = [
     "ExecutableBuilder",
     "KernelArtifact",
     "KernelHandle",
-    "ModuleArtifact",
     "SymbolArtifact",
     "SymbolHandle",
-    "load_module",
 ]
