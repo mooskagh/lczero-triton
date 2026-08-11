@@ -3,6 +3,7 @@
 import pytest
 import torch
 from lczero_triton.bt4.kernels.copy_type_converted import (
+    _autotune_grid,
     _copy_type_converted_kernel,
 )
 
@@ -19,12 +20,10 @@ def test_copy_type_converted_matches_torch_with_tail() -> None:
     input_cuda = input_cpu.cuda()
     output = torch.empty(element_count, dtype=torch.float32, device="cuda")
 
-    _copy_type_converted_kernel[(2,)](
+    _copy_type_converted_kernel[_autotune_grid](
         output,
         input_cuda,
         element_count,
-        256,
-        num_warps=8,
     )
 
     torch.testing.assert_close(output.cpu(), input_cpu.float(), rtol=0.0, atol=0.0)

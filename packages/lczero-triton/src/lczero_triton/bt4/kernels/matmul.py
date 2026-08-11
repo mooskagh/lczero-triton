@@ -11,6 +11,7 @@ from lc0ex import Buffer, ExecutableBuilder, KernelArtifact
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
+from lczero_triton.bt4.kernels._autotune import validate_active_architecture
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
@@ -145,24 +146,9 @@ class MatmulSpecialization:
             raise ValueError(message)
 
 
-def _validate_active_architecture(architecture: int) -> None:
-    """Require tuning and compilation on the requested CUDA architecture."""
-    if not torch.cuda.is_available():
-        message = "dense GEMM autotuning requires an available CUDA device"
-        raise RuntimeError(message)
-    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-    active_architecture = major * 10 + minor
-    if active_architecture != architecture:
-        message = (
-            f"dense GEMM requested sm_{architecture}, but the active device is "
-            f"sm_{active_architecture}"
-        )
-        raise ValueError(message)
-
-
 def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
     """Autotune and compile one contiguous FP16 dense GEMM specialization."""
-    _validate_active_architecture(specialization.architecture)
+    validate_active_architecture(specialization.architecture)
     output = torch.empty(
         (specialization.m, specialization.n),
         dtype=torch.float16,

@@ -2,7 +2,10 @@
 
 import pytest
 import torch
-from lczero_triton.bt4.kernels.nchw_to_nhwc import _nchw_to_nhwc_kernel
+from lczero_triton.bt4.kernels.nchw_to_nhwc import (
+    _autotune_grid,
+    _nchw_to_nhwc_kernel,
+)
 
 pytestmark = [
     pytest.mark.gpu,
@@ -27,7 +30,7 @@ def test_nchw_to_nhwc_extracts_first_channels_with_tail() -> None:
         device="cuda",
     )
 
-    _nchw_to_nhwc_kernel[(1,)](
+    _nchw_to_nhwc_kernel[_autotune_grid](
         output,
         input_cpu.cuda(),
         batch_size,
@@ -35,8 +38,6 @@ def test_nchw_to_nhwc_extracts_first_channels_with_tail() -> None:
         output_channels,
         height,
         width,
-        256,
-        num_warps=8,
     )
 
     expected = input_cpu[:, :output_channels].permute(0, 2, 3, 1).contiguous()

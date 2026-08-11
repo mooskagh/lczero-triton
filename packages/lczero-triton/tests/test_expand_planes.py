@@ -2,7 +2,10 @@
 
 import pytest
 import torch
-from lczero_triton.bt4.kernels.expand_planes import _expand_planes_kernel
+from lczero_triton.bt4.kernels.expand_planes import (
+    _autotune_grid,
+    _expand_planes_kernel,
+)
 
 pytestmark = [
     pytest.mark.gpu,
@@ -21,7 +24,7 @@ def test_expand_planes_matches_mask_bits_and_masks_plane_tail() -> None:
     values = plane_values.cuda()
     output = torch.empty((5, 64), dtype=torch.float16, device="cuda")
 
-    _expand_planes_kernel[(2,)](output, masks, values, 5, 64, 256, num_warps=8)
+    _expand_planes_kernel[_autotune_grid](output, masks, values, 5, 64)
 
     expected = torch.zeros((5, 64), dtype=torch.float16)
     rounded_values = plane_values.half()

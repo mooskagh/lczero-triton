@@ -11,6 +11,7 @@ from lc0ex.triton_module_compiler import compile_ptx
 _POLICY_SIZE = 1858
 _POLICY_INPUT_SIZE = 4288
 _SYMBOL_NAME = "lczero_bt4_mapping_table"
+_BLACKWELL_ARCHITECTURE = 100
 _ENCODED_TABLE = (
     b"c-k%51(y)S8U|oe=>}oxl$Ms3?q0gPmhJ}W?(SH+yFpr7VnJG3VnJH^KAy`t^ZbJM%*^-BgbfoWOgO?5frxy^_e3HxQHVus;*gNU"
     b"q#zCH$wD^rke6R5LNSU{f|8V?G-W7DIm%Oos#GJ8I@G5LEoegrI@6Qh4B}UYFqB~oX9Ob|#c0MbmWfPaGE<n!Z050;WvpU7o7lx~"
@@ -67,9 +68,11 @@ def values() -> tuple[int, ...]:
 def compile_symbol(*, architecture: str) -> SymbolArtifact:
     """Compile the immutable attention-policy gather table as a module symbol."""
     entries = ", ".join(str(value) for value in values())
+    architecture_number = int(architecture.removeprefix("sm_"))
+    ptx_version = "8.7" if architecture_number >= _BLACKWELL_ARCHITECTURE else "8.0"
     ptx = "\n".join(
         (
-            ".version 8.0",
+            f".version {ptx_version}",
             f".target {architecture}",
             ".address_size 64",
             "",

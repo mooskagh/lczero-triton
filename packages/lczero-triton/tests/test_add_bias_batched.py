@@ -2,7 +2,10 @@
 
 import pytest
 import torch
-from lczero_triton.bt4.kernels.add_bias_batched import _add_bias_batched_kernel
+from lczero_triton.bt4.kernels.add_bias_batched import (
+    _add_bias_batched_kernel,
+    _autotune_grid,
+)
 
 pytestmark = [
     pytest.mark.gpu,
@@ -49,17 +52,27 @@ def test_add_bias_batched_selects_each_batch_bias_in_place(
     ).reshape(batch_count, channel_count)
     expected = _activate(inputs.float() + bias.float().unsqueeze(1), activation).half()
     result = inputs.cuda()
+    bias_cuda = bias.cuda()
 
-    _add_bias_batched_kernel[(3,)](
+    # Tune out of place so candidate launches cannot repeatedly mutate the input.
+    _add_bias_batched_kernel[_autotune_grid](
+        torch.empty_like(result),
         result,
-        result,
-        bias.cuda(),
+        bias_cuda,
         batch_count,
         row_count,
         channel_count,
         _ACTIVATIONS[activation],
-        256,
-        num_warps=8,
+    )
+
+    _add_bias_batched_kernel[_autotune_grid](
+        result,
+        result,
+        bias_cuda,
+        batch_count,
+        row_count,
+        channel_count,
+        _ACTIVATIONS[activation],
     )
 
     torch.testing.assert_close(result.cpu(), expected, rtol=1e-3, atol=2e-3)

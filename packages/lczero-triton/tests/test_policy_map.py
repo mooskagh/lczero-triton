@@ -3,7 +3,7 @@
 import pytest
 import torch
 from lczero_triton.bt4.kernels.mapping_table import values
-from lczero_triton.bt4.kernels.policy_map import _policy_map_kernel
+from lczero_triton.bt4.kernels.policy_map import _autotune_grid, _policy_map_kernel
 
 pytestmark = [
     pytest.mark.gpu,
@@ -26,15 +26,13 @@ def test_policy_map_gathers_all_outputs_for_adjacent_batches() -> None:
         device="cuda",
     )
 
-    _policy_map_kernel[(15,)](
+    _policy_map_kernel[_autotune_grid](
         output,
         inputs.cuda(),
         mapping_cpu.cuda(),
         batch_size,
         input_element_count,
         len(mapping_cpu),
-        256,
-        num_warps=8,
     )
 
     expected = inputs[:, mapping_cpu.long()]
@@ -47,15 +45,13 @@ def test_policy_map_zeros_negative_and_out_of_range_indices() -> None:
     mapping = torch.tensor([0, -1, 7, 8, 3, -4], dtype=torch.int32)
     output = torch.empty((2, 6), dtype=torch.float16, device="cuda")
 
-    _policy_map_kernel[(1,)](
+    _policy_map_kernel[_autotune_grid](
         output,
         inputs.cuda(),
         mapping.cuda(),
         2,
         8,
         6,
-        256,
-        num_warps=8,
     )
 
     expected = torch.tensor(

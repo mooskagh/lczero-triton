@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from lczero_triton.bt4.kernels.add_vectors import _add_vectors_kernel
+from lczero_triton.bt4.kernels.add_vectors import _add_vectors_kernel, _autotune_grid
 
 pytestmark = [
     pytest.mark.gpu,
@@ -45,16 +45,25 @@ def test_add_vectors_broadcasts_periodically_in_place_with_tail(
     ]
     expected = _activate(inputs.float() + repeated_bias.float(), activation).half()
     result = inputs.cuda()
+    bias_cuda = bias.cuda()
 
-    _add_vectors_kernel[(2,)](
+    # Tune out of place so candidate launches cannot repeatedly mutate the input.
+    _add_vectors_kernel[_autotune_grid](
+        torch.empty_like(result),
         result,
-        result,
-        bias.cuda(),
+        bias_cuda,
         element_count,
         len(bias),
         _ACTIVATIONS[activation],
-        256,
-        num_warps=8,
+    )
+
+    _add_vectors_kernel[_autotune_grid](
+        result,
+        result,
+        bias_cuda,
+        element_count,
+        len(bias),
+        _ACTIVATIONS[activation],
     )
 
     torch.testing.assert_close(result.cpu(), expected, rtol=1e-3, atol=2e-3)

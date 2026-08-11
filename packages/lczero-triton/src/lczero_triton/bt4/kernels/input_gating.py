@@ -1,21 +1,30 @@
 """Multiplicative and additive input-gating kernel family."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import cast
 
+import torch
 import triton
 import triton.language as tl
 from lc0ex import Buffer, ExecutableBuilder, KernelArtifact
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
-from triton.backends.compiler import GPUTarget
-from triton.compiler import ASTSource
 
+from lczero_triton.bt4.kernels._autotune import (
+    elementwise_configs,
+    validate_active_architecture,
+)
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
-_WARP_SIZE = 32
 
 
+@triton.autotune(
+    configs=elementwise_configs(),
+    key=["batch_size", "square_count", "channel_count"],
+    cache_results=True,
+)
 @triton.jit
 def _input_gating_kernel(
     output,
@@ -53,8 +62,6 @@ class InputGatingSpecialization:
     square_count: int
     channel_count: int
     architecture: int
-    block_size: int = 256
-    num_warps: int = 8
 
     def __post_init__(self) -> None:
         """Validate dimensions and launch configuration."""
@@ -67,54 +74,68 @@ class InputGatingSpecialization:
         if self.architecture <= 0:
             message = "architecture must be positive"
             raise ValueError(message)
-        if self.block_size <= 0 or self.block_size & (self.block_size - 1):
-            message = "block_size must be a positive power of two"
-            raise ValueError(message)
-        if self.num_warps <= 0:
-            message = "num_warps must be positive"
-            raise ValueError(message)
+
+
+def _element_count(configuration: Mapping[str, object]) -> int:
+    """Return the tensor element count from kernel configuration values."""
+    return (
+        cast("int", configuration["batch_size"])
+        * cast("int", configuration["square_count"])
+        * cast("int", configuration["channel_count"])
+    )
+
+
+def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
+    """Return the flat gating grid for a tuning candidate."""
+    block_size = cast("int", configuration["block_size"])
+    return ((_element_count(configuration) + block_size - 1) // block_size,)
+
+
+def _artifact_grid(
+    configuration: Mapping[str, object],
+    element_count: int,
+) -> tuple[int, int, int]:
+    """Resolve the serialized grid from the selected configuration."""
+    block_size = cast("int", configuration["block_size"])
+    return ((element_count + block_size - 1) // block_size, 1, 1)
 
 
 def compile_input_gating(
     specialization: InputGatingSpecialization,
 ) -> KernelArtifact:
-    """Compile one ONNX-layout FP16 input-gating specialization."""
+    """Autotune and compile one ONNX-layout FP16 input-gating specialization."""
+    validate_active_architecture(specialization.architecture)
     element_count = (
         specialization.batch_size
         * specialization.square_count
         * specialization.channel_count
     )
-    grid = (
-        (element_count + specialization.block_size - 1) // specialization.block_size,
-        1,
-        1,
+    output = torch.empty(element_count, dtype=torch.float16, device="cuda")
+    input_ = torch.zeros(element_count, dtype=torch.float16, device="cuda")
+    gate_element_count = specialization.square_count * specialization.channel_count
+    multiplicative_gate = torch.zeros(
+        gate_element_count,
+        dtype=torch.float16,
+        device="cuda",
     )
-    compiled = triton.compile(
-        ASTSource(
-            _input_gating_kernel,
-            {
-                "output": "*fp16",
-                "input_": "*fp16",
-                "multiplicative_gate": "*fp16",
-                "additive_gate": "*fp16",
-                "batch_size": "constexpr",
-                "square_count": "constexpr",
-                "channel_count": "constexpr",
-                "block_size": "constexpr",
-            },
-            constexprs={
-                "batch_size": specialization.batch_size,
-                "square_count": specialization.square_count,
-                "channel_count": specialization.channel_count,
-                "block_size": specialization.block_size,
-            },
-        ),
-        target=GPUTarget("cuda", specialization.architecture, _WARP_SIZE),
-        options={"num_warps": specialization.num_warps},
+    additive_gate = torch.zeros(
+        gate_element_count,
+        dtype=torch.float16,
+        device="cuda",
     )
+    compiled = _input_gating_kernel[_autotune_grid](
+        output,
+        input_,
+        multiplicative_gate,
+        additive_gate,
+        specialization.batch_size,
+        specialization.square_count,
+        specialization.channel_count,
+    )
+    selected = _input_gating_kernel.best_config
     return artifact_from_triton(
         compiled,
-        grid=grid,
+        grid=_artifact_grid(selected.kwargs, element_count),
         parameters=(_POINTER, _POINTER, _POINTER, _POINTER),
     )
 

@@ -2,7 +2,10 @@
 
 import pytest
 import torch
-from lczero_triton.bt4.kernels.input_gating import _input_gating_kernel
+from lczero_triton.bt4.kernels.input_gating import (
+    _autotune_grid,
+    _input_gating_kernel,
+)
 
 pytestmark = [
     pytest.mark.gpu,
@@ -32,17 +35,28 @@ def test_input_gating_matches_fp32_reference_in_place() -> None:
         inputs.float() * multiplier.float().unsqueeze(0) + addition.float().unsqueeze(0)
     ).half()
     result = inputs.cuda()
+    multiplier_cuda = multiplier.cuda()
+    addition_cuda = addition.cuda()
 
-    _input_gating_kernel[(2,)](
+    # Tune out of place so candidate launches cannot repeatedly mutate the input.
+    _input_gating_kernel[_autotune_grid](
+        torch.empty_like(result),
         result,
-        result,
-        multiplier.cuda(),
-        addition.cuda(),
+        multiplier_cuda,
+        addition_cuda,
         batch_size,
         square_count,
         channel_count,
-        256,
-        num_warps=8,
+    )
+
+    _input_gating_kernel[_autotune_grid](
+        result,
+        result,
+        multiplier_cuda,
+        addition_cuda,
+        batch_size,
+        square_count,
+        channel_count,
     )
 
     torch.testing.assert_close(result.cpu(), expected, rtol=0.0, atol=1e-3)

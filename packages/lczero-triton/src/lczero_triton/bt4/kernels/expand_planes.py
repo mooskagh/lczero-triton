@@ -1,22 +1,31 @@
 """Packed chess-plane expansion kernel family."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import cast
 
+import torch
 import triton
 import triton.language as tl
 from lc0ex import Buffer, ExecutableBuilder, KernelArtifact
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
-from triton.backends.compiler import GPUTarget
-from triton.compiler import ASTSource
 
+from lczero_triton.bt4.kernels._autotune import (
+    elementwise_configs,
+    validate_active_architecture,
+)
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 _MASK_BITS = 64
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
-_WARP_SIZE = 32
 
 
+@triton.autotune(
+    configs=elementwise_configs(),
+    key=["plane_count", "square_count"],
+    cache_results=True,
+)
 @triton.jit
 def _expand_planes_kernel(
     output,
@@ -44,8 +53,6 @@ class ExpandPlanesSpecialization:
     plane_count: int
     architecture: int
     square_count: int = 64
-    block_size: int = 256
-    num_warps: int = 8
 
     def __post_init__(self) -> None:
         """Validate dimensions and launch configuration."""
@@ -58,47 +65,63 @@ class ExpandPlanesSpecialization:
         if self.square_count > _MASK_BITS:
             message = "U64 plane masks support at most 64 squares"
             raise ValueError(message)
-        if self.block_size <= 0 or self.block_size & (self.block_size - 1):
-            message = "block_size must be a positive power of two"
-            raise ValueError(message)
-        if self.num_warps <= 0:
-            message = "num_warps must be positive"
-            raise ValueError(message)
+
+
+def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
+    """Return the flat plane-expansion grid for a tuning candidate."""
+    element_count = cast("int", configuration["plane_count"]) * cast(
+        "int", configuration["square_count"]
+    )
+    block_size = cast("int", configuration["block_size"])
+    return ((element_count + block_size - 1) // block_size,)
+
+
+def _artifact_grid(
+    configuration: Mapping[str, object],
+    plane_count: int,
+    square_count: int,
+) -> tuple[int, int, int]:
+    """Resolve the serialized grid from the selected configuration."""
+    block_size = cast("int", configuration["block_size"])
+    element_count = plane_count * square_count
+    return ((element_count + block_size - 1) // block_size, 1, 1)
 
 
 def compile_expand_planes(
     specialization: ExpandPlanesSpecialization,
 ) -> KernelArtifact:
-    """Compile one packed-plane expansion specialization."""
-    element_count = specialization.plane_count * specialization.square_count
-    grid = (
-        (element_count + specialization.block_size - 1) // specialization.block_size,
-        1,
-        1,
+    """Autotune and compile one packed-plane expansion specialization."""
+    validate_active_architecture(specialization.architecture)
+    output = torch.empty(
+        (specialization.plane_count, specialization.square_count),
+        dtype=torch.float16,
+        device="cuda",
     )
-    compiled = triton.compile(
-        ASTSource(
-            _expand_planes_kernel,
-            {
-                "output": "*fp16",
-                "masks": "*u64",
-                "values": "*fp32",
-                "plane_count": "constexpr",
-                "square_count": "constexpr",
-                "block_size": "constexpr",
-            },
-            constexprs={
-                "plane_count": specialization.plane_count,
-                "square_count": specialization.square_count,
-                "block_size": specialization.block_size,
-            },
-        ),
-        target=GPUTarget("cuda", specialization.architecture, _WARP_SIZE),
-        options={"num_warps": specialization.num_warps},
+    masks = torch.zeros(
+        specialization.plane_count,
+        dtype=torch.uint64,
+        device="cuda",
     )
+    values = torch.zeros(
+        specialization.plane_count,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    compiled = _expand_planes_kernel[_autotune_grid](
+        output,
+        masks,
+        values,
+        specialization.plane_count,
+        specialization.square_count,
+    )
+    selected = _expand_planes_kernel.best_config
     return artifact_from_triton(
         compiled,
-        grid=grid,
+        grid=_artifact_grid(
+            selected.kwargs,
+            specialization.plane_count,
+            specialization.square_count,
+        ),
         parameters=(_POINTER, _POINTER, _POINTER),
     )
 

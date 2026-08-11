@@ -3,6 +3,7 @@
 import pytest
 import torch
 from lczero_triton.bt4.kernels.preprocess_attention_body import (
+    _autotune_grid,
     _preprocess_attention_body_kernel,
 )
 
@@ -32,15 +33,14 @@ def test_preprocess_attention_body_transposes_and_appends_encoding() -> None:
         device="cuda",
     )
 
-    _preprocess_attention_body_kernel[(batch_size, square_count)](
+    _preprocess_attention_body_kernel[_autotune_grid](
         output,
         planes.cuda(),
         encoding.cuda(),
+        batch_size,
         square_count,
         input_channels,
         encoding_channels,
-        32,
-        num_warps=4,
     )
 
     expected = torch.cat((planes.permute(0, 2, 1), encoding), dim=2)

@@ -361,6 +361,13 @@ Required semantics:
 - Policy mapping uses the 1858-entry ONNX gather map exported as the immutable
   `lczero_bt4_mapping_table` CUBIN symbol. This is semantically equivalent to
   LC0's 4288-entry scatter map and requires no external buffer.
+- Autotune every family's block size and warp count on the requested active
+  target, keyed by the complete static shape and activation when present.
+  Persist tuning results and capture the selected block and resolved grid in
+  the serialized artifact. Launch choices are tuning results, not public
+  specialization inputs.
+- Tile attention preprocessing across its output-channel dimension so block
+  sizes below the full 624-channel width remain valid tuning candidates.
 
 Acceptance criteria:
 
@@ -368,6 +375,10 @@ Acceptance criteria:
 - Tests cover in-place operation where the CUDA wrapper permits it.
 - Tests cover periodic bias broadcasting and tail masking.
 - Policy map tests cover all 1858 outputs and invalid-index validation.
+- Static tests cover each autotune key and candidate set. GPU artifact tests
+  prove that every family serializes its selected launch configuration.
+- Autotuning uses separate benchmark outputs so kernels that permit in-place
+  execution do not mutate inputs between candidates.
 
 ### 6. Implement contiguous dense GEMM
 
@@ -741,5 +752,5 @@ without changing external buffers or numerical semantics.
 - Alternate policy and value heads
 - Multi-architecture artifacts
 - Packed or fused QKV and policy-QK projections
-- Cross-kernel and graph-level tuning
+- Cross-kernel and graph-level tuning beyond each family's launch autotuning
 - Full LC0 numerical and performance comparison

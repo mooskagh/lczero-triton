@@ -1,21 +1,32 @@
 """Attention-policy gather kernel family."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import cast
 
+import torch
 import triton
 import triton.language as tl
 from lc0ex import Buffer, ExecutableBuilder, KernelArtifact, SymbolHandle
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
-from triton.backends.compiler import GPUTarget
-from triton.compiler import ASTSource
 
+from lczero_triton.bt4.kernels._autotune import (
+    elementwise_configs,
+    validate_active_architecture,
+)
 from lczero_triton.bt4.kernels._cache import KernelCache
+from lczero_triton.bt4.kernels.mapping_table import values as mapping_values
 
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
-_WARP_SIZE = 32
+_STANDARD_INPUT_ELEMENT_COUNT = 4288
 
 
+@triton.autotune(
+    configs=elementwise_configs(),
+    key=["batch_size", "input_element_count", "output_element_count"],
+    cache_results=True,
+)
 @triton.jit
 def _policy_map_kernel(
     output,
@@ -49,8 +60,6 @@ class PolicyMapSpecialization:
     architecture: int
     input_element_count: int = 4288
     output_element_count: int = 1858
-    block_size: int = 256
-    num_warps: int = 8
 
     def __post_init__(self) -> None:
         """Validate dimensions and launch configuration."""
@@ -67,49 +76,70 @@ class PolicyMapSpecialization:
         if self.architecture <= 0:
             message = "architecture must be positive"
             raise ValueError(message)
-        if self.block_size <= 0 or self.block_size & (self.block_size - 1):
-            message = "block_size must be a positive power of two"
-            raise ValueError(message)
-        if self.num_warps <= 0:
-            message = "num_warps must be positive"
-            raise ValueError(message)
+
+
+def _element_count(configuration: Mapping[str, object]) -> int:
+    """Return the output element count from kernel configuration values."""
+    return cast("int", configuration["batch_size"]) * cast(
+        "int", configuration["output_element_count"]
+    )
+
+
+def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
+    """Return the flat policy-gather grid for a tuning candidate."""
+    block_size = cast("int", configuration["block_size"])
+    return ((_element_count(configuration) + block_size - 1) // block_size,)
+
+
+def _artifact_grid(
+    configuration: Mapping[str, object],
+    element_count: int,
+) -> tuple[int, int, int]:
+    """Resolve the serialized grid from the selected configuration."""
+    block_size = cast("int", configuration["block_size"])
+    return ((element_count + block_size - 1) // block_size, 1, 1)
+
+
+def _benchmark_mapping(specialization: PolicyMapSpecialization) -> torch.Tensor:
+    """Create valid representative gather indices for autotuning."""
+    standard_mapping = mapping_values()
+    if (
+        specialization.input_element_count == _STANDARD_INPUT_ELEMENT_COUNT
+        and specialization.output_element_count == len(standard_mapping)
+    ):
+        return torch.tensor(standard_mapping, dtype=torch.int32, device="cuda")
+    return torch.arange(
+        specialization.output_element_count,
+        dtype=torch.int32,
+        device="cuda",
+    ).remainder_(specialization.input_element_count)
 
 
 def compile_policy_map(
     specialization: PolicyMapSpecialization,
 ) -> KernelArtifact:
-    """Compile one FP16 attention-policy gather specialization."""
+    """Autotune and compile one FP16 attention-policy gather specialization."""
+    validate_active_architecture(specialization.architecture)
     element_count = specialization.batch_size * specialization.output_element_count
-    grid = (
-        (element_count + specialization.block_size - 1) // specialization.block_size,
-        1,
-        1,
+    output = torch.empty(element_count, dtype=torch.float16, device="cuda")
+    input_ = torch.zeros(
+        specialization.batch_size * specialization.input_element_count,
+        dtype=torch.float16,
+        device="cuda",
     )
-    compiled = triton.compile(
-        ASTSource(
-            _policy_map_kernel,
-            {
-                "output": "*fp16",
-                "input_": "*fp16",
-                "mapping": "*i32",
-                "batch_size": "constexpr",
-                "input_element_count": "constexpr",
-                "output_element_count": "constexpr",
-                "block_size": "constexpr",
-            },
-            constexprs={
-                "batch_size": specialization.batch_size,
-                "input_element_count": specialization.input_element_count,
-                "output_element_count": specialization.output_element_count,
-                "block_size": specialization.block_size,
-            },
-        ),
-        target=GPUTarget("cuda", specialization.architecture, _WARP_SIZE),
-        options={"num_warps": specialization.num_warps},
+    mapping = _benchmark_mapping(specialization)
+    compiled = _policy_map_kernel[_autotune_grid](
+        output,
+        input_,
+        mapping,
+        specialization.batch_size,
+        specialization.input_element_count,
+        specialization.output_element_count,
     )
+    selected = _policy_map_kernel.best_config
     return artifact_from_triton(
         compiled,
-        grid=grid,
+        grid=_artifact_grid(selected.kwargs, element_count),
         parameters=(_POINTER, _POINTER, _POINTER),
     )
 

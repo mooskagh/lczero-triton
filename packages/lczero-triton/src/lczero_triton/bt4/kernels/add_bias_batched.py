@@ -1,16 +1,20 @@
 """Batched FP16 bias-broadcast kernel family."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
+import torch
 import triton
 import triton.language as tl
 from lc0ex import Buffer, ExecutableBuilder, KernelArtifact
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
-from triton.backends.compiler import GPUTarget
-from triton.compiler import ASTSource
 
+from lczero_triton.bt4.kernels._autotune import (
+    elementwise_configs,
+    validate_active_architecture,
+)
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 Activation = Literal["none", "mish"]
@@ -23,9 +27,13 @@ _ACTIVATIONS: dict[Activation, int] = {
 }
 _MISH_BRANCH = tl.constexpr(-0.6)
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
-_WARP_SIZE = 32
 
 
+@triton.autotune(
+    configs=elementwise_configs(),
+    key=["batch_count", "row_count", "channel_count", "activation"],
+    cache_results=True,
+)
 @triton.jit
 def _add_bias_batched_kernel(
     output,
@@ -70,8 +78,6 @@ class AddBiasBatchedSpecialization:
     channel_count: int
     activation: Activation
     architecture: int
-    block_size: int = 256
-    num_warps: int = 8
 
     def __post_init__(self) -> None:
         """Validate dimensions, activation, and launch configuration."""
@@ -87,55 +93,62 @@ class AddBiasBatchedSpecialization:
         if self.architecture <= 0:
             message = "architecture must be positive"
             raise ValueError(message)
-        if self.block_size <= 0 or self.block_size & (self.block_size - 1):
-            message = "block_size must be a positive power of two"
-            raise ValueError(message)
-        if self.num_warps <= 0:
-            message = "num_warps must be positive"
-            raise ValueError(message)
+
+
+def _element_count(configuration: Mapping[str, object]) -> int:
+    """Return the tensor element count from kernel configuration values."""
+    return (
+        cast("int", configuration["batch_count"])
+        * cast("int", configuration["row_count"])
+        * cast("int", configuration["channel_count"])
+    )
+
+
+def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
+    """Return the flat bias-addition grid for a tuning candidate."""
+    block_size = cast("int", configuration["block_size"])
+    return ((_element_count(configuration) + block_size - 1) // block_size,)
+
+
+def _artifact_grid(
+    configuration: Mapping[str, object],
+    element_count: int,
+) -> tuple[int, int, int]:
+    """Resolve the serialized grid from the selected configuration."""
+    block_size = cast("int", configuration["block_size"])
+    return ((element_count + block_size - 1) // block_size, 1, 1)
 
 
 def compile_add_bias_batched(
     specialization: AddBiasBatchedSpecialization,
 ) -> KernelArtifact:
-    """Compile one batched FP16 bias-broadcast specialization."""
+    """Autotune and compile one batched FP16 bias-broadcast specialization."""
+    validate_active_architecture(specialization.architecture)
     element_count = (
         specialization.batch_count
         * specialization.row_count
         * specialization.channel_count
     )
-    grid = (
-        (element_count + specialization.block_size - 1) // specialization.block_size,
-        1,
-        1,
+    output = torch.empty(element_count, dtype=torch.float16, device="cuda")
+    input_ = torch.zeros(element_count, dtype=torch.float16, device="cuda")
+    bias = torch.zeros(
+        specialization.batch_count * specialization.channel_count,
+        dtype=torch.float16,
+        device="cuda",
     )
-    compiled = triton.compile(
-        ASTSource(
-            _add_bias_batched_kernel,
-            {
-                "output": "*fp16",
-                "input_": "*fp16",
-                "bias": "*fp16",
-                "batch_count": "constexpr",
-                "row_count": "constexpr",
-                "channel_count": "constexpr",
-                "activation": "constexpr",
-                "block_size": "constexpr",
-            },
-            constexprs={
-                "batch_count": specialization.batch_count,
-                "row_count": specialization.row_count,
-                "channel_count": specialization.channel_count,
-                "activation": _ACTIVATIONS[specialization.activation],
-                "block_size": specialization.block_size,
-            },
-        ),
-        target=GPUTarget("cuda", specialization.architecture, _WARP_SIZE),
-        options={"num_warps": specialization.num_warps},
+    compiled = _add_bias_batched_kernel[_autotune_grid](
+        output,
+        input_,
+        bias,
+        specialization.batch_count,
+        specialization.row_count,
+        specialization.channel_count,
+        _ACTIVATIONS[specialization.activation],
     )
+    selected = _add_bias_batched_kernel.best_config
     return artifact_from_triton(
         compiled,
-        grid=grid,
+        grid=_artifact_grid(selected.kwargs, element_count),
         parameters=(_POINTER, _POINTER, _POINTER),
     )
 
