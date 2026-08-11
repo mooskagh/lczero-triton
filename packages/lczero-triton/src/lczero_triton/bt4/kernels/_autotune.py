@@ -39,16 +39,20 @@ def preprocess_configs() -> list[triton.Config]:
     ]
 
 
-def validate_active_architecture(architecture: int) -> None:
-    """Require autotuning to run on the requested CUDA architecture."""
+def active_architecture() -> int:
+    """Return the compute capability of the active CUDA device."""
     if not torch.cuda.is_available():
         message = "kernel autotuning requires an available CUDA device"
         raise RuntimeError(message)
     major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-    active_architecture = major * 10 + minor
-    if active_architecture != architecture:
+    return major * 10 + minor
+
+
+def validate_active_architecture(architecture: int) -> None:
+    """Require autotuning to run on the requested CUDA architecture."""
+    active = active_architecture()
+    if active != architecture:
         message = (
-            f"kernel requested sm_{architecture}, but the active device is "
-            f"sm_{active_architecture}"
+            f"kernel requested sm_{architecture}, but the active device is sm_{active}"
         )
         raise ValueError(message)
