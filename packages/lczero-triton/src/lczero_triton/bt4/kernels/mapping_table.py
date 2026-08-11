@@ -9,6 +9,7 @@ from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import compile_ptx
 
 _POLICY_SIZE = 1858
+_POLICY_INPUT_SIZE = 4288
 _SYMBOL_NAME = "lczero_bt4_mapping_table"
 _ENCODED_TABLE = (
     b"c-k%51(y)S8U|oe=>}oxl$Ms3?q0gPmhJ}W?(SH+yFpr7VnJG3VnJH^KAy`t^ZbJM%*^-BgbfoWOgO?5frxy^_e3HxQHVus;*gNU"
@@ -52,7 +53,12 @@ def values() -> tuple[int, ...]:
     """Return the ONNX gather inverse of LC0's attention-policy scatter map."""
     table = zlib.decompress(base64.b85decode(_ENCODED_TABLE))
     result = tuple(value[0] for value in struct.iter_unpack("<i", table))
-    if len(result) != _POLICY_SIZE:
+    if (
+        len(result) != _POLICY_SIZE
+        or len(set(result)) != _POLICY_SIZE
+        or min(result, default=-1) < 0
+        or max(result, default=_POLICY_INPUT_SIZE) >= _POLICY_INPUT_SIZE
+    ):
         message = "invalid embedded attention-policy mapping table"
         raise RuntimeError(message)
     return result

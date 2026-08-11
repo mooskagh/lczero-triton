@@ -111,10 +111,9 @@ to FP16, validating name/shape/dtype, and uploading each buffer.
 
 ### Constants
 
-Initially expose consumed non-learned constants as external ONNX-named buffers
-too. This includes:
+Expose consumed non-learned constants as external ONNX-named buffers except for
+the embedded attention-policy mapping symbol. External constants include:
 
-- `/const/mapping_table`
 - `/attn_body/ffn/alpha/w`
 - `/encoder{i}/mha/QK/scale/w`
 - `/encoder{i}/alpha*input/w`
@@ -124,9 +123,8 @@ too. This includes:
 Do not declare ONNX shape, slice, or reshape constants that no Triton kernel
 consumes. Static graph construction makes them unnecessary.
 
-Later, these constants can move into CUDA module symbols produced through PTX
-or CUDA rather than Triton. That change should preserve their logical buffer
-names and graph arguments.
+Later, the remaining constants can move into CUDA module symbols produced
+through PTX or CUDA rather than Triton.
 
 ## Target Source Layout
 
@@ -146,7 +144,6 @@ packages/lczero-triton/src/lczero_triton/bt4/
     _format.py
     kernels/
         __init__.py
-        _activation.py
         _cache.py
         add_bias_batched.py
         add_vectors.py
@@ -361,9 +358,9 @@ Required semantics:
   does so.
 - Mish reproduces LC0's approximation rather than using a generic framework
   implementation.
-- Policy mapping uses the 1858-entry ONNX gather map in
-  `/const/mapping_table`. This is semantically equivalent to LC0's 4288-entry
-  scatter map and matches the chosen external constant contract.
+- Policy mapping uses the 1858-entry ONNX gather map exported as the immutable
+  `lczero_bt4_mapping_table` CUBIN symbol. This is semantically equivalent to
+  LC0's 4288-entry scatter map and requires no external buffer.
 
 Acceptance criteria:
 
@@ -725,7 +722,7 @@ baseline is approximately:
 - 157 custom Triton calls
 - 351 compute nodes
 - 409 learned persistent buffers
-- About 48 consumed external constant buffers
+- About 47 consumed external constant buffers plus one embedded mapping symbol
 - 2 execution inputs
 - 3 execution outputs
 
@@ -737,7 +734,7 @@ without changing external buffers or numerical semantics.
 
 - Dynamic batches or multiple fixed-batch program variants
 - Production `.pb.gz` or ONNX weight loading
-- Constants embedded as PTX/CUDA module symbols
+- Remaining constants embedded as PTX/CUDA module symbols
 - C++ `lc0ex` runtime
 - LC0 backend registration
 - Host WDL softmax and Q/D conversion
