@@ -21,6 +21,10 @@ from lczero_triton.bt4.kernels.add_vectors import (
     AddVectorsSpecialization,
     add_vectors,
 )
+from lczero_triton.bt4.kernels.batched_matmul import (
+    BatchedMatmulSpecialization,
+    batched_matmul,
+)
 from lczero_triton.bt4.kernels.expand_planes import (
     ExpandPlanesSpecialization,
     expand_planes,
@@ -42,6 +46,10 @@ from lczero_triton.bt4.kernels.preprocess_attention_body import (
     PreprocessAttentionBodySpecialization,
     preprocess_attention_body,
 )
+from lczero_triton.bt4.kernels.softmax_64 import (
+    Softmax64Specialization,
+    softmax_64,
+)
 
 _F16_SIZE_BYTES = 2
 _INPUT_CHANNELS = 112
@@ -62,6 +70,7 @@ class _BuildContext:
     default_encoding: net_pb2.Format.Encoding
     default_activation: net_pb2.NetworkFormat.ActivationFunction
     ffn_activation: net_pb2.NetworkFormat.ActivationFunction
+    smolgen_activation: net_pb2.NetworkFormat.ActivationFunction
 
 
 def build(
@@ -92,6 +101,11 @@ def build(
             network_format.ffn_activation,
             default_activation,
             path="format.network_format.ffn_activation",
+        ),
+        smolgen_activation=_resolve_activation(
+            network_format.smolgen_activation,
+            default_activation,
+            path="format.network_format.smolgen_activation",
         ),
     )
     _network(context, network.weights)
@@ -518,7 +532,14 @@ def _encoder(  # noqa: PLR0913
     shared_smolgen: net_pb2.Weights.Layer,
 ) -> Buffer:
     """Build one Smolgen attention and FFN encoder residual block."""
-    smolgen = _smolgen(context, body, encoder, prefix=prefix, head_count=head_count)
+    smolgen, generated_width = _smolgen(
+        context,
+        body,
+        body_width,
+        encoder,
+        prefix=prefix,
+        head_count=head_count,
+    )
     attended = _attention(
         context,
         body,
@@ -528,22 +549,194 @@ def _encoder(  # noqa: PLR0913
         prefix=prefix,
         head_count=head_count,
         shared_smolgen=shared_smolgen,
+        generated_width=generated_width,
     )
     return _ffn(context, attended, body_width, encoder, prefix=prefix)
 
 
-def _smolgen(
+def _smolgen(  # noqa: PLR0913
     context: _BuildContext,
     body: Buffer,
+    body_width: int,
     encoder: net_pb2.Weights.EncoderLayer,
     *,
     prefix: str,
     head_count: int,
-) -> Buffer:
+) -> tuple[Buffer, int]:
     """Build local Smolgen compression and its two normalized dense layers."""
-    del context, body, encoder, prefix, head_count
-    message = "BT4 Smolgen production awaits its kernel families"
-    raise NotImplementedError(message)
+    _require_activation(
+        context.smolgen_activation,
+        net_pb2.NetworkFormat.ACTIVATION_SWISH,
+        path="format.network_format.smolgen_activation",
+    )
+    smolgen = encoder.mha.smolgen
+    path = f"weights.{prefix[1:]}.mha.smolgen"
+    compress_weights, compression_width = _matrix_f16(
+        context,
+        smolgen.compress,
+        input_width=body_width,
+        name=f"{prefix}/smolgen/compress/w",
+        path=f"{path}.compress",
+    )
+    dense1_weights, hidden_width = _matrix_f16(
+        context,
+        smolgen.dense1_w,
+        input_width=_SQUARE_COUNT * compression_width,
+        name=f"{prefix}/smolgen/dense1/w/w",
+        path=f"{path}.dense1_w",
+    )
+    dense1_bias, dense1_bias_width = _vector_f16(
+        context,
+        smolgen.dense1_b,
+        name=f"{prefix}/smolgen/dense1/b/w",
+        path=f"{path}.dense1_b",
+    )
+    _require_equal_widths(
+        dense1_bias_width,
+        hidden_width,
+        path=f"{path}.dense1_b",
+        expected_path=f"{path}.dense1_w output",
+    )
+    ln1_gammas, ln1_gamma_width = _vector_f16(
+        context,
+        smolgen.ln1_gammas,
+        name=f"{prefix}/smolgen/ln1/w/scale",
+        path=f"{path}.ln1_gammas",
+    )
+    ln1_betas, ln1_beta_width = _vector_f16(
+        context,
+        smolgen.ln1_betas,
+        name=f"{prefix}/smolgen/ln1/w/bias",
+        path=f"{path}.ln1_betas",
+    )
+    _require_equal_widths(
+        ln1_gamma_width,
+        hidden_width,
+        path=f"{path}.ln1_gammas",
+        expected_path=f"{path}.dense1_w output",
+    )
+    _require_equal_widths(
+        ln1_beta_width,
+        hidden_width,
+        path=f"{path}.ln1_betas",
+        expected_path=f"{path}.dense1_w output",
+    )
+    dense2_weights, generated_total_width = _matrix_f16(
+        context,
+        smolgen.dense2_w,
+        input_width=hidden_width,
+        name=f"{prefix}/smolgen/dense2/w/w",
+        path=f"{path}.dense2_w",
+    )
+    generated_width, remainder = divmod(generated_total_width, head_count)
+    if remainder:
+        message = f"{path}.dense2_w: output width must be divisible by head count"
+        raise NetworkFormatError(message)
+    dense2_bias, dense2_bias_width = _vector_f16(
+        context,
+        smolgen.dense2_b,
+        name=f"{prefix}/smolgen/dense2/b/w",
+        path=f"{path}.dense2_b",
+    )
+    ln2_gammas, ln2_gamma_width = _vector_f16(
+        context,
+        smolgen.ln2_gammas,
+        name=f"{prefix}/smolgen/ln2/w/scale",
+        path=f"{path}.ln2_gammas",
+    )
+    ln2_betas, ln2_beta_width = _vector_f16(
+        context,
+        smolgen.ln2_betas,
+        name=f"{prefix}/smolgen/ln2/w/bias",
+        path=f"{path}.ln2_betas",
+    )
+    for width, field in (
+        (dense2_bias_width, "dense2_b"),
+        (ln2_gamma_width, "ln2_gammas"),
+        (ln2_beta_width, "ln2_betas"),
+    ):
+        _require_equal_widths(
+            width,
+            generated_total_width,
+            path=f"{path}.{field}",
+            expected_path=f"{path}.dense2_w output",
+        )
+
+    token_rows = context.batch_size * _SQUARE_COUNT
+    compressed = _temporary_f16(context, element_count=token_rows * compression_width)
+    matmul(
+        context.builder,
+        context.kernels,
+        compressed,
+        body,
+        compress_weights,
+        MatmulSpecialization(
+            token_rows, compression_width, body_width, context.architecture
+        ),
+    )
+    hidden = _temporary_f16(context, element_count=context.batch_size * hidden_width)
+    matmul(
+        context.builder,
+        context.kernels,
+        hidden,
+        compressed,
+        dense1_weights,
+        MatmulSpecialization(
+            context.batch_size,
+            hidden_width,
+            _SQUARE_COUNT * compression_width,
+            context.architecture,
+        ),
+    )
+    layer_norm(
+        context.builder,
+        context.kernels,
+        hidden,
+        hidden,
+        dense1_bias,
+        ln1_gammas,
+        ln1_betas,
+        LayerNormSpecialization(
+            row_count=context.batch_size,
+            width=hidden_width,
+            activation="swish",
+            has_skip=False,
+            architecture=context.architecture,
+        ),
+    )
+    generated = _temporary_f16(
+        context, element_count=context.batch_size * generated_total_width
+    )
+    matmul(
+        context.builder,
+        context.kernels,
+        generated,
+        hidden,
+        dense2_weights,
+        MatmulSpecialization(
+            context.batch_size,
+            generated_total_width,
+            hidden_width,
+            context.architecture,
+        ),
+    )
+    layer_norm(
+        context.builder,
+        context.kernels,
+        generated,
+        generated,
+        dense2_bias,
+        ln2_gammas,
+        ln2_betas,
+        LayerNormSpecialization(
+            row_count=context.batch_size,
+            width=generated_total_width,
+            activation="swish",
+            has_skip=False,
+            architecture=context.architecture,
+        ),
+    )
+    return generated, generated_width
 
 
 def _attention(  # noqa: PLR0913
@@ -556,11 +749,222 @@ def _attention(  # noqa: PLR0913
     prefix: str,
     head_count: int,
     shared_smolgen: net_pb2.Weights.Layer,
+    generated_width: int,
 ) -> Buffer:
     """Build shared Smolgen projection and the encoder Q/K/V attention path."""
-    del context, body, smolgen, body_width, encoder, prefix, head_count, shared_smolgen
-    message = "BT4 attention production awaits its kernel families"
-    raise NotImplementedError(message)
+    mha = encoder.mha
+    path = f"weights.{prefix[1:]}"
+    shared_weights, smolgen_output_width = _matrix_f16(
+        context,
+        shared_smolgen,
+        input_width=generated_width,
+        name="/const/smolgen_w",
+        path="weights.smolgen_w",
+    )
+    expected_smolgen_width = _SQUARE_COUNT * _SQUARE_COUNT
+    _require_equal_widths(
+        smolgen_output_width,
+        expected_smolgen_width,
+        path="weights.smolgen_w output",
+        expected_path="64-way attention logits",
+    )
+
+    projections: list[tuple[Buffer, Buffer, int, str]] = []
+    for label, weight_field, bias_field in (
+        ("Q", mha.q_w, mha.q_b),
+        ("K", mha.k_w, mha.k_b),
+        ("V", mha.v_w, mha.v_b),
+    ):
+        weights, width = _matrix_f16(
+            context,
+            weight_field,
+            input_width=body_width,
+            name=f"{prefix}/mha/{label}/w/w",
+            path=f"{path}.mha.{label.lower()}_w",
+        )
+        bias, bias_width = _vector_f16(
+            context,
+            bias_field,
+            name=f"{prefix}/mha/{label}/b/w",
+            path=f"{path}.mha.{label.lower()}_b",
+        )
+        _require_equal_widths(
+            bias_width,
+            width,
+            path=f"{path}.mha.{label.lower()}_b",
+            expected_path=f"{path}.mha.{label.lower()}_w output",
+        )
+        projections.append((weights, bias, width, label))
+    model_width = projections[0][2]
+    for _weights, _bias, width, label in projections[1:]:
+        _require_equal_widths(
+            width,
+            model_width,
+            path=f"{path}.mha.{label.lower()}_w output",
+            expected_path=f"{path}.mha.q_w output",
+        )
+    head_depth, remainder = divmod(model_width, head_count)
+    if remainder:
+        message = f"{path}.mha.q_w: output width must be divisible by head count"
+        raise NetworkFormatError(message)
+
+    output_weights, output_width = _matrix_f16(
+        context,
+        mha.dense_w,
+        input_width=model_width,
+        name=f"{prefix}/mha/out/dense/w/w",
+        path=f"{path}.mha.dense_w",
+    )
+    _require_body_width(output_width, body_width, path=f"{path}.mha.dense_w output")
+    output_bias, output_bias_width = _vector_f16(
+        context,
+        mha.dense_b,
+        name=f"{prefix}/mha/out/dense/b/w",
+        path=f"{path}.mha.dense_b",
+    )
+    _require_body_width(output_bias_width, body_width, path=f"{path}.mha.dense_b")
+    gammas, gamma_width = _vector_f16(
+        context,
+        encoder.ln1_gammas,
+        name=f"{prefix}/ln1/w/scale",
+        path=f"{path}.ln1_gammas",
+    )
+    betas, beta_width = _vector_f16(
+        context,
+        encoder.ln1_betas,
+        name=f"{prefix}/ln1/w/bias",
+        path=f"{path}.ln1_betas",
+    )
+    _require_body_width(gamma_width, body_width, path=f"{path}.ln1_gammas")
+    _require_body_width(beta_width, body_width, path=f"{path}.ln1_betas")
+    scale = context.persistent.external_buffer(
+        name=f"{prefix}/mha/QK/scale/w",
+        shape=(1,),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+    )
+    alpha = context.persistent.external_buffer(
+        name=f"{prefix}/alpha*input/w",
+        shape=(1,),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+    )
+
+    token_rows = context.batch_size * _SQUARE_COUNT
+    attention_batches = context.batch_size * head_count
+    smolgen_logits = _temporary_f16(
+        context, element_count=attention_batches * expected_smolgen_width
+    )
+    matmul(
+        context.builder,
+        context.kernels,
+        smolgen_logits,
+        smolgen,
+        shared_weights,
+        MatmulSpecialization(
+            attention_batches,
+            expected_smolgen_width,
+            generated_width,
+            context.architecture,
+        ),
+    )
+    projected: list[Buffer] = []
+    for weights, bias, width, _label in projections:
+        value = _temporary_f16(context, element_count=token_rows * width)
+        matmul(
+            context.builder,
+            context.kernels,
+            value,
+            body,
+            weights,
+            MatmulSpecialization(token_rows, width, body_width, context.architecture),
+        )
+        add_bias_batched(
+            context.builder,
+            context.kernels,
+            value,
+            value,
+            bias,
+            AddBiasBatchedSpecialization(
+                1, token_rows, width, "none", context.architecture
+            ),
+        )
+        projected.append(value)
+    queries, keys, values = projected
+    qk = _temporary_f16(
+        context, element_count=attention_batches * expected_smolgen_width
+    )
+    batched_matmul(
+        context.builder,
+        context.kernels,
+        qk,
+        queries,
+        keys,
+        BatchedMatmulSpecialization(
+            "body_qk",
+            attention_batches,
+            _SQUARE_COUNT,
+            _SQUARE_COUNT,
+            head_depth,
+            head_count,
+            context.architecture,
+        ),
+        scale=scale,
+    )
+    softmax_64(
+        context.builder,
+        context.kernels,
+        qk,
+        qk,
+        smolgen_logits,
+        Softmax64Specialization(
+            attention_batches * _SQUARE_COUNT, context.architecture
+        ),
+    )
+    merged = _temporary_f16(context, element_count=token_rows * model_width)
+    batched_matmul(
+        context.builder,
+        context.kernels,
+        merged,
+        qk,
+        values,
+        BatchedMatmulSpecialization(
+            "body_attention_v",
+            attention_batches,
+            _SQUARE_COUNT,
+            head_depth,
+            _SQUARE_COUNT,
+            head_count,
+            context.architecture,
+        ),
+    )
+    branch = _temporary_f16(context, element_count=token_rows * body_width)
+    matmul(
+        context.builder,
+        context.kernels,
+        branch,
+        merged,
+        output_weights,
+        MatmulSpecialization(token_rows, body_width, model_width, context.architecture),
+    )
+    attended = _temporary_f16(context, element_count=token_rows * body_width)
+    layer_norm(
+        context.builder,
+        context.kernels,
+        attended,
+        branch,
+        output_bias,
+        gammas,
+        betas,
+        LayerNormSpecialization(
+            row_count=token_rows,
+            width=body_width,
+            activation="none",
+            has_skip=True,
+            architecture=context.architecture,
+        ),
+        skip=body,
+        alpha=alpha,
+    )
+    return attended
 
 
 def _ffn(
@@ -572,9 +976,122 @@ def _ffn(
     prefix: str,
 ) -> Buffer:
     """Build an encoder FFN and its DeepNorm residual layer normalization."""
-    del context, body, body_width, encoder, prefix
-    message = "BT4 FFN production awaits its kernel families"
-    raise NotImplementedError(message)
+    _require_activation(
+        context.ffn_activation,
+        net_pb2.NetworkFormat.ACTIVATION_MISH,
+        path="format.network_format.ffn_activation",
+    )
+    path = f"weights.{prefix[1:]}"
+    dense1_weights, hidden_width = _matrix_f16(
+        context,
+        encoder.ffn.dense1_w,
+        input_width=body_width,
+        name=f"{prefix}/ffn/dense1/w/w",
+        path=f"{path}.ffn.dense1_w",
+    )
+    dense1_bias, dense1_bias_width = _vector_f16(
+        context,
+        encoder.ffn.dense1_b,
+        name=f"{prefix}/ffn/dense1/b/w",
+        path=f"{path}.ffn.dense1_b",
+    )
+    _require_equal_widths(
+        dense1_bias_width,
+        hidden_width,
+        path=f"{path}.ffn.dense1_b",
+        expected_path=f"{path}.ffn.dense1_w output",
+    )
+    dense2_weights, output_width = _matrix_f16(
+        context,
+        encoder.ffn.dense2_w,
+        input_width=hidden_width,
+        name=f"{prefix}/ffn/dense2/w/w",
+        path=f"{path}.ffn.dense2_w",
+    )
+    _require_body_width(output_width, body_width, path=f"{path}.ffn.dense2_w output")
+    dense2_bias, dense2_bias_width = _vector_f16(
+        context,
+        encoder.ffn.dense2_b,
+        name=f"{prefix}/ffn/dense2/b/w",
+        path=f"{path}.ffn.dense2_b",
+    )
+    gammas, gamma_width = _vector_f16(
+        context,
+        encoder.ln2_gammas,
+        name=f"{prefix}/ln2/w/scale",
+        path=f"{path}.ln2_gammas",
+    )
+    betas, beta_width = _vector_f16(
+        context,
+        encoder.ln2_betas,
+        name=f"{prefix}/ln2/w/bias",
+        path=f"{path}.ln2_betas",
+    )
+    for width, field in (
+        (dense2_bias_width, "ffn.dense2_b"),
+        (gamma_width, "ln2_gammas"),
+        (beta_width, "ln2_betas"),
+    ):
+        _require_body_width(width, body_width, path=f"{path}.{field}")
+    alpha = context.persistent.external_buffer(
+        name=f"{prefix}/ffn/alpha/w",
+        shape=(1,),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+    )
+
+    token_rows = context.batch_size * _SQUARE_COUNT
+    hidden = _temporary_f16(context, element_count=token_rows * hidden_width)
+    matmul(
+        context.builder,
+        context.kernels,
+        hidden,
+        body,
+        dense1_weights,
+        MatmulSpecialization(
+            token_rows, hidden_width, body_width, context.architecture
+        ),
+    )
+    add_bias_batched(
+        context.builder,
+        context.kernels,
+        hidden,
+        hidden,
+        dense1_bias,
+        AddBiasBatchedSpecialization(
+            1, token_rows, hidden_width, "mish", context.architecture
+        ),
+    )
+    branch = _temporary_f16(context, element_count=token_rows * body_width)
+    matmul(
+        context.builder,
+        context.kernels,
+        branch,
+        hidden,
+        dense2_weights,
+        MatmulSpecialization(
+            token_rows, body_width, hidden_width, context.architecture
+        ),
+    )
+    output = _temporary_f16(context, element_count=token_rows * body_width)
+    layer_norm(
+        context.builder,
+        context.kernels,
+        output,
+        branch,
+        dense2_bias,
+        gammas,
+        betas,
+        LayerNormSpecialization(
+            row_count=token_rows,
+            width=body_width,
+            activation="none",
+            has_skip=True,
+            architecture=context.architecture,
+        ),
+        skip=body,
+        alpha=alpha,
+    )
+    return output
 
 
 def _policy_head(

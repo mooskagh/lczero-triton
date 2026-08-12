@@ -5,12 +5,14 @@ from typing import cast
 
 import lczero_triton.bt4.kernels.add_bias_batched as add_bias_batched_module
 import lczero_triton.bt4.kernels.add_vectors as add_vectors_module
+import lczero_triton.bt4.kernels.batched_matmul as batched_matmul_module
 import lczero_triton.bt4.kernels.expand_planes as expand_planes_module
 import lczero_triton.bt4.kernels.input_gating as input_gating_module
 import lczero_triton.bt4.kernels.layer_norm as layer_norm_module
 import lczero_triton.bt4.kernels.matmul as matmul_module
 import lczero_triton.bt4.kernels.nchw_to_nhwc as nchw_to_nhwc_module
 import lczero_triton.bt4.kernels.preprocess_attention_body as preprocess_module
+import lczero_triton.bt4.kernels.softmax_64 as softmax_64_module
 import lczero_triton.bt4.network as network_module
 import net_pb2
 import pytest
@@ -21,6 +23,7 @@ from lczero_triton.bt4.kernels.add_bias_batched import (
     AddBiasBatchedSpecialization,
 )
 from lczero_triton.bt4.kernels.add_vectors import AddVectorsSpecialization
+from lczero_triton.bt4.kernels.batched_matmul import BatchedMatmulSpecialization
 from lczero_triton.bt4.kernels.expand_planes import ExpandPlanesSpecialization
 from lczero_triton.bt4.kernels.input_gating import InputGatingSpecialization
 from lczero_triton.bt4.kernels.layer_norm import LayerNormSpecialization
@@ -29,6 +32,7 @@ from lczero_triton.bt4.kernels.nchw_to_nhwc import NchwToNhwcSpecialization
 from lczero_triton.bt4.kernels.preprocess_attention_body import (
     PreprocessAttentionBodySpecialization,
 )
+from lczero_triton.bt4.kernels.softmax_64 import Softmax64Specialization
 from lczero_triton.bt4.network import (
     _BuildContext,
     _default_activation,
@@ -40,6 +44,7 @@ from lczero_triton.bt4.network import (
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
 _ARCHITECTURE = 80
 _REUSED_TEMPORARY_COUNT = 3
+_ENCODER_LOCAL_BUFFER_COUNT = 28
 
 
 def _active_architecture() -> int:
@@ -104,6 +109,52 @@ def _embedding_network(
     _set_elements(weights.ip_emb_ffn_ln_gammas, body_width)
     _set_elements(weights.ip_emb_ffn_ln_betas, body_width)
     return network
+
+
+def _add_encoder(  # noqa: PLR0913
+    network: net_pb2.Net,
+    *,
+    body_width: int,
+    compression_width: int,
+    hidden_width: int,
+    generated_width: int,
+    model_width: int,
+    ffn_width: int,
+) -> None:
+    """Populate the skeleton encoder with locally inferred dimensions."""
+    encoder = network.weights.encoder[0]
+    heads = network.weights.headcount
+    smolgen = encoder.mha.smolgen
+    _set_elements(smolgen.compress, body_width * compression_width)
+    _set_elements(smolgen.dense1_w, 64 * compression_width * hidden_width)
+    _set_elements(smolgen.dense1_b, hidden_width)
+    _set_elements(smolgen.ln1_gammas, hidden_width)
+    _set_elements(smolgen.ln1_betas, hidden_width)
+    _set_elements(smolgen.dense2_w, hidden_width * heads * generated_width)
+    _set_elements(smolgen.dense2_b, heads * generated_width)
+    _set_elements(smolgen.ln2_gammas, heads * generated_width)
+    _set_elements(smolgen.ln2_betas, heads * generated_width)
+    for weight, bias in (
+        (encoder.mha.q_w, encoder.mha.q_b),
+        (encoder.mha.k_w, encoder.mha.k_b),
+        (encoder.mha.v_w, encoder.mha.v_b),
+    ):
+        _set_elements(weight, body_width * model_width)
+        _set_elements(bias, model_width)
+    _set_elements(encoder.mha.dense_w, model_width * body_width)
+    _set_elements(encoder.mha.dense_b, body_width)
+    _set_elements(encoder.ln1_gammas, body_width)
+    _set_elements(encoder.ln1_betas, body_width)
+    _set_elements(encoder.ffn.dense1_w, body_width * ffn_width)
+    _set_elements(encoder.ffn.dense1_b, ffn_width)
+    _set_elements(encoder.ffn.dense2_w, ffn_width * body_width)
+    _set_elements(encoder.ffn.dense2_b, body_width)
+    _set_elements(encoder.ln2_gammas, body_width)
+    _set_elements(encoder.ln2_betas, body_width)
+    _set_elements(network.weights.smolgen_w, generated_width * 64 * 64)
+    network.format.network_format.smolgen_activation = (
+        net_pb2.NetworkFormat.ACTIVATION_SWISH
+    )
 
 
 def _artifact(function: str, parameter_count: int) -> KernelArtifact:
@@ -174,6 +225,24 @@ def _stub_compilers(
         _compiler(records, "add_bias_batched", 3),
     )
 
+    def compile_batched_matmul(
+        specialization: BatchedMatmulSpecialization,
+    ) -> KernelArtifact:
+        records.append(("batched_matmul", specialization))
+        parameter_count = 3 if specialization.operation == "body_attention_v" else 4
+        return _artifact(specialization.operation, parameter_count)
+
+    monkeypatch.setattr(
+        batched_matmul_module,
+        "compile_batched_matmul",
+        compile_batched_matmul,
+    )
+    monkeypatch.setattr(
+        softmax_64_module,
+        "compile_softmax_64",
+        _compiler(records, "softmax_64", 3),
+    )
+
     def compile_layer_norm(specialization: LayerNormSpecialization) -> KernelArtifact:
         function = "layer_norm_skip" if specialization.has_skip else "layer_norm"
         records.append((function, specialization))
@@ -232,6 +301,40 @@ def _stop_after_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(network_module, "_moves_left_head", ignore_moves_left)
 
 
+def _stop_after_encoders(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace output heads with one read of the final encoder body."""
+
+    def consume_policy(
+        context: _BuildContext,
+        body: Buffer,
+        body_width: int,
+        weights: net_pb2.Weights,
+    ) -> None:
+        del body_width, weights
+        kernel = context.builder.add_kernel(_artifact("consume_body", 1))
+        context.builder.call(kernel, body, readonly=(body,))
+
+    def ignore_value(
+        context: _BuildContext,
+        body: Buffer,
+        body_width: int,
+        winner: net_pb2.Weights.ValueHead,
+    ) -> None:
+        del context, body, body_width, winner
+
+    def ignore_moves_left(
+        context: _BuildContext,
+        body: Buffer,
+        body_width: int,
+        weights: net_pb2.Weights,
+    ) -> None:
+        del context, body, body_width, weights
+
+    monkeypatch.setattr(network_module, "_policy_head", consume_policy)
+    monkeypatch.setattr(network_module, "_value_head", ignore_value)
+    monkeypatch.setattr(network_module, "_moves_left_head", ignore_moves_left)
+
+
 def _location(argument: lc0ex_pb2.Node.Argument) -> tuple[int, int]:
     """Return one serialized allocation argument location."""
     return argument.allocation.index, argument.allocation.offset
@@ -248,15 +351,24 @@ def test_build_rejects_non_positive_batch_before_network_validation() -> None:
         build(ExecutableBuilder(), net_pb2.Net(), batch_size=0)
 
 
-def test_build_normalizes_and_reaches_encoder_boundary(
+def test_build_normalizes_and_builds_encoder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A valid embedding graph reaches the first unimplemented encoder production."""
+    """A normalized network builds through its encoder production."""
     network = _embedding_network(encoding_width=1, body_width=16, hidden_width=32)
+    _add_encoder(
+        network,
+        body_width=16,
+        compression_width=2,
+        hidden_width=16,
+        generated_width=16,
+        model_width=16,
+        ffn_width=32,
+    )
     _stub_compilers(monkeypatch)
+    _stop_after_encoders(monkeypatch)
 
-    with pytest.raises(NotImplementedError, match="Smolgen"):
-        build(ExecutableBuilder(), network, batch_size=1)
+    build(ExecutableBuilder(), network, batch_size=1)
 
     assert (
         network.format.network_format.network
@@ -266,6 +378,93 @@ def test_build_normalizes_and_reaches_encoder_boundary(
         network.format.network_format.input_embedding
         == net_pb2.NetworkFormat.INPUT_EMBEDDING_PE_DENSE
     )
+
+
+def test_encoder_builds_names_order_and_specializations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One block preserves ONNX names and the required evaluation order."""
+    network = _embedding_network(encoding_width=1, body_width=16, hidden_width=32)
+    network.weights.headcount = 2
+    _add_encoder(
+        network,
+        body_width=16,
+        compression_width=2,
+        hidden_width=16,
+        generated_width=16,
+        model_width=16,
+        ffn_width=32,
+    )
+    records = _stub_compilers(monkeypatch)
+    _stop_after_encoders(monkeypatch)
+    builder = ExecutableBuilder()
+
+    build(builder, network, batch_size=2)
+    executable = builder.build()
+    nodes = executable.programs[0].nodes
+    functions = [executable.kernels[node.kernel_idx].function for node in nodes]
+    encoder_functions = functions[12:-1]
+
+    assert encoder_functions == [
+        "matmul",
+        "matmul",
+        "layer_norm",
+        "matmul",
+        "layer_norm",
+        "matmul",
+        "matmul",
+        "add_bias_batched",
+        "matmul",
+        "add_bias_batched",
+        "matmul",
+        "add_bias_batched",
+        "body_qk",
+        "softmax_64",
+        "body_attention_v",
+        "matmul",
+        "layer_norm_skip",
+        "matmul",
+        "add_bias_batched",
+        "matmul",
+        "layer_norm_skip",
+    ]
+    buffers = {buffer.name: tuple(buffer.shape) for buffer in executable.buffers}
+    encoder_names = {name for name in buffers if name.startswith("/encoder0/")}
+    assert len(encoder_names) == _ENCODER_LOCAL_BUFFER_COUNT
+    assert buffers["/encoder0/mha/Q/w/w"] == (16, 16)
+    assert buffers["/encoder0/smolgen/dense2/w/w"] == (16, 32)
+    assert buffers["/const/smolgen_w"] == (16, 4096)
+    assert buffers["/encoder0/alpha*input/w"] == (1,)
+    assert buffers["/encoder0/ffn/alpha/w"] == (1,)
+
+    specializations = [specialization for _name, specialization in records]
+    assert (
+        LayerNormSpecialization(
+            row_count=2,
+            width=32,
+            activation="swish",
+            has_skip=False,
+            architecture=_ARCHITECTURE,
+        )
+        in specializations
+    )
+    assert (
+        BatchedMatmulSpecialization("body_qk", 4, 64, 64, 8, 2, _ARCHITECTURE)
+        in specializations
+    )
+    assert (
+        BatchedMatmulSpecialization("body_attention_v", 4, 64, 8, 64, 2, _ARCHITECTURE)
+        in specializations
+    )
+    assert Softmax64Specialization(4 * 64, _ARCHITECTURE) in specializations
+
+    arguments = [[_location(argument) for argument in node.arguments] for node in nodes]
+    encoder_start = 12
+    ln1 = arguments[encoder_start + 16]
+    ln2 = arguments[encoder_start + 20]
+    assert ln1[3] == arguments[11][0]
+    assert ln2[3] == ln1[0]
+    assert arguments[-1][0] == ln2[0]
 
 
 @pytest.mark.parametrize(
