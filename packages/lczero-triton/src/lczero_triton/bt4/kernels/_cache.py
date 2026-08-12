@@ -1,11 +1,14 @@
 """Per-build cache for immutable BT4 kernel specializations."""
 
+import logging
 from collections.abc import Callable, Hashable
+from time import perf_counter
 from typing import TypeVar
 
 from lc0ex import ExecutableBuilder, KernelArtifact, KernelHandle
 
 Specialization = TypeVar("Specialization", bound=Hashable)
+_LOGGER = logging.getLogger(__name__)
 
 
 class KernelCache:
@@ -28,7 +31,35 @@ class KernelCache:
         """Return the handle compiled from one complete specialization key."""
         key = (compiler, specialization)
         handle = self._handles.get(key)
+        compiler_name = getattr(compiler, "__name__", type(compiler).__name__)
         if handle is None:
-            handle = self._builder.add_kernel(compiler(specialization))
+            _LOGGER.info(
+                "compiling kernel %s for specialization %r",
+                compiler_name,
+                specialization,
+            )
+            started = perf_counter()
+            try:
+                artifact = compiler(specialization)
+                handle = self._builder.add_kernel(artifact)
+            except Exception:
+                _LOGGER.exception(
+                    "kernel compilation failed for %s and specialization %r",
+                    compiler_name,
+                    specialization,
+                )
+                raise
             self._handles[key] = handle
+            _LOGGER.info(
+                "kernel %s compilation completed for specialization %r in %.2fs",
+                compiler_name,
+                specialization,
+                perf_counter() - started,
+            )
+        else:
+            _LOGGER.debug(
+                "reusing compiled kernel %s for specialization %r",
+                compiler_name,
+                specialization,
+            )
         return handle

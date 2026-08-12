@@ -1,5 +1,6 @@
 """Protobuf-driven grammar for construction of the BT4 executable graph."""
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -70,6 +71,7 @@ _F16_SIZE_BYTES = 2
 _INPUT_CHANNELS = 112
 _POSITION_CHANNELS = 12
 _SQUARE_COUNT = 64
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -99,6 +101,7 @@ def build(
     """Traverse the active network and append one or more batch programs."""
     sizes = _normalize_batch_sizes(batch_size, batch_sizes)
 
+    _LOGGER.info("normalizing and validating BT4 network")
     normalize_network(network)
     validate_network_format(network)
     network_format = network.format.network_format
@@ -119,8 +122,14 @@ def build(
         smolgen_activation=smolgen_activation,
     )
     kernels = KernelCache(builder)
+    _LOGGER.info(
+        "building BT4 graph for batch sizes %s with %d encoder layers",
+        sizes,
+        len(network.weights.encoder),
+    )
     for size in sizes:
         program_name = "main" if len(sizes) == 1 else f"batch-{size}"
+        _LOGGER.info("building program %s for batch size %d", program_name, size)
         with builder.program(name=program_name) as program:
             context = _BuildContext(
                 builder=builder,
@@ -136,7 +145,9 @@ def build(
                 fingerprint_layers=fingerprint_layers,
             )
             _network(context, network.weights)
+        _LOGGER.info("finished program %s", program_name)
     builder.set_metadata(fingerprint.SerializeToString(deterministic=True))
+    _LOGGER.info("finished BT4 graph construction")
 
 
 def _normalize_batch_sizes(
@@ -166,9 +177,16 @@ def _normalize_batch_sizes(
 
 def _network(context: _BuildContext, weights: net_pb2.Weights) -> None:
     """Build inputs, body embedding, encoders, and selected output heads."""
+    _LOGGER.info("batch size %d: building input embedding", context.batch_size)
     inputs = _inputs(context)
     body, body_width = _embedding(context, inputs, weights)
+    _LOGGER.info(
+        "batch size %d: building encoder tower (%d layers)",
+        context.batch_size,
+        len(weights.encoder),
+    )
     body = _encoder_tower(context, body, body_width, weights)
+    _LOGGER.info("batch size %d: building output heads", context.batch_size)
     _policy_head(context, body, body_width, weights)
     _value_head(context, body, body_width, weights.value_heads.winner)
     _moves_left_head(context, body, body_width, weights)
@@ -726,6 +744,12 @@ def _encoder_tower(
 ) -> Buffer:
     """Visit each protobuf encoder in evaluation order without fixed depth."""
     for index, encoder in enumerate(weights.encoder):
+        _LOGGER.info(
+            "batch size %d: building encoder %d/%d",
+            context.batch_size,
+            index + 1,
+            len(weights.encoder),
+        )
         body = _encoder(
             context,
             body,
