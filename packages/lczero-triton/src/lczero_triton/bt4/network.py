@@ -1,10 +1,11 @@
 """Protobuf-driven grammar for construction of the BT4 executable graph."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
 import net_pb2
-from lc0ex import Allocation, Buffer, ExecutableBuilder
+from lc0ex import Buffer, ExecutableBuilder, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 
 from lczero_triton.bt4._format import (
@@ -76,8 +77,7 @@ class _BuildContext:
     """Construction services shared by grammar productions in one build."""
 
     builder: ExecutableBuilder
-    persistent: Allocation
-    execution: Allocation
+    execution: ProgramBuilder
     kernels: KernelCache
     batch_size: int
     architecture: int
@@ -93,12 +93,11 @@ def build(
     builder: ExecutableBuilder,
     network: net_pb2.Net,
     *,
-    batch_size: int = 169,
+    batch_size: int | None = None,
+    batch_sizes: Sequence[int] | None = None,
 ) -> None:
-    """Traverse the active network and append its executable graph."""
-    if batch_size <= 0:
-        message = "batch_size must be positive"
-        raise ValueError(message)
+    """Traverse the active network and append one or more batch programs."""
+    sizes = _normalize_batch_sizes(batch_size, batch_sizes)
 
     normalize_network(network)
     validate_network_format(network)
@@ -119,22 +118,50 @@ def build(
         ffn_activation=ffn_activation,
         smolgen_activation=smolgen_activation,
     )
-    context = _BuildContext(
-        builder=builder,
-        persistent=builder.allocation(lc0ex_pb2.Allocation.LIFETIME_PERSISTENT),
-        execution=builder.allocation(lc0ex_pb2.Allocation.LIFETIME_EXECUTION),
-        kernels=KernelCache(builder),
-        batch_size=batch_size,
-        architecture=active_architecture(),
-        default_encoding=network.format.weights_encoding,
-        default_activation=default_activation,
-        ffn_activation=ffn_activation,
-        smolgen_activation=smolgen_activation,
-        fingerprint=fingerprint,
-        fingerprint_layers=fingerprint_layers,
-    )
-    _network(context, network.weights)
+    kernels = KernelCache(builder)
+    for size in sizes:
+        program_name = "main" if len(sizes) == 1 else f"batch-{size}"
+        with builder.program(name=program_name) as program:
+            context = _BuildContext(
+                builder=builder,
+                execution=program,
+                kernels=kernels,
+                batch_size=size,
+                architecture=active_architecture(),
+                default_encoding=network.format.weights_encoding,
+                default_activation=default_activation,
+                ffn_activation=ffn_activation,
+                smolgen_activation=smolgen_activation,
+                fingerprint=fingerprint,
+                fingerprint_layers=fingerprint_layers,
+            )
+            _network(context, network.weights)
     builder.set_metadata(fingerprint.SerializeToString(deterministic=True))
+
+
+def _normalize_batch_sizes(
+    batch_size: int | None,
+    batch_sizes: Sequence[int] | None,
+) -> tuple[int, ...]:
+    """Validate and normalize the requested fixed batch program sizes."""
+    if batch_size is not None and batch_sizes is not None:
+        message = "specify batch_size or batch_sizes, not both"
+        raise ValueError(message)
+    sizes: tuple[int, ...]
+    if batch_sizes is None:
+        sizes = (169 if batch_size is None else batch_size,)
+    else:
+        sizes = tuple(batch_sizes)
+    if not sizes:
+        message = "batch_sizes must not be empty"
+        raise ValueError(message)
+    if any(size <= 0 for size in sizes):
+        message = "batch_size must be positive"
+        raise ValueError(message)
+    if len(set(sizes)) != len(sizes):
+        message = "batch_sizes must not contain duplicates"
+        raise ValueError(message)
+    return sizes
 
 
 def _network(context: _BuildContext, weights: net_pb2.Weights) -> None:
@@ -313,12 +340,12 @@ def _fingerprint_network(
 
 def _inputs(context: _BuildContext) -> tuple[Buffer, Buffer]:
     """Declare the packed execution inputs consumed by plane expansion."""
-    masks = context.execution.external_buffer(
+    masks = context.execution.buffer(
         name="/input/plane_masks",
         shape=(context.batch_size, _INPUT_CHANNELS),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_U64,
     )
-    values = context.execution.external_buffer(
+    values = context.execution.buffer(
         name="/input/plane_values",
         shape=(context.batch_size, _INPUT_CHANNELS),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
@@ -468,7 +495,7 @@ def _embedding(  # noqa: PLR0915
         body_width,
         path="weights.ip_emb_ffn.dense2_b",
     )
-    alpha = context.persistent.external_buffer(
+    alpha = context.builder.persistent_buffer(
         name="/attn_body/ffn/alpha/w",
         shape=(1,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -1027,12 +1054,12 @@ def _attention(  # noqa: PLR0913
     )
     _require_body_width(gamma_width, body_width, path=f"{path}.ln1_gammas")
     _require_body_width(beta_width, body_width, path=f"{path}.ln1_betas")
-    scale = context.persistent.external_buffer(
+    scale = context.builder.persistent_buffer(
         name=f"{prefix}/mha/QK/scale/w",
         shape=(1,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
     )
-    alpha = context.persistent.external_buffer(
+    alpha = context.builder.persistent_buffer(
         name=f"{prefix}/alpha*input/w",
         shape=(1,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -1223,7 +1250,7 @@ def _ffn(
         (beta_width, "ln2_betas"),
     ):
         _require_body_width(width, body_width, path=f"{path}.{field}")
-    alpha = context.persistent.external_buffer(
+    alpha = context.builder.persistent_buffer(
         name=f"{prefix}/ffn/alpha/w",
         shape=(1,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -1379,12 +1406,12 @@ def _policy_head(
         path="weights.policy_heads.vanilla.ip4_pol_w",
         expected_path="promotion output",
     )
-    scale = context.persistent.external_buffer(
+    scale = context.builder.persistent_buffer(
         name="/policy/scale/w",
         shape=(1,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
     )
-    output = context.execution.external_buffer(
+    output = context.execution.buffer(
         name="/output/policy",
         shape=(context.batch_size, 1858),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
@@ -1628,7 +1655,7 @@ def _dense_output_head(  # noqa: PLR0913
         path=f"{path} dense2 bias",
         expected_path=f"{output_name} output",
     )
-    output = context.execution.external_buffer(
+    output = context.execution.buffer(
         name=output_name,
         shape=(context.batch_size, output_width),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
@@ -1822,7 +1849,7 @@ def _vector_f16(
     width = _layer_elements(layer, context.default_encoding, path=path)
     _fingerprint_layer(context, path)
     return (
-        context.persistent.external_buffer(
+        context.builder.persistent_buffer(
             name=name,
             shape=(width,),
             dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -1850,7 +1877,7 @@ def _matrix_f16(
         )
         raise NetworkFormatError(message)
     return (
-        context.persistent.external_buffer(
+        context.builder.persistent_buffer(
             name=name,
             shape=(input_width, output_width),
             dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,

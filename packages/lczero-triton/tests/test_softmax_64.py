@@ -218,7 +218,7 @@ def _external_buffer(
     writable: bool = False,
 ) -> Buffer:
     """Declare one FP16 execution buffer for graph tests."""
-    return builder.allocation(lc0ex_pb2.Allocation.LIFETIME_EXECUTION).external_buffer(
+    return builder.execution_buffer(
         name=name,
         shape=shape,
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -258,13 +258,13 @@ def test_graph_call_preserves_in_place_abi_and_dependencies() -> None:
     executable = builder.build()
     nodes = executable.programs[0].nodes
     locations = {
-        buffer.name: (buffer.allocation_idx, buffer.allocation_offset)
-        for buffer in executable.buffers
+        buffer.name: (buffer.offset,)
+        for buffer in (
+            *executable.buffers,
+            *executable.programs[0].buffers,
+        )
     }
-    first_arguments = [
-        (argument.allocation.index, argument.allocation.offset)
-        for argument in nodes[0].arguments
-    ]
+    first_arguments = [(argument.allocation.offset,) for argument in nodes[0].arguments]
 
     assert executable.target.architecture == f"sm_{_architecture()}"
     assert first_arguments == [

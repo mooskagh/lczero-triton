@@ -1,4 +1,4 @@
-"""Opaque logical buffer handles and executable allocation serialization."""
+"""Opaque logical buffers and contiguous allocation planning."""
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -11,10 +11,14 @@ _MAX_ALLOCATION_SIZE_BYTES = (1 << 64) - 1
 
 @dataclass(frozen=True, slots=True, eq=False)
 class Allocation:
-    """A logical device-memory allocation owned by an executable builder."""
+    """A logical device-memory allocation owned by a buffer builder."""
 
-    lifetime: lc0ex_pb2.Allocation.Lifetime
     _owner: "BufferBuilder" = field(repr=False)
+    _persistent: bool
+
+    def is_persistent(self) -> bool:
+        """Return whether this allocation belongs to the executable."""
+        return self._persistent
 
     def external_buffer(
         self,
@@ -25,7 +29,7 @@ class Allocation:
         writable: bool = False,
         alignment_bytes: int | None = None,
     ) -> "Buffer":
-        """Create or retrieve a named external range in this allocation."""
+        """Create or retrieve a named external buffer in this allocation."""
         return self._owner.external_buffer(
             self,
             name=name,
@@ -41,7 +45,7 @@ class Allocation:
         size_bytes: int,
         alignment_bytes: int,
     ) -> "Buffer":
-        """Create an unnamed reusable execution range with raw storage size."""
+        """Create an unnamed reusable range in this allocation."""
         return self._owner.temporary_buffer(
             self,
             size_bytes=size_bytes,
@@ -55,17 +59,12 @@ class Allocation:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class Buffer:
-    """An opaque identity for one logical device-memory range.
-
-    Do not add shape, data-type, layout, or stride accessors. Kernels receive
-    pointers only, so their dimensions and element types must be explicit
-    specialization parameters at graph-construction call sites.
-    """
+    """An opaque identity for one logical device-memory range."""
 
 
 @dataclass(frozen=True, slots=True)
 class _ExternalBuffer:
-    """Canonical runtime metadata for one named external range."""
+    """Canonical metadata for one named external range."""
 
     name: str
     shape: tuple[int, ...]
@@ -81,6 +80,33 @@ class _BufferRecord:
     alignment_bytes: int
     external: _ExternalBuffer | None
     writable: bool
+
+
+@dataclass(slots=True)
+class _AllocationSlot:
+    """One reusable raw-storage range in an allocation."""
+
+    buffers: list[Buffer]
+    size_bytes: int
+    alignment_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class BufferLocation:
+    """The planned location of one logical buffer."""
+
+    allocation: Allocation
+    offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class AllocationPlan:
+    """The packed layout of one persistent or execution allocation."""
+
+    size_bytes: int
+    alignment_bytes: int
+    locations: dict[Buffer, BufferLocation]
+    external_buffers: tuple[tuple[Buffer, _ExternalBuffer], ...]
 
 
 def data_type_size_bytes(dtype: lc0ex_pb2.Buffer.DataType) -> int:
@@ -100,46 +126,25 @@ def data_type_size_bytes(dtype: lc0ex_pb2.Buffer.DataType) -> int:
     return sizes[dtype]
 
 
-@dataclass(slots=True)
-class _AllocationSlot:
-    """One reusable raw-storage range in an allocation."""
-
-    buffers: list[Buffer]
-    size_bytes: int
-    alignment_bytes: int
-
-
-@dataclass(frozen=True, slots=True)
-class BufferLocation:
-    """The planned location of one logical buffer."""
-
-    allocation_idx: int
-    allocation_offset: int
-
-
 class BufferBuilder:
-    """Collect opaque logical buffers and serialize their physical storage."""
+    """Collect opaque buffers and pack each allocation."""
 
     def __init__(self) -> None:
-        """Initialize an empty buffer collection."""
-        self._allocations: list[Allocation] = []
-        self._buffers_by_allocation: dict[Allocation, list[Buffer]] = {}
+        """Initialize an empty allocation collection."""
+        self._persistent = Allocation(self, _persistent=True)
+        self._buffers_by_allocation: dict[Allocation, list[Buffer]] = {
+            self._persistent: [],
+        }
         self._records: dict[Buffer, _BufferRecord] = {}
-        self._external_by_name: dict[str, Buffer] = {}
+        self._external_by_allocation_and_name: dict[tuple[Allocation, str], Buffer] = {}
 
-    def allocation(
-        self,
-        lifetime: lc0ex_pb2.Allocation.Lifetime,
-    ) -> Allocation:
-        """Create an allocation with the given runtime lifetime."""
-        if lifetime not in {
-            lc0ex_pb2.Allocation.LIFETIME_PERSISTENT,
-            lc0ex_pb2.Allocation.LIFETIME_EXECUTION,
-        }:
-            message = "allocation lifetime must be PERSISTENT or EXECUTION"
-            raise ValueError(message)
-        allocation = Allocation(lifetime, self)
-        self._allocations.append(allocation)
+    def persistent_allocation(self) -> Allocation:
+        """Return the executable-wide persistent allocation."""
+        return self._persistent
+
+    def execution_allocation(self) -> Allocation:
+        """Create and return a new program execution allocation."""
+        allocation = Allocation(self, _persistent=False)
         self._buffers_by_allocation[allocation] = []
         return allocation
 
@@ -165,7 +170,8 @@ class BufferBuilder:
         _validate_alignment(resolved_alignment, minimum=element_size)
         size_bytes = _checked_product(normalized_shape, element_size)
 
-        existing = self._external_by_name.get(name)
+        key = (allocation, name)
+        existing = self._external_by_allocation_and_name.get(key)
         if existing is not None:
             record = self._records[existing]
             _validate_matching_external(
@@ -191,7 +197,7 @@ class BufferBuilder:
                 writable,
             ),
         )
-        self._external_by_name[name] = buffer
+        self._external_by_allocation_and_name[key] = buffer
         return buffer
 
     def temporary_buffer(
@@ -203,8 +209,8 @@ class BufferBuilder:
     ) -> Buffer:
         """Create an unnamed raw-storage buffer in an execution allocation."""
         self._require_owned_allocation(allocation)
-        if allocation.lifetime != lc0ex_pb2.Allocation.LIFETIME_EXECUTION:
-            message = "temporary buffers require an EXECUTION allocation"
+        if allocation.is_persistent():
+            message = "temporary buffers require an execution allocation"
             raise ValueError(message)
         _validate_size(size_bytes)
         _validate_alignment(alignment_bytes, minimum=1)
@@ -222,90 +228,82 @@ class BufferBuilder:
         return buffer
 
     def owns(self, buffer: Buffer) -> bool:
-        """Return whether *buffer* is a handle created by this collection."""
+        """Return whether *buffer* belongs to this collection."""
         return buffer in self._records
 
     def is_reusable(self, buffer: Buffer) -> bool:
-        """Return whether *buffer* is an internal reusable execution range."""
+        """Return whether *buffer* is an internal reusable range."""
         return self._records[buffer].external is None
 
     def is_writable(self, buffer: Buffer) -> bool:
         """Return whether *buffer* may be modified by graph nodes."""
         return self._records[buffer].writable
 
+    def allocation_of(self, buffer: Buffer) -> Allocation:
+        """Return the allocation containing *buffer*."""
+        return self._records[buffer].allocation
+
     def share_allocation(self, first: Buffer, second: Buffer) -> bool:
         """Return whether two opaque ranges belong to one allocation."""
-        return self._records[first].allocation is self._records[second].allocation
+        return self.allocation_of(first) is self.allocation_of(second)
 
-    def build(
+    def plan(
         self,
-        executable: lc0ex_pb2.NeuralExecutable,
+        allocation: Allocation,
         reusable_conflicts: dict[Buffer, set[Buffer]],
-    ) -> dict[Buffer, BufferLocation]:
-        """Append allocations and return locations for every used buffer."""
+    ) -> AllocationPlan | None:
+        """Pack one allocation and return its serialized plan."""
+        self._require_owned_allocation(allocation)
+        buffers = self._buffers_by_allocation[allocation]
+        fixed_buffers = [
+            buffer for buffer in buffers if self._records[buffer].external is not None
+        ]
+        reusable_buffers = [
+            buffer for buffer in buffers if buffer in reusable_conflicts
+        ]
+        if not fixed_buffers and not reusable_buffers:
+            return None
+
         locations: dict[Buffer, BufferLocation] = {}
-        for allocation in self._allocations:
-            buffers = self._buffers_by_allocation[allocation]
-            fixed_buffers = [
-                buffer
-                for buffer in buffers
-                if self._records[buffer].external is not None
-            ]
-            reusable_buffers = [
-                buffer for buffer in buffers if buffer in reusable_conflicts
-            ]
-            if not fixed_buffers and not reusable_buffers:
-                continue
+        allocation_size = 0
+        allocation_alignment = 1
+        for buffer in fixed_buffers:
+            record = self._records[buffer]
+            allocation_alignment = max(allocation_alignment, record.alignment_bytes)
+            allocation_size = _align_up(allocation_size, record.alignment_bytes)
+            locations[buffer] = BufferLocation(allocation, allocation_size)
+            allocation_size = _checked_add(allocation_size, record.size_bytes)
 
-            allocation_idx = len(executable.allocations)
-            allocation_size = 0
-            allocation_alignment = 1
-            for buffer in fixed_buffers:
-                record = self._records[buffer]
-                allocation_alignment = max(allocation_alignment, record.alignment_bytes)
-                allocation_size = _align_up(allocation_size, record.alignment_bytes)
-                locations[buffer] = BufferLocation(allocation_idx, allocation_size)
-                allocation_size = _checked_add(allocation_size, record.size_bytes)
-
-            allocation_size, reusable_alignment, reusable_offsets = (
-                self._build_reusable_ranges(
-                    reusable_buffers,
-                    reusable_conflicts,
-                    allocation_size,
-                )
+        allocation_size, reusable_alignment, reusable_offsets = (
+            self._build_reusable_ranges(
+                reusable_buffers,
+                reusable_conflicts,
+                allocation_size,
             )
-            allocation_alignment = max(allocation_alignment, reusable_alignment)
-            for buffer, offset in reusable_offsets.items():
-                locations[buffer] = BufferLocation(allocation_idx, offset)
+        )
+        allocation_alignment = max(allocation_alignment, reusable_alignment)
+        for buffer, offset in reusable_offsets.items():
+            locations[buffer] = BufferLocation(allocation, offset)
 
-            executable.allocations.add(
-                size_bytes=allocation_size,
-                alignment_bytes=allocation_alignment,
-                lifetime=allocation.lifetime,
-            )
-            for buffer in fixed_buffers:
-                record = self._records[buffer]
-                external = record.external
-                if external is None:
-                    message = "internal error: fixed buffer is not external"
-                    raise RuntimeError(message)
-                location = locations[buffer]
-                executable.buffers.add(
-                    name=external.name,
-                    allocation_idx=location.allocation_idx,
-                    allocation_offset=location.allocation_offset,
-                    data_type=external.dtype,
-                    shape=external.shape,
-                )
-        return locations
+        external_buffers: list[tuple[Buffer, _ExternalBuffer]] = []
+        for buffer in fixed_buffers:
+            external = self._records[buffer].external
+            if external is not None:
+                external_buffers.append((buffer, external))
+        return AllocationPlan(
+            allocation_size,
+            allocation_alignment,
+            locations,
+            tuple(external_buffers),
+        )
 
     def _add_buffer(self, buffer: Buffer, record: _BufferRecord) -> None:
-        """Register one newly created opaque handle and its private metadata."""
+        """Register one newly created opaque buffer handle."""
         self._buffers_by_allocation[record.allocation].append(buffer)
         self._records[buffer] = record
 
     def _require_owned_allocation(self, allocation: Allocation) -> None:
-        """Reject allocations created by another executable builder."""
+        """Reject allocations created by another builder."""
         if not allocation.belongs_to(self):
             message = "allocation does not belong to this executable builder"
             raise ValueError(message)
@@ -316,7 +314,7 @@ class BufferBuilder:
         conflicts: dict[Buffer, set[Buffer]],
         allocation_size: int,
     ) -> tuple[int, int, dict[Buffer, int]]:
-        """Pack internal raw ranges into reusable slots after external ranges."""
+        """Pack internal raw ranges into reusable slots."""
         slots: list[_AllocationSlot] = []
         for buffer in buffers:
             record = self._records[buffer]
@@ -375,7 +373,7 @@ def _validate_size(size_bytes: int) -> None:
 
 
 def _validate_alignment(alignment_bytes: int, *, minimum: int) -> None:
-    """Validate one power-of-two alignment suitable for a raw memory range."""
+    """Validate one power-of-two alignment suitable for a raw range."""
     if (
         alignment_bytes < minimum
         or alignment_bytes > _MAX_ALLOCATION_SIZE_BYTES

@@ -6,7 +6,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Self
 
-from lc0ex.buffer_builder import Allocation, Buffer, BufferBuilder, BufferLocation
+from lc0ex.buffer_builder import Allocation, AllocationPlan, Buffer, BufferBuilder
 from lc0ex.kernel_builder import (
     KernelArtifact,
     KernelHandle,
@@ -29,8 +29,97 @@ class _KernelInvocation:
     readonly: frozenset[Buffer]
 
 
+class ProgramBuilder:
+    """Build one program and its private execution allocation."""
+
+    def __init__(
+        self,
+        owner: "ExecutableBuilder",
+        name: str,
+        metadata: bytes | None,
+        token: object,
+    ) -> None:
+        """Initialize a program owned by *owner*."""
+        if token is not owner._program_token:  # noqa: SLF001
+            message = "programs must be created by an executable builder"
+            raise ValueError(message)
+        self._owner = owner
+        self._name = name
+        self.metadata = metadata
+        self._allocation = owner._buffers.execution_allocation()  # noqa: SLF001
+        self._invocations: list[_KernelInvocation] = []
+
+    @property
+    def name(self) -> str:
+        """Return the immutable program name."""
+        return self._name
+
+    @property
+    def allocation(self) -> Allocation:
+        """Return this program's private execution allocation."""
+        return self._allocation
+
+    def __enter__(self) -> Self:
+        """Make this program the target of owner-level graph calls."""
+        self._owner._push_program(self)  # noqa: SLF001
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Restore the previous active program."""
+        self._owner._pop_program(self)  # noqa: SLF001
+
+    def buffer(
+        self,
+        *,
+        name: str,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+        writable: bool = False,
+        alignment_bytes: int | None = None,
+    ) -> Buffer:
+        """Create a named execution buffer in this program's allocation."""
+        return self._owner._buffers.external_buffer(  # noqa: SLF001
+            self._allocation,
+            name=name,
+            shape=shape,
+            dtype=dtype,
+            writable=writable,
+            alignment_bytes=alignment_bytes,
+        )
+
+    def temporary_buffer(self, *, size_bytes: int, alignment_bytes: int) -> Buffer:
+        """Create an unnamed execution buffer in this program's allocation."""
+        return self._owner._buffers.temporary_buffer(  # noqa: SLF001
+            self._allocation,
+            size_bytes=size_bytes,
+            alignment_bytes=alignment_bytes,
+        )
+
+    def add_kernel(self, kernel: KernelArtifact) -> KernelHandle:
+        """Register a kernel in the owning executable."""
+        return self._owner.add_kernel(kernel)
+
+    def add_symbol(self, symbol: SymbolArtifact) -> SymbolHandle:
+        """Register a symbol in the owning executable."""
+        return self._owner.add_symbol(symbol)
+
+    def call(
+        self,
+        kernel: KernelHandle,
+        *arguments: Buffer | SymbolHandle,
+        readonly: Sequence[Buffer] = (),
+    ) -> None:
+        """Append a call to this program."""
+        self._owner._call_in_program(  # noqa: SLF001
+            self,
+            kernel,
+            *arguments,
+            readonly=readonly,
+        )
+
+
 class ExecutableBuilder:
-    """Build an Lc0 neural executable."""
+    """Build an Lc0 neural executable with shared persistent storage."""
 
     def __init__(self) -> None:
         """Initialize an empty executable builder."""
@@ -44,14 +133,74 @@ class ExecutableBuilder:
         ] = {}
         self._symbols: dict[SymbolHandle, SymbolArtifact] = {}
         self._symbol_handles: dict[SymbolArtifact, SymbolHandle] = {}
-        self._invocations: list[_KernelInvocation] = []
+        self._programs: list[ProgramBuilder] = []
+        self._program_indices: dict[str, ProgramBuilder] = {}
+        self._active_programs: list[ProgramBuilder] = []
+        self._default_program: ProgramBuilder | None = None
+        self._program_token = object()
 
-    def allocation(
+    def persistent_buffer(
         self,
-        lifetime: lc0ex_pb2.Allocation.Lifetime,
-    ) -> Allocation:
-        """Create a logical device-memory allocation."""
-        return self._buffers.allocation(lifetime)
+        *,
+        name: str,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+        writable: bool = False,
+        alignment_bytes: int | None = None,
+    ) -> Buffer:
+        """Create a named persistent buffer in the executable allocation."""
+        return self._buffers.external_buffer(
+            self._buffers.persistent_allocation(),
+            name=name,
+            shape=shape,
+            dtype=dtype,
+            writable=writable,
+            alignment_bytes=alignment_bytes,
+        )
+
+    def execution_buffer(
+        self,
+        *,
+        name: str,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+        writable: bool = False,
+        alignment_bytes: int | None = None,
+    ) -> Buffer:
+        """Create a named buffer in the implicit single program."""
+        return self._get_default_program().buffer(
+            name=name,
+            shape=shape,
+            dtype=dtype,
+            writable=writable,
+            alignment_bytes=alignment_bytes,
+        )
+
+    def temporary_buffer(self, *, size_bytes: int, alignment_bytes: int) -> Buffer:
+        """Create a raw buffer in the implicit single program."""
+        return self._get_default_program().temporary_buffer(
+            size_bytes=size_bytes,
+            alignment_bytes=alignment_bytes,
+        )
+
+    def program(
+        self,
+        *,
+        name: str,
+        metadata: bytes | None = None,
+    ) -> ProgramBuilder:
+        """Create a named program with a private execution allocation."""
+        if not name:
+            message = "program name cannot be empty"
+            raise ValueError(message)
+        if name in self._program_indices:
+            message = f"program {name!r} already exists"
+            raise ValueError(message)
+        normalized_metadata = None if metadata is None else bytes(metadata)
+        result = ProgramBuilder(self, name, normalized_metadata, self._program_token)
+        self._programs.append(result)
+        self._program_indices[name] = result
+        return result
 
     def set_target(
         self,
@@ -67,12 +216,7 @@ class ExecutableBuilder:
         return self
 
     def set_metadata(self, metadata: bytes) -> Self:
-        """Set opaque executable metadata and return this builder.
-
-        Repeated calls are allowed when they provide the same metadata, which
-        matches the idempotent target configuration API. Conflicting metadata
-        usually indicates that two graph producers were combined accidentally.
-        """
+        """Set opaque executable metadata and return this builder."""
         normalized = bytes(metadata)
         if self._metadata is not None and self._metadata != normalized:
             message = "metadata does not match the executable metadata"
@@ -124,11 +268,132 @@ class ExecutableBuilder:
         *arguments: Buffer | SymbolHandle,
         readonly: Sequence[Buffer] = (),
     ) -> None:
-        """Append a call to a registered kernel to the executable graph.
+        """Append a call to the active or inferred program."""
+        self._call_in_program(
+            self._infer_program(arguments),
+            kernel,
+            *arguments,
+            readonly=readonly,
+        )
 
-        Arguments not included in *readonly* are treated as writable. Read-only
-        accesses to the same buffer may execute concurrently.
-        """
+    def build(self) -> lc0ex_pb2.NeuralExecutable:
+        """Create and return a new neural executable."""
+        executable = lc0ex_pb2.NeuralExecutable(magic=_MAGIC, format=_FORMAT)
+        if self._metadata is not None:
+            executable.metadata = self._metadata
+        if self._target is not None:
+            vendor, architecture = self._target
+            executable.target.vendor = vendor
+            executable.target.architecture = architecture
+
+        persistent_conflicts: dict[Buffer, set[Buffer]] = {}
+        persistent_plan = self._buffers.plan(
+            self._buffers.persistent_allocation(),
+            persistent_conflicts,
+        )
+        if persistent_plan is not None:
+            executable.persistent_allocation.size_bytes = persistent_plan.size_bytes
+            executable.persistent_allocation.alignment_bytes = (
+                persistent_plan.alignment_bytes
+            )
+            self._build_buffers(executable, persistent_plan)
+
+        kernel_indices, symbol_locations = self._build_exports(executable)
+        for program in self._programs:
+            dependencies, reusable_conflicts = self._analyze_invocations(program)
+            plan = self._buffers.plan(
+                program._allocation,  # noqa: SLF001
+                reusable_conflicts,
+            )
+            destination = executable.programs.add(name=program.name)
+            if program.metadata is not None:
+                destination.metadata = program.metadata
+            if plan is not None:
+                destination.execution_allocation.size_bytes = plan.size_bytes
+                destination.execution_allocation.alignment_bytes = plan.alignment_bytes
+                self._build_buffers(destination, plan)
+            self._build_invocations(
+                destination=destination,
+                program=program,
+                dependencies=dependencies,
+                plans=(persistent_plan, plan),
+                exports=(kernel_indices, symbol_locations),
+            )
+        return executable
+
+    def build_and_write(
+        self,
+        path: str | PathLike[str],
+    ) -> lc0ex_pb2.NeuralExecutable:
+        """Build, serialize, and return the executable."""
+        executable = self.build()
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(executable.SerializeToString())
+        return executable
+
+    def _push_program(self, program: ProgramBuilder) -> None:
+        """Push a program onto the active graph target stack."""
+        if program._owner is not self:  # noqa: SLF001
+            message = "program does not belong to this executable builder"
+            raise ValueError(message)
+        self._active_programs.append(program)
+
+    def _pop_program(self, program: ProgramBuilder) -> None:
+        """Pop the expected active graph target."""
+        if not self._active_programs or self._active_programs[-1] is not program:
+            message = "program context is not the active builder context"
+            raise RuntimeError(message)
+        self._active_programs.pop()
+
+    def _get_default_program(self) -> ProgramBuilder:
+        """Create the implicit single-program graph when needed."""
+        if self._default_program is None:
+            existing = self._program_indices.get(_PROGRAM_NAME)
+            self._default_program = (
+                existing if existing is not None else self.program(name=_PROGRAM_NAME)
+            )
+        return self._default_program
+
+    def _infer_program(
+        self,
+        arguments: tuple[Buffer | SymbolHandle, ...],
+    ) -> ProgramBuilder:
+        """Infer a program from active context and execution buffers."""
+        if self._active_programs:
+            return self._active_programs[-1]
+        programs = {
+            self._program_for_buffer(argument)
+            for argument in arguments
+            if isinstance(argument, Buffer)
+            and self._buffers.owns(argument)
+            and not self._buffers.allocation_of(argument).is_persistent()
+        }
+        if len(programs) > 1:
+            message = "kernel arguments belong to different programs"
+            raise ValueError(message)
+        return next(iter(programs), self._get_default_program())
+
+    def _program_for_buffer(self, buffer: Buffer) -> ProgramBuilder:
+        """Find the program owning an execution buffer."""
+        allocation = self._buffers.allocation_of(buffer)
+        for program in self._programs:
+            if program._allocation is allocation:  # noqa: SLF001
+                return program
+        message = "execution buffer does not belong to a known program"
+        raise RuntimeError(message)
+
+    def _call_in_program(
+        self,
+        program: ProgramBuilder,
+        kernel: KernelHandle,
+        *arguments: Buffer | SymbolHandle,
+        readonly: Sequence[Buffer] = (),
+    ) -> None:
+        """Validate and append one invocation to *program*."""
+        if program._owner is not self:  # noqa: SLF001
+            message = "program does not belong to this executable builder"
+            raise ValueError(message)
         artifact = self._kernels.get(kernel)
         if artifact is None:
             message = "kernel handle does not belong to this executable builder"
@@ -165,8 +430,17 @@ class ExecutableBuilder:
         ):
             message = "read-only buffers must be kernel arguments"
             raise ValueError(message)
+        execution_programs = {
+            self._program_for_buffer(argument)
+            for argument in arguments
+            if isinstance(argument, Buffer)
+            and not self._buffers.allocation_of(argument).is_persistent()
+        }
+        if execution_programs and execution_programs != {program}:
+            message = "kernel arguments belong to a different program"
+            raise ValueError(message)
 
-        self._invocations.append(
+        program._invocations.append(  # noqa: SLF001
             _KernelInvocation(
                 kernel=kernel,
                 arguments=arguments,
@@ -182,43 +456,6 @@ class ExecutableBuilder:
                 ),
             ),
         )
-
-    def build(self) -> lc0ex_pb2.NeuralExecutable:
-        """Create and return a new neural executable."""
-        executable = lc0ex_pb2.NeuralExecutable(magic=_MAGIC, format=_FORMAT)
-        if self._metadata is not None:
-            executable.metadata = self._metadata
-        if self._target is not None:
-            vendor, architecture = self._target
-            executable.target.vendor = vendor
-            executable.target.architecture = architecture
-        dependencies, reusable_conflicts = self._analyze_invocations()
-        locations = self._buffers.build(executable, reusable_conflicts)
-        kernel_indices, symbol_locations = self._build_exports(executable)
-        self._build_invocations(
-            executable,
-            dependencies,
-            locations,
-            kernel_indices,
-            symbol_locations,
-        )
-        return executable
-
-    def build_and_write(
-        self,
-        path: str | PathLike[str],
-    ) -> lc0ex_pb2.NeuralExecutable:
-        """Build the executable, serialize it to *path*, and return it.
-
-        Raises:
-            google.protobuf.message.EncodeError: If required fields are unset.
-
-        """
-        executable = self.build()
-        output_path = Path(path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(executable.SerializeToString())
-        return executable
 
     def _build_exports(
         self,
@@ -259,6 +496,7 @@ class ExecutableBuilder:
 
     def _analyze_invocations(
         self,
+        program: ProgramBuilder,
     ) -> tuple[list[list[int]], dict[Buffer, set[Buffer]]]:
         """Return reduced dependencies and reusable-buffer conflicts."""
         latest_writer: dict[Buffer, int] = {}
@@ -267,7 +505,7 @@ class ExecutableBuilder:
         accesses: dict[Buffer, set[int]] = {}
 
         dependencies: list[list[int]] = []
-        for index, invocation in enumerate(self._invocations):
+        for index, invocation in enumerate(program._invocations):  # noqa: SLF001
             for buffer in {
                 argument
                 for argument in invocation.arguments
@@ -287,26 +525,49 @@ class ExecutableBuilder:
 
         return dependencies, self._reusable_conflicts(accesses, ancestors)
 
+    def _build_buffers(
+        self,
+        destination: lc0ex_pb2.NeuralExecutable | lc0ex_pb2.Program,
+        plan: AllocationPlan,
+    ) -> None:
+        """Serialize named external buffers into an executable or program."""
+        buffers = destination.buffers
+        for buffer, external in plan.external_buffers:
+            location = plan.locations[buffer]
+            buffers.add(
+                name=external.name,
+                offset=location.offset,
+                data_type=external.dtype,
+                shape=external.shape,
+            )
+
     def _build_invocations(
         self,
-        executable: lc0ex_pb2.NeuralExecutable,
+        *,
+        destination: lc0ex_pb2.Program,
+        program: ProgramBuilder,
         dependencies: list[list[int]],
-        locations: dict[Buffer, BufferLocation],
-        kernel_indices: dict[KernelHandle, int],
-        symbol_locations: dict[SymbolHandle, tuple[int, str]],
+        plans: tuple[AllocationPlan | None, AllocationPlan | None],
+        exports: tuple[
+            dict[KernelHandle, int],
+            dict[SymbolHandle, tuple[int, str]],
+        ],
     ) -> None:
-        """Append the invocation program using precomputed resource indices."""
-        if not self._invocations:
-            return
-
-        program = executable.programs.add(name=_PROGRAM_NAME)
+        """Serialize one program's invocation graph."""
+        persistent_plan, plan = plans
+        kernel_indices, symbol_locations = exports
+        locations = {}
+        if persistent_plan is not None:
+            locations.update(persistent_plan.locations)
+        if plan is not None:
+            locations.update(plan.locations)
         for invocation, invocation_dependencies in zip(
-            self._invocations,
+            program._invocations,  # noqa: SLF001
             dependencies,
             strict=True,
         ):
             artifact = self._kernels[invocation.kernel]
-            node = program.nodes.add(
+            node = destination.nodes.add(
                 kernel_idx=kernel_indices[invocation.kernel],
                 dependencies=invocation_dependencies,
                 grid=artifact.grid,
@@ -316,10 +577,18 @@ class ExecutableBuilder:
             for argument in invocation.arguments:
                 if isinstance(argument, Buffer):
                     location = locations[argument]
+                    allocation_kind = (
+                        lc0ex_pb2.Node.Argument.AllocationLocation.AllocationKind
+                    )
+                    allocation = (
+                        allocation_kind.ALLOCATION_PERSISTENT
+                        if location.allocation.is_persistent()
+                        else allocation_kind.ALLOCATION_EXECUTION
+                    )
                     node.arguments.add(
                         allocation=lc0ex_pb2.Node.Argument.AllocationLocation(
-                            index=location.allocation_idx,
-                            offset=location.allocation_offset,
+                            kind=allocation,
+                            offset=location.offset,
                         )
                     )
                 else:

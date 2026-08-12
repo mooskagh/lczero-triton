@@ -456,7 +456,7 @@ def _stop_after_encoders(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _location(argument: lc0ex_pb2.Node.Argument) -> tuple[int, int]:
     """Return one serialized allocation argument location."""
-    return argument.allocation.index, argument.allocation.offset
+    return argument.allocation.kind, argument.allocation.offset
 
 
 def _parse_fingerprint(builder: ExecutableBuilder) -> net_pb2.Net:
@@ -668,6 +668,28 @@ def test_fingerprint_ignores_weight_values_encodings_and_batch_size(
     assert first_builder.build().metadata == second_builder.build().metadata
 
 
+def test_build_can_emit_multiple_program_specific_batch_allocations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each fixed batch variant receives private input/output storage."""
+    network = _embedding_network(encoding_width=1, body_width=16, hidden_width=32)
+    _stub_compilers(monkeypatch)
+    _stop_after_embedding(monkeypatch)
+    builder = ExecutableBuilder()
+
+    build(builder, network, batch_sizes=(1, 3))
+    executable = builder.build()
+
+    assert [program.name for program in executable.programs] == ["batch-1", "batch-3"]
+    assert [tuple(program.buffers[0].shape) for program in executable.programs] == [
+        (1, 112),
+        (3, 112),
+    ]
+    assert executable.programs[0].execution_allocation.size_bytes != (
+        executable.programs[1].execution_allocation.size_bytes
+    )
+
+
 def test_full_graph_fingerprint_contains_all_active_layers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -769,7 +791,13 @@ def test_encoder_builds_names_order_and_specializations(
         "matmul",
         "layer_norm_skip",
     ]
-    buffers = {buffer.name: tuple(buffer.shape) for buffer in executable.buffers}
+    buffers = {
+        buffer.name: tuple(buffer.shape)
+        for buffer in (
+            *executable.buffers,
+            *executable.programs[0].buffers,
+        )
+    }
     encoder_names = {name for name in buffers if name.startswith("/encoder0/")}
     assert len(encoder_names) == _ENCODER_LOCAL_BUFFER_COUNT
     assert buffers["/encoder0/mha/Q/w/w"] == (16, 16)
@@ -830,7 +858,13 @@ def test_embedding_infers_external_shapes_from_layer_counts(
 
     build(builder, network, batch_size=2)
     executable = builder.build()
-    buffers = {buffer.name: buffer for buffer in executable.buffers}
+    buffers = {
+        buffer.name: buffer
+        for buffer in (
+            *executable.buffers,
+            *executable.programs[0].buffers,
+        )
+    }
 
     expected_shapes = {
         "/input/plane_masks": (2, 112),
@@ -866,14 +900,12 @@ def test_embedding_infers_external_shapes_from_layer_counts(
         if not name.startswith("/input/")
     )
     assert all(
-        executable.allocations[buffers[name].allocation_idx].lifetime
-        == lc0ex_pb2.Allocation.LIFETIME_EXECUTION
+        name in {buffer.name for buffer in executable.programs[0].buffers}
         for name in ("/input/plane_masks", "/input/plane_values")
     )
     assert all(
-        executable.allocations[buffer.allocation_idx].lifetime
-        == lc0ex_pb2.Allocation.LIFETIME_PERSISTENT
-        for name, buffer in buffers.items()
+        name in {buffer.name for buffer in executable.buffers}
+        for name in buffers
         if not name.startswith("/input/")
     )
 
@@ -1037,7 +1069,13 @@ def test_output_heads_build_contracts_and_independent_branches(
     ]
     assert "softmax_64" not in head_functions
 
-    buffers = {buffer.name: buffer for buffer in executable.buffers}
+    buffers = {
+        buffer.name: buffer
+        for buffer in (
+            *executable.buffers,
+            *executable.programs[0].buffers,
+        )
+    }
     expected_shapes = {
         "/policy/dense1/matmul/w": (16, 12),
         "/policy/dense1/add/w": (12,),
@@ -1069,10 +1107,7 @@ def test_output_heads_build_contracts_and_independent_branches(
     for name in ("/output/policy", "/output/wdl", "/output/mlh"):
         buffer = buffers[name]
         assert buffer.data_type == lc0ex_pb2.Buffer.DATA_TYPE_F32
-        assert (
-            executable.allocations[buffer.allocation_idx].lifetime
-            == lc0ex_pb2.Allocation.LIFETIME_EXECUTION
-        )
+        assert buffer.name in {item.name for item in executable.programs[0].buffers}
     assert "/const/mapping_table" not in buffers
 
     head_specializations = [specialization for _name, specialization in records][12:]

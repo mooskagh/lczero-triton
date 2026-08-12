@@ -17,7 +17,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     network = load_network(arguments.network)
     builder = ExecutableBuilder()
-    build(builder, network, batch_size=arguments.batch_size)
+    build(builder, network, batch_sizes=arguments.batch_sizes)
     builder.build_and_write(arguments.output)
     sys.stdout.write(f"{arguments.output}\n")
     return 0
@@ -35,7 +35,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     graph_parser.add_argument("--network", type=Path, required=True)
     graph_parser.add_argument("--output", type=Path, required=True)
-    graph_parser.add_argument("--batch-size", type=_positive_integer, default=169)
+    graph_parser.add_argument(
+        "--batch-size",
+        dest="batch_sizes",
+        type=_positive_integer,
+        action="append",
+        default=None,
+        help="fixed batch size to compile; repeat for multiple programs",
+    )
     return parser
 
 

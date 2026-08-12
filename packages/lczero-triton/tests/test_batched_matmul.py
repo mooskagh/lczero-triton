@@ -131,8 +131,7 @@ def test_specialization_rejects_unknown_operation_and_target() -> None:
 def test_graph_validation_precedes_compilation() -> None:
     """Scale and alias errors do not trigger GPU compilation."""
     builder = ExecutableBuilder()
-    execution = builder.allocation(lc0ex_pb2.Allocation.LIFETIME_EXECUTION)
-    buffer = execution.temporary_buffer(size_bytes=2, alignment_bytes=2)
+    buffer = builder.temporary_buffer(size_bytes=2, alignment_bytes=2)
     kernels = KernelCache(builder)
     qk = BatchedMatmulSpecialization("body_qk", 1, 1, 1, 1, 1, 80)
     attention_v = BatchedMatmulSpecialization("body_attention_v", 1, 1, 1, 1, 1, 80)
@@ -371,11 +370,17 @@ def _external_buffer(
     shape: Sequence[int],
     *,
     writable: bool = False,
-    lifetime: lc0ex_pb2.Allocation.Lifetime = (lc0ex_pb2.Allocation.LIFETIME_EXECUTION),
+    persistent: bool = False,
 ) -> Buffer:
     """Declare one test execution buffer."""
-    allocation = builder.allocation(lifetime)
-    return allocation.external_buffer(
+    if persistent:
+        return builder.persistent_buffer(
+            name=name,
+            shape=shape,
+            dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+            writable=writable,
+        )
+    return builder.execution_buffer(
         name=name,
         shape=shape,
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -422,7 +427,7 @@ def test_graph_call_has_only_physical_operands(
             builder,
             scale_name,
             (1,),
-            lifetime=lc0ex_pb2.Allocation.LIFETIME_PERSISTENT,
+            persistent=True,
         )
     )
 
@@ -439,20 +444,20 @@ def test_graph_call_has_only_physical_operands(
     executable = builder.build()
     node = executable.programs[0].nodes[0]
     locations = {
-        buffer.name: (buffer.allocation_idx, buffer.allocation_offset)
-        for buffer in executable.buffers
+        buffer.name: (buffer.offset,)
+        for buffer in (
+            *executable.buffers,
+            *executable.programs[0].buffers,
+        )
     }
-    arguments = [
-        (argument.allocation.index, argument.allocation.offset)
-        for argument in node.arguments
-    ]
+    arguments = [(argument.allocation.offset,) for argument in node.arguments]
     expected_names = ["output", "left", "right"]
     if scale is not None:
         expected_names.append(scale_name)
 
     assert executable.target.architecture == f"sm_{_architecture()}"
     assert set(locations) == set(expected_names)
-    assert len(executable.allocations) == len(expected_names)
+    assert len(locations) == len(expected_names)
     assert arguments == [locations[name] for name in expected_names]
 
 
@@ -473,7 +478,7 @@ def test_graph_dependencies_follow_physical_buffer_flow() -> None:
         builder,
         "/encoder0/mha/QK/scale/w",
         (1,),
-        lifetime=lc0ex_pb2.Allocation.LIFETIME_PERSISTENT,
+        persistent=True,
     )
 
     batched_matmul(

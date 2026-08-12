@@ -127,20 +127,18 @@ def test_compilation_captures_selected_configuration_and_static_launch() -> None
 def test_graph_call_preserves_output_activation_weight_order() -> None:
     """The graph ABI places the destination before both readonly operands."""
     builder = ExecutableBuilder()
-    execution = builder.allocation(lc0ex_pb2.Allocation.LIFETIME_EXECUTION)
-    persistent = builder.allocation(lc0ex_pb2.Allocation.LIFETIME_PERSISTENT)
-    output = execution.external_buffer(
+    output = builder.execution_buffer(
         name="output",
         shape=(169, 3),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
         writable=True,
     )
-    activations = execution.external_buffer(
+    activations = builder.execution_buffer(
         name="activations",
         shape=(169, 128),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
     )
-    weights = persistent.external_buffer(
+    weights = builder.persistent_buffer(
         name="weights",
         shape=(128, 3),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -158,13 +156,13 @@ def test_graph_call_preserves_output_activation_weight_order() -> None:
     executable = builder.build()
     node = executable.programs[0].nodes[0]
     locations = {
-        buffer.name: (buffer.allocation_idx, buffer.allocation_offset)
-        for buffer in executable.buffers
+        buffer.name: (buffer.offset,)
+        for buffer in (
+            *executable.buffers,
+            *executable.programs[0].buffers,
+        )
     }
-    arguments = [
-        (argument.allocation.index, argument.allocation.offset)
-        for argument in node.arguments
-    ]
+    arguments = [(argument.allocation.offset,) for argument in node.arguments]
 
     assert executable.target.architecture == f"sm_{_architecture()}"
     assert arguments == [
@@ -200,8 +198,7 @@ def test_compilation_rejects_a_different_active_architecture() -> None:
 def test_graph_call_rejects_output_aliasing_before_compilation() -> None:
     """Dense GEMM cannot overwrite either source while tiles remain active."""
     builder = ExecutableBuilder()
-    execution = builder.allocation(lc0ex_pb2.Allocation.LIFETIME_EXECUTION)
-    buffer = execution.temporary_buffer(size_bytes=2, alignment_bytes=2)
+    buffer = builder.temporary_buffer(size_bytes=2, alignment_bytes=2)
 
     with pytest.raises(ValueError, match="cannot alias"):
         matmul(

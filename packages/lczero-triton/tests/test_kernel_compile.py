@@ -109,14 +109,13 @@ def test_real_compilation_produces_pointer_abi_and_static_launch() -> None:
 def test_copy_graph_call_preserves_output_input_argument_order() -> None:
     """The family API serializes destination before its readonly source."""
     builder = ExecutableBuilder()
-    execution = builder.allocation(lc0ex_pb2.Allocation.LIFETIME_EXECUTION)
-    output = execution.external_buffer(
+    output = builder.execution_buffer(
         name="output",
         shape=(257,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
         writable=True,
     )
-    input_ = execution.external_buffer(
+    input_ = builder.execution_buffer(
         name="input",
         shape=(257,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -132,19 +131,16 @@ def test_copy_graph_call_preserves_output_input_argument_order() -> None:
     executable = builder.build()
     node = executable.programs[0].nodes[0]
     locations = {
-        buffer.name: (buffer.allocation_idx, buffer.allocation_offset)
-        for buffer in executable.buffers
+        buffer.name: (buffer.offset,)
+        for buffer in (
+            *executable.buffers,
+            *executable.programs[0].buffers,
+        )
     }
 
     assert executable.target.architecture == f"sm_{_architecture()}"
-    assert (
-        node.arguments[0].allocation.index,
-        node.arguments[0].allocation.offset,
-    ) == locations["output"]
-    assert (
-        node.arguments[1].allocation.index,
-        node.arguments[1].allocation.offset,
-    ) == locations["input"]
+    assert (node.arguments[0].allocation.offset,) == locations["output"]
+    assert (node.arguments[1].allocation.offset,) == locations["input"]
 
 
 def test_remaining_step_five_families_capture_autotuned_artifacts() -> None:
@@ -208,14 +204,13 @@ def test_remaining_step_five_families_capture_autotuned_artifacts() -> None:
 def test_policy_map_serializes_embedded_symbol_argument() -> None:
     """Policy gathering uses a module symbol rather than an external buffer."""
     builder = ExecutableBuilder()
-    execution = builder.allocation(lc0ex_pb2.Allocation.LIFETIME_EXECUTION)
-    output = execution.external_buffer(
+    output = builder.execution_buffer(
         name="output",
         shape=(2, 1858),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
         writable=True,
     )
-    input_ = execution.external_buffer(
+    input_ = builder.execution_buffer(
         name="input",
         shape=(2, 4288),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,

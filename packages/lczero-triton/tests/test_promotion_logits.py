@@ -123,8 +123,7 @@ def test_specialization_rejects_invalid_static_values(
 def test_graph_alias_validation_precedes_compilation() -> None:
     """The writable policy record cannot also be a projection input."""
     builder = ExecutableBuilder()
-    execution = builder.allocation(lc0ex_pb2.Allocation.LIFETIME_EXECUTION)
-    buffer = execution.temporary_buffer(size_bytes=2, alignment_bytes=2)
+    buffer = builder.temporary_buffer(size_bytes=2, alignment_bytes=2)
     specialization = PromotionLogitsSpecialization(1, 16, 80)
 
     with pytest.raises(ValueError, match="cannot alias"):
@@ -246,10 +245,17 @@ def _external_buffer(
     shape: Sequence[int],
     *,
     writable: bool = False,
-    lifetime: lc0ex_pb2.Allocation.Lifetime = (lc0ex_pb2.Allocation.LIFETIME_EXECUTION),
+    persistent: bool = False,
 ) -> Buffer:
     """Declare one FP16 external buffer for graph tests."""
-    return builder.allocation(lifetime).external_buffer(
+    if persistent:
+        return builder.persistent_buffer(
+            name=name,
+            shape=shape,
+            dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+            writable=writable,
+        )
+    return builder.execution_buffer(
         name=name,
         shape=shape,
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -274,7 +280,7 @@ def test_graph_call_uses_in_place_records_and_tracks_dependencies() -> None:
         builder,
         "/policy/promotion/matmul/w",
         (32, 4),
-        lifetime=lc0ex_pb2.Allocation.LIFETIME_PERSISTENT,
+        persistent=True,
     )
     kernels = KernelCache(builder)
 
@@ -298,13 +304,13 @@ def test_graph_call_uses_in_place_records_and_tracks_dependencies() -> None:
     executable = builder.build()
     nodes = executable.programs[0].nodes
     locations = {
-        buffer.name: (buffer.allocation_idx, buffer.allocation_offset)
-        for buffer in executable.buffers
+        buffer.name: (buffer.offset,)
+        for buffer in (
+            *executable.buffers,
+            *executable.programs[0].buffers,
+        )
     }
-    arguments = [
-        (argument.allocation.index, argument.allocation.offset)
-        for argument in nodes[0].arguments
-    ]
+    arguments = [(argument.allocation.offset,) for argument in nodes[0].arguments]
 
     assert executable.target.architecture == f"sm_{_architecture()}"
     assert arguments == [

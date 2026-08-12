@@ -6,7 +6,8 @@ Port the active evaluation graph of
 `BT4-1024x15x32h-swa-6147500.pb.gz` to statically compiled Triton kernels and
 serialize it as an `lc0ex` graph.
 
-The first artifact targets batch size 169 and the default active heads:
+The graph builder supports one or more fixed batch-size programs and the default
+active heads:
 
 - `vanilla` attention policy
 - `winner` WDL value
@@ -19,7 +20,7 @@ named persistent buffers at their points of use. Their names must exactly match
 the final initializer names produced by `leela2onnx`. Learned matrices use the
 ONNX `[K, N]` layout and FP16 dtype.
 
-This milestone does not include an `lc0ex` runtime or LC0 backend registration.
+This milestone does not include LC0 backend registration.
 
 ## Research Findings
 
@@ -40,15 +41,14 @@ This milestone does not include an `lc0ex` runtime or LC0 backend registration.
   can calculate those offsets directly.
 - The CUDA backend returns raw FP32 WDL logits and performs the three-way
   softmax on the host. The initial Triton graph should preserve this behavior.
-- The current `lc0ex` builder already provides suitable named persistent
-  allocation-backed buffers for externally loaded weights. It lacks named
-  execution-lifetime buffers for external inputs and outputs.
+- Persistent weights are executable-global named buffers. Inputs, outputs, and
+  scratch are named or raw buffers inside each program's execution allocation.
 
 ## Fixed Architecture
 
 | Property | Value |
 | --- | ---: |
-| Batch | 169 |
+| Default batch | 169 |
 | Squares | 64 |
 | Input planes | 112 |
 | Dense positional channels | 512 |
@@ -190,7 +190,13 @@ transformer IR, initializer manifest, or model configuration.
 The public entry point is conceptually:
 
 ```python
-def build(builder: ExecutableBuilder, network: net_pb2.Net, *, batch_size: int) -> None:
+def build(
+    builder: ExecutableBuilder,
+    network: net_pb2.Net,
+    *,
+    batch_size: int | None = None,
+    batch_sizes: Sequence[int] | None = None,
+) -> None:
 ```
 
 Its call graph follows the active evaluation order:
@@ -242,7 +248,7 @@ Add tests for:
 Weight decoding and upload remain separate concerns. The graph builder reads
 only protobuf structure, format fields, and encoded layer lengths.
 
-### 3. Add minimal `lc0ex` pointer-source features
+### 3. Define minimal `lc0ex` pointer-source features
 
 Make `Buffer` an opaque logical device-range identity. Do not expose shape,
 dtype, layout, stride, or reshape accessors: node arguments are pointers, and
@@ -251,12 +257,12 @@ external buffers as canonical serialization metadata, and create anonymous
 execution temporaries from raw byte size and alignment.
 
 `Node.Argument` has exactly one pointer/value source: a runtime parameter, an
-allocation location, or a module symbol. Put allocation locations in the
-following nested message rather than exposing flat `allocation_*` fields:
+allocation location, or a module symbol. An allocation location identifies the
+persistent or program execution allocation and an offset:
 
 ```proto
 message AllocationLocation {
-  required uint32 index = 1;
+  required AllocationKind kind = 1;
   required uint64 offset = 2;
 }
 ```
@@ -289,7 +295,7 @@ weight bytes or initialized persistent allocations.
 
 Acceptance criteria:
 
-- Allocation arguments serialize through `AllocationLocation(index, offset)`.
+- Allocation arguments serialize through `AllocationLocation(kind, offset)`.
 - Kernel and symbol exports sharing CUBIN bytes share one `binary_idx`.
 - Symbol arguments serialize as `binary_idx` and `symbol_name` and are not
   callable kernels.
@@ -636,7 +642,7 @@ FP16 -> FP32
 
 Acceptance criteria:
 
-- Output buffers have the agreed names, execution lifetime, shapes, and F32
+- Output buffers have the agreed names, program execution scope, shapes, and F32
   dtype.
 - Value output ordering is win, draw, loss.
 - Moves-left output is nonnegative.
@@ -648,7 +654,7 @@ Replace toy dimension flags with BT4-specific inputs:
 
 - Input `.pb.gz` network path
 - Output `lc0ex` path
-- Fixed batch validation, defaulting to and initially requiring 169
+- One or more fixed batch sizes, defaulting to 169
 
 Include architecture, batch, and compilation target in generated artifact names
 to avoid accidental cross-target reuse.
@@ -675,7 +681,7 @@ Acceptance criteria:
 Add tests for:
 
 - Exact external buffer names, shapes, dtypes, and counts
-- Named execution-buffer lifetime and non-aliasing
+- Program-local execution-buffer allocations and non-aliasing
 - Buffer alignment and I32 sizing
 - Opaque buffer handles and raw temporary allocation
 - On-demand kernel-cache key coverage
@@ -708,14 +714,14 @@ Use `leela2onnx` with FP16 output as an untracked integration fixture to verify
 the exact initializer names, shapes, and values expected by the graph. Do not
 commit the roughly 370 MiB model artifact.
 
-Until an `lc0ex` runtime exists, end-to-end verification consists of:
+End-to-end verification consists of:
 
 - Numerical tests for every kernel and specialization
-- Structural inspection of the complete serialized graph
+- Structural inspection of the complete serialized graph and each program allocation
 - Validation of every external buffer against the generated FP16 ONNX model
 
-Full policy, WDL, and moves-left comparison against LC0 is deferred until the
-runtime can bind buffers and execute the serialized graph.
+Full policy, WDL, and moves-left comparison against LC0 is deferred until LC0
+backend registration.
 
 Run all repository checks after each coherent phase:
 
@@ -743,10 +749,8 @@ without changing external buffers or numerical semantics.
 
 ## Deferred Work
 
-- Dynamic batches or multiple fixed-batch program variants
 - Production `.pb.gz` or ONNX weight loading
 - Remaining constants embedded as PTX/CUDA module symbols
-- C++ `lc0ex` runtime
 - LC0 backend registration
 - Host WDL softmax and Q/D conversion
 - Alternate policy and value heads

@@ -14,8 +14,6 @@ from lc0ex import (
 from lc0ex.proto import lc0ex_pb2
 
 F16 = lc0ex_pb2.Buffer.DATA_TYPE_F16
-PERSISTENT = lc0ex_pb2.Allocation.LIFETIME_PERSISTENT
-EXECUTION = lc0ex_pb2.Allocation.LIFETIME_EXECUTION
 POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
 U32 = lc0ex_pb2.PARAMETER_TYPE_U32
 TARGET_ARCHITECTURE = "sm_80"
@@ -53,7 +51,7 @@ def _external(
     writable: bool = False,
 ) -> Buffer:
     """Create a small named external buffer for one graph test."""
-    return builder.allocation(PERSISTENT).external_buffer(
+    return builder.persistent_buffer(
         name=name,
         shape=(1,),
         dtype=F16,
@@ -77,7 +75,7 @@ def test_add_kernel_and_call_serializes_generic_metadata() -> None:
     assert [
         argument.allocation.offset
         for argument in executable.programs[0].nodes[0].arguments
-    ] == [0, 0, 0]
+    ] == [0, 2, 4]
 
 
 def test_set_target_rejects_conflicting_architecture() -> None:
@@ -121,9 +119,8 @@ def test_ordered_raw_temporaries_reuse_one_range() -> None:
     """Temporaries may alias only after dependencies order their accesses."""
     builder = _builder()
     kernel = builder.add_kernel(_artifact(parameters=(POINTER, POINTER)))
-    execution = builder.allocation(EXECUTION)
-    first = execution.temporary_buffer(size_bytes=64, alignment_bytes=32)
-    second = execution.temporary_buffer(size_bytes=64, alignment_bytes=32)
+    first = builder.temporary_buffer(size_bytes=64, alignment_bytes=32)
+    second = builder.temporary_buffer(size_bytes=64, alignment_bytes=32)
     bridge = _external(builder, "bridge", writable=True)
     builder.call(kernel, first, bridge)
     builder.call(kernel, bridge, second, readonly=(bridge,))
@@ -131,7 +128,7 @@ def test_ordered_raw_temporaries_reuse_one_range() -> None:
     executable = builder.build()
     nodes = executable.programs[0].nodes
 
-    assert executable.allocations[0].size_bytes == 64
+    assert executable.programs[0].execution_allocation.size_bytes == 64
     assert (
         nodes[0].arguments[0].allocation.offset
         == nodes[1].arguments[1].allocation.offset
@@ -143,15 +140,14 @@ def test_independent_raw_temporaries_do_not_reuse_storage() -> None:
     """Potentially concurrent temporary accesses require distinct ranges."""
     builder = _builder()
     kernel = builder.add_kernel(_artifact())
-    execution = builder.allocation(EXECUTION)
-    first = execution.temporary_buffer(size_bytes=64, alignment_bytes=32)
-    second = execution.temporary_buffer(size_bytes=64, alignment_bytes=32)
+    first = builder.temporary_buffer(size_bytes=64, alignment_bytes=32)
+    second = builder.temporary_buffer(size_bytes=64, alignment_bytes=32)
     builder.call(kernel, first)
     builder.call(kernel, second)
 
     executable = builder.build()
 
-    assert executable.allocations[0].size_bytes == 128
+    assert executable.programs[0].execution_allocation.size_bytes == 128
 
 
 def test_call_rejects_foreign_and_non_pointer_handles() -> None:

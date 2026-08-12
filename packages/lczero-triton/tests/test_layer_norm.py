@@ -348,8 +348,7 @@ def test_specialization_rejects_unknown_activation() -> None:
 def test_graph_validation_precedes_compilation() -> None:
     """Optional operands and unsafe broadcast aliases fail without CUDA."""
     builder = ExecutableBuilder()
-    execution = builder.allocation(lc0ex_pb2.Allocation.LIFETIME_EXECUTION)
-    buffer = execution.temporary_buffer(size_bytes=512, alignment_bytes=2)
+    buffer = builder.temporary_buffer(size_bytes=512, alignment_bytes=2)
     kernels = KernelCache(builder)
     without_skip = LayerNormSpecialization(
         1,
@@ -438,12 +437,14 @@ def _external_buffer(
     persistent: bool = False,
 ) -> Buffer:
     """Declare one FP16 test buffer with the requested lifetime."""
-    lifetime = (
-        lc0ex_pb2.Allocation.LIFETIME_PERSISTENT
-        if persistent
-        else lc0ex_pb2.Allocation.LIFETIME_EXECUTION
-    )
-    return builder.allocation(lifetime).external_buffer(
+    if persistent:
+        return builder.persistent_buffer(
+            name=name,
+            shape=shape,
+            dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+            writable=writable,
+        )
+    return builder.execution_buffer(
         name=name,
         shape=shape,
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -486,13 +487,13 @@ def test_graph_call_preserves_deepnorm_argument_order() -> None:
     executable = builder.build()
     node = executable.programs[0].nodes[0]
     locations = {
-        buffer.name: (buffer.allocation_idx, buffer.allocation_offset)
-        for buffer in executable.buffers
+        buffer.name: (buffer.offset,)
+        for buffer in (
+            *executable.buffers,
+            *executable.programs[0].buffers,
+        )
     }
-    arguments = [
-        (argument.allocation.index, argument.allocation.offset)
-        for argument in node.arguments
-    ]
+    arguments = [(argument.allocation.offset,) for argument in node.arguments]
 
     assert executable.target.architecture == f"sm_{_architecture()}"
     assert arguments == [

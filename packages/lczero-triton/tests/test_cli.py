@@ -19,7 +19,7 @@ def test_parser_accepts_graph_network_and_batch_size() -> None:
     )
 
     assert arguments.command == "graph"
-    assert arguments.batch_size == 1
+    assert arguments.batch_sizes == [1]
 
 
 @pytest.mark.parametrize("argv", [["graph", "--output", "output.lc0ex"], ["kernels"]])
