@@ -56,6 +56,8 @@ _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
 _ARCHITECTURE = 80
 _REUSED_TEMPORARY_COUNT = 3
 _ENCODER_LOCAL_BUFFER_COUNT = 28
+_EMBEDDING_FINGERPRINT_LAYER_COUNT = 14
+_FULL_FINGERPRINT_LAYER_COUNT = 59
 
 
 def _active_architecture() -> int:
@@ -457,6 +459,115 @@ def _location(argument: lc0ex_pb2.Node.Argument) -> tuple[int, int]:
     return argument.allocation.index, argument.allocation.offset
 
 
+def _parse_fingerprint(builder: ExecutableBuilder) -> net_pb2.Net:
+    """Parse the sparse network fingerprint stored in executable metadata."""
+    fingerprint = net_pb2.Net()
+    fingerprint.ParseFromString(builder.build().metadata)
+    return fingerprint
+
+
+def _present_fingerprint_layers(
+    fingerprint: net_pb2.Net,
+) -> list[net_pb2.Weights.Layer]:
+    """Return fingerprint layers whose proto2 parent fields are present."""
+    weights = fingerprint.weights
+    present: list[tuple[bool, net_pb2.Weights.Layer]] = [
+        (weights.HasField(field), getattr(weights, field))
+        for field in (
+            "ip_emb_preproc_w",
+            "ip_emb_preproc_b",
+            "ip_emb_w",
+            "ip_emb_b",
+            "ip_emb_ln_gammas",
+            "ip_emb_ln_betas",
+            "ip_mult_gate",
+            "ip_add_gate",
+            "ip_emb_ffn_ln_gammas",
+            "ip_emb_ffn_ln_betas",
+            "smolgen_w",
+            "ip_mov_w",
+            "ip_mov_b",
+            "ip1_mov_w",
+            "ip1_mov_b",
+            "ip2_mov_w",
+            "ip2_mov_b",
+        )
+    ]
+    if weights.HasField("ip_emb_ffn"):
+        present.extend(
+            (weights.ip_emb_ffn.HasField(field), getattr(weights.ip_emb_ffn, field))
+            for field in ("dense1_w", "dense1_b", "dense2_w", "dense2_b")
+        )
+    for encoder in weights.encoder:
+        present.extend(
+            (encoder.mha.smolgen.HasField(field), getattr(encoder.mha.smolgen, field))
+            for field in (
+                "compress",
+                "dense1_w",
+                "dense1_b",
+                "ln1_gammas",
+                "ln1_betas",
+                "dense2_w",
+                "dense2_b",
+                "ln2_gammas",
+                "ln2_betas",
+            )
+        )
+        present.extend(
+            (encoder.mha.HasField(field), getattr(encoder.mha, field))
+            for field in (
+                "q_w",
+                "q_b",
+                "k_w",
+                "k_b",
+                "v_w",
+                "v_b",
+                "dense_w",
+                "dense_b",
+            )
+        )
+        present.extend(
+            (encoder.HasField(field), getattr(encoder, field))
+            for field in ("ln1_gammas", "ln1_betas", "ln2_gammas", "ln2_betas")
+        )
+        present.extend(
+            (encoder.ffn.HasField(field), getattr(encoder.ffn, field))
+            for field in ("dense1_w", "dense1_b", "dense2_w", "dense2_b")
+        )
+    if weights.HasField("policy_heads"):
+        present.extend(
+            (
+                weights.policy_heads.vanilla.HasField(field),
+                getattr(weights.policy_heads.vanilla, field),
+            )
+            for field in (
+                "ip_pol_w",
+                "ip_pol_b",
+                "ip2_pol_w",
+                "ip2_pol_b",
+                "ip3_pol_w",
+                "ip3_pol_b",
+                "ip4_pol_w",
+            )
+        )
+    if weights.HasField("value_heads"):
+        present.extend(
+            (
+                weights.value_heads.winner.HasField(field),
+                getattr(weights.value_heads.winner, field),
+            )
+            for field in (
+                "ip_val_w",
+                "ip_val_b",
+                "ip1_val_w",
+                "ip1_val_b",
+                "ip2_val_w",
+                "ip2_val_b",
+            )
+        )
+    return [layer for is_present, layer in present if is_present]
+
+
 def test_build_entry_point_is_importable() -> None:
     """BT4 graph construction is exposed through the protobuf-driven API."""
     assert callable(build)
@@ -495,6 +606,119 @@ def test_build_normalizes_and_builds_encoder(
         network.format.network_format.input_embedding
         == net_pb2.NetworkFormat.INPUT_EMBEDDING_PE_DENSE
     )
+
+
+def test_build_stores_sparse_network_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The executable metadata contains effective format and active layer slots."""
+    network = _embedding_network(encoding_width=1, body_width=16, hidden_width=32)
+    _stub_compilers(monkeypatch)
+    _stop_after_embedding(monkeypatch)
+    builder = ExecutableBuilder()
+
+    build(builder, network, batch_size=2)
+
+    fingerprint = _parse_fingerprint(builder)
+    network_format = fingerprint.format.network_format
+    assert network_format.input == net_pb2.NetworkFormat.INPUT_CLASSICAL_112_PLANE
+    assert (
+        network_format.network
+        == net_pb2.NetworkFormat.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT
+    )
+    assert network_format.output == net_pb2.NetworkFormat.OUTPUT_UNKNOWN
+    assert (
+        network_format.default_activation
+        == net_pb2.NetworkFormat.DEFAULT_ACTIVATION_MISH
+    )
+    assert network_format.ffn_activation == net_pb2.NetworkFormat.ACTIVATION_MISH
+    assert network_format.smolgen_activation == net_pb2.NetworkFormat.ACTIVATION_MISH
+    assert fingerprint.weights.headcount == 1
+    assert len(fingerprint.weights.encoder) == 1
+    assert fingerprint.weights.HasField("policy_heads") is False
+
+    active_layers = _present_fingerprint_layers(fingerprint)
+    assert len(active_layers) == _EMBEDDING_FINGERPRINT_LAYER_COUNT
+    assert all(not layer.ListFields() for layer in active_layers)
+    assert all(not layer.params for layer in active_layers)
+    assert all(not layer.HasField("min_val") for layer in active_layers)
+    assert all(not layer.HasField("max_val") for layer in active_layers)
+    assert all(not layer.HasField("encoding") for layer in active_layers)
+    assert all(not layer.dims for layer in active_layers)
+
+
+def test_fingerprint_ignores_weight_values_encodings_and_batch_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transport details and executable batch variants do not affect identity."""
+    first = _embedding_network(encoding_width=1, body_width=16, hidden_width=32)
+    second = _embedding_network(encoding_width=1, body_width=16, hidden_width=32)
+    second.weights.ip_emb_preproc_w.params = b"\x01\x02" * (64 * 12 * 64)
+    second.weights.ip_emb_preproc_w.min_val = -3.0
+    second.weights.ip_emb_preproc_w.max_val = 7.0
+    second.weights.ip_emb_preproc_w.encoding = net_pb2.Weights.Layer.LINEAR16
+
+    _stub_compilers(monkeypatch)
+    _stop_after_embedding(monkeypatch)
+    first_builder = ExecutableBuilder()
+    second_builder = ExecutableBuilder()
+    build(first_builder, first, batch_size=1)
+    build(second_builder, second, batch_size=3)
+
+    assert first_builder.build().metadata == second_builder.build().metadata
+
+
+def test_full_graph_fingerprint_contains_all_active_layers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The complete BT4 graph marks embedding, body, and selected heads."""
+    network = _embedding_network(encoding_width=1, body_width=16, hidden_width=24)
+    _add_encoder(
+        network,
+        body_width=16,
+        compression_width=2,
+        hidden_width=16,
+        generated_width=16,
+        model_width=16,
+        ffn_width=24,
+    )
+    _add_output_heads(
+        network,
+        body_width=16,
+        policy_width=12,
+        policy_model_width=8,
+        value_width=4,
+        value_hidden_width=6,
+        moves_width=3,
+        moves_hidden_width=5,
+    )
+    _stub_head_compilers(monkeypatch)
+    builder = ExecutableBuilder()
+
+    build(builder, network, batch_size=1)
+
+    active_layers = _present_fingerprint_layers(_parse_fingerprint(builder))
+    assert len(active_layers) == _FULL_FINGERPRINT_LAYER_COUNT
+    assert all(not layer.ListFields() for layer in active_layers)
+
+
+def test_fingerprint_changes_when_semantic_enum_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Format enums are retained even when they do not change buffer shapes."""
+    first = _embedding_network(encoding_width=1, body_width=16, hidden_width=32)
+    second = _embedding_network(encoding_width=1, body_width=16, hidden_width=32)
+    first.format.network_format.output = net_pb2.NetworkFormat.OUTPUT_CLASSICAL
+    second.format.network_format.output = net_pb2.NetworkFormat.OUTPUT_WDL
+
+    _stub_compilers(monkeypatch)
+    _stop_after_embedding(monkeypatch)
+    first_builder = ExecutableBuilder()
+    second_builder = ExecutableBuilder()
+    build(first_builder, first, batch_size=1)
+    build(second_builder, second, batch_size=1)
+
+    assert first_builder.build().metadata != second_builder.build().metadata
 
 
 def test_encoder_builds_names_order_and_specializations(

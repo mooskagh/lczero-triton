@@ -35,6 +35,7 @@ class ExecutableBuilder:
     def __init__(self) -> None:
         """Initialize an empty executable builder."""
         self._target: tuple[lc0ex_pb2.Target.Vendor, str] | None = None
+        self._metadata: bytes | None = None
         self._buffers = BufferBuilder()
         self._kernels: dict[KernelHandle, KernelArtifact] = {}
         self._kernel_handles: dict[KernelArtifact, KernelHandle] = {}
@@ -63,6 +64,20 @@ class ExecutableBuilder:
             message = "target does not match the executable target"
             raise ValueError(message)
         self._target = target
+        return self
+
+    def set_metadata(self, metadata: bytes) -> Self:
+        """Set opaque executable metadata and return this builder.
+
+        Repeated calls are allowed when they provide the same metadata, which
+        matches the idempotent target configuration API. Conflicting metadata
+        usually indicates that two graph producers were combined accidentally.
+        """
+        normalized = bytes(metadata)
+        if self._metadata is not None and self._metadata != normalized:
+            message = "metadata does not match the executable metadata"
+            raise ValueError(message)
+        self._metadata = normalized
         return self
 
     def add_kernel(self, kernel: KernelArtifact) -> KernelHandle:
@@ -171,6 +186,8 @@ class ExecutableBuilder:
     def build(self) -> lc0ex_pb2.NeuralExecutable:
         """Create and return a new neural executable."""
         executable = lc0ex_pb2.NeuralExecutable(magic=_MAGIC, format=_FORMAT)
+        if self._metadata is not None:
+            executable.metadata = self._metadata
         if self._target is not None:
             vendor, architecture = self._target
             executable.target.vendor = vendor

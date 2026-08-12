@@ -182,6 +182,26 @@ def test_named_execution_buffers_serialize_as_fixed_ranges() -> None:
     assert [buffer.allocation_offset for buffer in executable.buffers] == [0, 16]
 
 
+def test_metadata_serializes_as_opaque_executable_metadata() -> None:
+    """Configured metadata survives executable construction and parsing."""
+    builder = _builder().set_metadata(b"fingerprint")
+
+    executable = builder.build()
+    restored = lc0ex_pb2.NeuralExecutable()
+    restored.ParseFromString(executable.SerializeToString())
+
+    assert restored.metadata == b"fingerprint"
+
+
+def test_metadata_rejects_conflicting_reconfiguration() -> None:
+    """One executable cannot contain two different metadata payloads."""
+    builder = _builder().set_metadata(b"first")
+
+    builder.set_metadata(b"first")
+    with pytest.raises(ValueError, match="metadata"):
+        builder.set_metadata(b"second")
+
+
 @pytest.mark.parametrize(
     ("dtype", "expected_size"),
     [(F32, 4), (U8, 1), (F16, 2), (U64, 8), (lc0ex_pb2.Buffer.DATA_TYPE_BF16, 2)],

@@ -85,6 +85,8 @@ class _BuildContext:
     default_activation: net_pb2.NetworkFormat.ActivationFunction
     ffn_activation: net_pb2.NetworkFormat.ActivationFunction
     smolgen_activation: net_pb2.NetworkFormat.ActivationFunction
+    fingerprint: net_pb2.Net
+    fingerprint_layers: dict[str, net_pb2.Weights.Layer]
 
 
 def build(
@@ -102,6 +104,21 @@ def build(
     validate_network_format(network)
     network_format = network.format.network_format
     default_activation = _default_activation(network_format.default_activation)
+    ffn_activation = _resolve_activation(
+        network_format.ffn_activation,
+        default_activation,
+        path="format.network_format.ffn_activation",
+    )
+    smolgen_activation = _resolve_activation(
+        network_format.smolgen_activation,
+        default_activation,
+        path="format.network_format.smolgen_activation",
+    )
+    fingerprint, fingerprint_layers = _fingerprint_network(
+        network,
+        ffn_activation=ffn_activation,
+        smolgen_activation=smolgen_activation,
+    )
     context = _BuildContext(
         builder=builder,
         persistent=builder.allocation(lc0ex_pb2.Allocation.LIFETIME_PERSISTENT),
@@ -111,18 +128,13 @@ def build(
         architecture=active_architecture(),
         default_encoding=network.format.weights_encoding,
         default_activation=default_activation,
-        ffn_activation=_resolve_activation(
-            network_format.ffn_activation,
-            default_activation,
-            path="format.network_format.ffn_activation",
-        ),
-        smolgen_activation=_resolve_activation(
-            network_format.smolgen_activation,
-            default_activation,
-            path="format.network_format.smolgen_activation",
-        ),
+        ffn_activation=ffn_activation,
+        smolgen_activation=smolgen_activation,
+        fingerprint=fingerprint,
+        fingerprint_layers=fingerprint_layers,
     )
     _network(context, network.weights)
+    builder.set_metadata(fingerprint.SerializeToString(deterministic=True))
 
 
 def _network(context: _BuildContext, weights: net_pb2.Weights) -> None:
@@ -133,6 +145,170 @@ def _network(context: _BuildContext, weights: net_pb2.Weights) -> None:
     _policy_head(context, body, body_width, weights)
     _value_head(context, body, body_width, weights.value_heads.winner)
     _moves_left_head(context, body, body_width, weights)
+
+
+def _fingerprint_network(
+    network: net_pb2.Net,
+    *,
+    ffn_activation: net_pb2.NetworkFormat.ActivationFunction,
+    smolgen_activation: net_pb2.NetworkFormat.ActivationFunction,
+) -> tuple[net_pb2.Net, dict[str, net_pb2.Weights.Layer]]:
+    """Create a sparse network and paths for layers consumed by the graph."""
+    fingerprint = net_pb2.Net()
+    source_format = network.format.network_format
+    target_format = fingerprint.format.network_format
+    for field in (
+        "input",
+        "output",
+        "network",
+        "policy",
+        "value",
+        "moves_left",
+        "input_embedding",
+    ):
+        setattr(target_format, field, getattr(source_format, field))
+    target_format.default_activation = source_format.default_activation
+    target_format.ffn_activation = ffn_activation
+    target_format.smolgen_activation = smolgen_activation
+
+    source_weights = network.weights
+    target_weights = fingerprint.weights
+    target_weights.headcount = source_weights.headcount
+    layers: dict[str, net_pb2.Weights.Layer] = {}
+
+    def add(path: str, layer: net_pb2.Weights.Layer) -> None:
+        layers[path] = layer
+
+    for path, layer in (
+        ("weights.ip_emb_preproc_w", target_weights.ip_emb_preproc_w),
+        ("weights.ip_emb_preproc_b", target_weights.ip_emb_preproc_b),
+        ("weights.ip_emb_w", target_weights.ip_emb_w),
+        ("weights.ip_emb_b", target_weights.ip_emb_b),
+        ("weights.ip_emb_ln_gammas", target_weights.ip_emb_ln_gammas),
+        ("weights.ip_emb_ln_betas", target_weights.ip_emb_ln_betas),
+        ("weights.ip_mult_gate", target_weights.ip_mult_gate),
+        ("weights.ip_add_gate", target_weights.ip_add_gate),
+        ("weights.ip_emb_ffn.dense1_w", target_weights.ip_emb_ffn.dense1_w),
+        ("weights.ip_emb_ffn.dense1_b", target_weights.ip_emb_ffn.dense1_b),
+        ("weights.ip_emb_ffn.dense2_w", target_weights.ip_emb_ffn.dense2_w),
+        ("weights.ip_emb_ffn.dense2_b", target_weights.ip_emb_ffn.dense2_b),
+        (
+            "weights.ip_emb_ffn_ln_gammas",
+            target_weights.ip_emb_ffn_ln_gammas,
+        ),
+        ("weights.ip_emb_ffn_ln_betas", target_weights.ip_emb_ffn_ln_betas),
+        ("weights.smolgen_w", target_weights.smolgen_w),
+        ("weights.ip_mov_w", target_weights.ip_mov_w),
+        ("weights.ip_mov_b", target_weights.ip_mov_b),
+        ("weights.ip1_mov_w", target_weights.ip1_mov_w),
+        ("weights.ip1_mov_b", target_weights.ip1_mov_b),
+        ("weights.ip2_mov_w", target_weights.ip2_mov_w),
+        ("weights.ip2_mov_b", target_weights.ip2_mov_b),
+    ):
+        add(path, layer)
+
+    for index in range(len(source_weights.encoder)):
+        target_encoder = target_weights.encoder.add()
+        prefix = f"weights.encoder{index}"
+        for path, layer in (
+            (
+                f"{prefix}.mha.smolgen.compress",
+                target_encoder.mha.smolgen.compress,
+            ),
+            (
+                f"{prefix}.mha.smolgen.dense1_w",
+                target_encoder.mha.smolgen.dense1_w,
+            ),
+            (
+                f"{prefix}.mha.smolgen.dense1_b",
+                target_encoder.mha.smolgen.dense1_b,
+            ),
+            (
+                f"{prefix}.mha.smolgen.ln1_gammas",
+                target_encoder.mha.smolgen.ln1_gammas,
+            ),
+            (
+                f"{prefix}.mha.smolgen.ln1_betas",
+                target_encoder.mha.smolgen.ln1_betas,
+            ),
+            (
+                f"{prefix}.mha.smolgen.dense2_w",
+                target_encoder.mha.smolgen.dense2_w,
+            ),
+            (
+                f"{prefix}.mha.smolgen.dense2_b",
+                target_encoder.mha.smolgen.dense2_b,
+            ),
+            (
+                f"{prefix}.mha.smolgen.ln2_gammas",
+                target_encoder.mha.smolgen.ln2_gammas,
+            ),
+            (
+                f"{prefix}.mha.smolgen.ln2_betas",
+                target_encoder.mha.smolgen.ln2_betas,
+            ),
+            (f"{prefix}.mha.q_w", target_encoder.mha.q_w),
+            (f"{prefix}.mha.q_b", target_encoder.mha.q_b),
+            (f"{prefix}.mha.k_w", target_encoder.mha.k_w),
+            (f"{prefix}.mha.k_b", target_encoder.mha.k_b),
+            (f"{prefix}.mha.v_w", target_encoder.mha.v_w),
+            (f"{prefix}.mha.v_b", target_encoder.mha.v_b),
+            (f"{prefix}.mha.dense_w", target_encoder.mha.dense_w),
+            (f"{prefix}.mha.dense_b", target_encoder.mha.dense_b),
+            (f"{prefix}.ln1_gammas", target_encoder.ln1_gammas),
+            (f"{prefix}.ln1_betas", target_encoder.ln1_betas),
+            (f"{prefix}.ffn.dense1_w", target_encoder.ffn.dense1_w),
+            (f"{prefix}.ffn.dense1_b", target_encoder.ffn.dense1_b),
+            (f"{prefix}.ffn.dense2_w", target_encoder.ffn.dense2_w),
+            (f"{prefix}.ffn.dense2_b", target_encoder.ffn.dense2_b),
+            (f"{prefix}.ln2_gammas", target_encoder.ln2_gammas),
+            (f"{prefix}.ln2_betas", target_encoder.ln2_betas),
+        ):
+            add(path, layer)
+    target_policy = target_weights.policy_heads.vanilla
+    for path, layer in (
+        (
+            "weights.policy_heads.vanilla.ip_pol_w",
+            target_policy.ip_pol_w,
+        ),
+        (
+            "weights.policy_heads.vanilla.ip_pol_b",
+            target_policy.ip_pol_b,
+        ),
+        (
+            "weights.policy_heads.vanilla.ip2_pol_w",
+            target_policy.ip2_pol_w,
+        ),
+        (
+            "weights.policy_heads.vanilla.ip2_pol_b",
+            target_policy.ip2_pol_b,
+        ),
+        (
+            "weights.policy_heads.vanilla.ip3_pol_w",
+            target_policy.ip3_pol_w,
+        ),
+        (
+            "weights.policy_heads.vanilla.ip3_pol_b",
+            target_policy.ip3_pol_b,
+        ),
+        (
+            "weights.policy_heads.vanilla.ip4_pol_w",
+            target_policy.ip4_pol_w,
+        ),
+    ):
+        add(path, layer)
+
+    target_winner = target_weights.value_heads.winner
+    for path, layer in (
+        ("weights.value_heads.winner.ip_val_w", target_winner.ip_val_w),
+        ("weights.value_heads.winner.ip_val_b", target_winner.ip_val_b),
+        ("weights.value_heads.winner.ip1_val_w", target_winner.ip1_val_w),
+        ("weights.value_heads.winner.ip1_val_b", target_winner.ip1_val_b),
+        ("weights.value_heads.winner.ip2_val_w", target_winner.ip2_val_w),
+        ("weights.value_heads.winner.ip2_val_b", target_winner.ip2_val_b),
+    ):
+        add(path, layer)
+    return fingerprint, layers
 
 
 def _inputs(context: _BuildContext) -> tuple[Buffer, Buffer]:
@@ -1623,6 +1799,18 @@ def _layer_elements(
     return len(layer.params) // _F16_SIZE_BYTES
 
 
+def _fingerprint_layer(
+    context: _BuildContext,
+    path: str,
+) -> None:
+    """Mark one consumed source layer in the sparse fingerprint."""
+    fingerprint_layer = context.fingerprint_layers.get(path)
+    if fingerprint_layer is None:
+        message = f"internal error: consumed layer {path} is missing from fingerprint"
+        raise RuntimeError(message)
+    fingerprint_layer.SetInParent()
+
+
 def _vector_f16(
     context: _BuildContext,
     layer: net_pb2.Weights.Layer,
@@ -1632,6 +1820,7 @@ def _vector_f16(
 ) -> tuple[Buffer, int]:
     """Declare an FP16 vector whose width is inferred from its payload."""
     width = _layer_elements(layer, context.default_encoding, path=path)
+    _fingerprint_layer(context, path)
     return (
         context.persistent.external_buffer(
             name=name,
@@ -1652,6 +1841,7 @@ def _matrix_f16(
 ) -> tuple[Buffer, int]:
     """Infer and declare an ONNX-layout FP16 matrix from its known input width."""
     element_count = _layer_elements(layer, context.default_encoding, path=path)
+    _fingerprint_layer(context, path)
     output_width, remainder = divmod(element_count, input_width)
     if remainder:
         message = (
