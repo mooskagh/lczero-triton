@@ -1,6 +1,7 @@
 """Protobuf-driven grammar for construction of the BT4 executable graph."""
 
 from dataclasses import dataclass
+from typing import Literal
 
 import net_pb2
 from lc0ex import Allocation, Buffer, ExecutableBuilder
@@ -25,6 +26,10 @@ from lczero_triton.bt4.kernels.batched_matmul import (
     BatchedMatmulSpecialization,
     batched_matmul,
 )
+from lczero_triton.bt4.kernels.copy_type_converted import (
+    CopyTypeConvertedSpecialization,
+    copy_type_converted,
+)
 from lczero_triton.bt4.kernels.expand_planes import (
     ExpandPlanesSpecialization,
     expand_planes,
@@ -37,14 +42,23 @@ from lczero_triton.bt4.kernels.layer_norm import (
     LayerNormSpecialization,
     layer_norm,
 )
+from lczero_triton.bt4.kernels.mapping_table import compile_symbol
 from lczero_triton.bt4.kernels.matmul import MatmulSpecialization, matmul
 from lczero_triton.bt4.kernels.nchw_to_nhwc import (
     NchwToNhwcSpecialization,
     nchw_to_nhwc,
 )
+from lczero_triton.bt4.kernels.policy_map import (
+    PolicyMapSpecialization,
+    policy_map,
+)
 from lczero_triton.bt4.kernels.preprocess_attention_body import (
     PreprocessAttentionBodySpecialization,
     preprocess_attention_body,
+)
+from lczero_triton.bt4.kernels.promotion_logits import (
+    PromotionLogitsSpecialization,
+    promotion_logits,
 )
 from lczero_triton.bt4.kernels.softmax_64 import (
     Softmax64Specialization,
@@ -1101,9 +1115,204 @@ def _policy_head(
     weights: net_pb2.Weights,
 ) -> None:
     """Build the selected vanilla attention-policy branch."""
-    del context, body, body_width, weights
-    message = "BT4 policy production awaits its kernel families"
-    raise NotImplementedError(message)
+    _require_activation(
+        context.default_activation,
+        net_pb2.NetworkFormat.ACTIVATION_MISH,
+        path="format.network_format.default_activation",
+    )
+    policy = weights.policy_heads.vanilla
+    if policy.pol_encoder:
+        message = "weights.policy_heads.vanilla.pol_encoder: not supported"
+        raise NetworkFormatError(message)
+
+    embedding_weights_layer = _policy_embedding_layer(weights, "ip_pol_w")
+    embedding_bias_layer = _policy_embedding_layer(weights, "ip_pol_b")
+    embedding_weights, policy_width = _matrix_f16(
+        context,
+        embedding_weights_layer,
+        input_width=body_width,
+        name="/policy/dense1/matmul/w",
+        path="weights.policy_heads.vanilla.ip_pol_w",
+    )
+    embedding_bias, embedding_bias_width = _vector_f16(
+        context,
+        embedding_bias_layer,
+        name="/policy/dense1/add/w",
+        path="weights.policy_heads.vanilla.ip_pol_b",
+    )
+    _require_equal_widths(
+        embedding_bias_width,
+        policy_width,
+        path="weights.policy_heads.vanilla.ip_pol_b",
+        expected_path="policy embedding output",
+    )
+    query_weights, model_width = _matrix_f16(
+        context,
+        policy.ip2_pol_w,
+        input_width=policy_width,
+        name="/policy/Q/matmul/w",
+        path="weights.policy_heads.vanilla.ip2_pol_w",
+    )
+    query_bias, query_bias_width = _vector_f16(
+        context,
+        policy.ip2_pol_b,
+        name="/policy/Q/add/w",
+        path="weights.policy_heads.vanilla.ip2_pol_b",
+    )
+    _require_equal_widths(
+        query_bias_width,
+        model_width,
+        path="weights.policy_heads.vanilla.ip2_pol_b",
+        expected_path="policy Q output",
+    )
+    key_weights, key_width = _matrix_f16(
+        context,
+        policy.ip3_pol_w,
+        input_width=policy_width,
+        name="/policy/K/matmul/w",
+        path="weights.policy_heads.vanilla.ip3_pol_w",
+    )
+    _require_equal_widths(
+        key_width,
+        model_width,
+        path="weights.policy_heads.vanilla.ip3_pol_w",
+        expected_path="policy Q output",
+    )
+    key_bias, key_bias_width = _vector_f16(
+        context,
+        policy.ip3_pol_b,
+        name="/policy/K/add/w",
+        path="weights.policy_heads.vanilla.ip3_pol_b",
+    )
+    _require_equal_widths(
+        key_bias_width,
+        model_width,
+        path="weights.policy_heads.vanilla.ip3_pol_b",
+        expected_path="policy Q output",
+    )
+    promotion_weights, promotion_width = _matrix_f16(
+        context,
+        policy.ip4_pol_w,
+        input_width=model_width,
+        name="/policy/promotion/matmul/w",
+        path="weights.policy_heads.vanilla.ip4_pol_w",
+    )
+    _require_equal_widths(
+        promotion_width,
+        4,
+        path="weights.policy_heads.vanilla.ip4_pol_w",
+        expected_path="promotion output",
+    )
+    scale = context.persistent.external_buffer(
+        name="/policy/scale/w",
+        shape=(1,),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+    )
+    output = context.execution.external_buffer(
+        name="/output/policy",
+        shape=(context.batch_size, 1858),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
+        writable=True,
+    )
+
+    token_rows = context.batch_size * _SQUARE_COUNT
+    embedded = _temporary_f16(context, element_count=token_rows * policy_width)
+    matmul(
+        context.builder,
+        context.kernels,
+        embedded,
+        body,
+        embedding_weights,
+        MatmulSpecialization(
+            token_rows, policy_width, body_width, context.architecture
+        ),
+    )
+    add_bias_batched(
+        context.builder,
+        context.kernels,
+        embedded,
+        embedded,
+        embedding_bias,
+        AddBiasBatchedSpecialization(
+            1, token_rows, policy_width, "mish", context.architecture
+        ),
+    )
+    query = _temporary_f16(context, element_count=token_rows * model_width)
+    key = _temporary_f16(context, element_count=token_rows * model_width)
+    for projected, projection_weights, bias in (
+        (query, query_weights, query_bias),
+        (key, key_weights, key_bias),
+    ):
+        matmul(
+            context.builder,
+            context.kernels,
+            projected,
+            embedded,
+            projection_weights,
+            MatmulSpecialization(
+                token_rows, model_width, policy_width, context.architecture
+            ),
+        )
+        add_bias_batched(
+            context.builder,
+            context.kernels,
+            projected,
+            projected,
+            bias,
+            AddBiasBatchedSpecialization(
+                1, token_rows, model_width, "none", context.architecture
+            ),
+        )
+
+    records = _temporary_f16(context, element_count=context.batch_size * 4288)
+    batched_matmul(
+        context.builder,
+        context.kernels,
+        records,
+        query,
+        key,
+        BatchedMatmulSpecialization(
+            "policy_qk",
+            context.batch_size,
+            _SQUARE_COUNT,
+            _SQUARE_COUNT,
+            model_width,
+            1,
+            context.architecture,
+        ),
+        scale=scale,
+    )
+    promotion_logits(
+        context.builder,
+        context.kernels,
+        records,
+        key,
+        promotion_weights,
+        PromotionLogitsSpecialization(
+            context.batch_size, model_width, context.architecture
+        ),
+    )
+    mapped = _temporary_f16(context, element_count=context.batch_size * 1858)
+    mapping = context.builder.add_symbol(
+        compile_symbol(architecture=f"sm_{context.architecture}")
+    )
+    policy_map(
+        context.builder,
+        context.kernels,
+        mapped,
+        records,
+        mapping,
+        PolicyMapSpecialization(context.batch_size, context.architecture),
+    )
+    copy_type_converted(
+        context.builder,
+        context.kernels,
+        output,
+        mapped,
+        CopyTypeConvertedSpecialization(
+            context.batch_size * 1858, context.architecture
+        ),
+    )
 
 
 def _value_head(
@@ -1113,9 +1322,22 @@ def _value_head(
     winner: net_pb2.Weights.ValueHead,
 ) -> None:
     """Build the selected winner WDL branch."""
-    del context, body, body_width, winner
-    message = "BT4 value production awaits its kernel families"
-    raise NotImplementedError(message)
+    _dense_output_head(
+        context,
+        body,
+        body_width,
+        embed_weight=winner.ip_val_w,
+        embed_bias=winner.ip_val_b,
+        dense1_weight=winner.ip1_val_w,
+        dense1_bias=winner.ip1_val_b,
+        dense2_weight=winner.ip2_val_w,
+        dense2_bias=winner.ip2_val_b,
+        prefix="/value",
+        path="weights.value_heads.winner",
+        output_name="/output/wdl",
+        output_width=3,
+        final_activation="none",
+    )
 
 
 def _moves_left_head(
@@ -1125,9 +1347,219 @@ def _moves_left_head(
     weights: net_pb2.Weights,
 ) -> None:
     """Build the selected moves-left branch."""
-    del context, body, body_width, weights
-    message = "BT4 moves-left production awaits its kernel families"
-    raise NotImplementedError(message)
+    _dense_output_head(
+        context,
+        body,
+        body_width,
+        embed_weight=weights.ip_mov_w,
+        embed_bias=weights.ip_mov_b,
+        dense1_weight=weights.ip1_mov_w,
+        dense1_bias=weights.ip1_mov_b,
+        dense2_weight=weights.ip2_mov_w,
+        dense2_bias=weights.ip2_mov_b,
+        prefix="/mlh",
+        path="weights",
+        output_name="/output/mlh",
+        output_width=1,
+        final_activation="relu",
+    )
+
+
+def _dense_output_head(  # noqa: PLR0913
+    context: _BuildContext,
+    body: Buffer,
+    body_width: int,
+    *,
+    embed_weight: net_pb2.Weights.Layer,
+    embed_bias: net_pb2.Weights.Layer,
+    dense1_weight: net_pb2.Weights.Layer,
+    dense1_bias: net_pb2.Weights.Layer,
+    dense2_weight: net_pb2.Weights.Layer,
+    dense2_bias: net_pb2.Weights.Layer,
+    prefix: str,
+    path: str,
+    output_name: str,
+    output_width: int,
+    final_activation: Literal["none", "relu"],
+) -> None:
+    """Build a per-square embedding followed by two flattened dense layers."""
+    _require_activation(
+        context.default_activation,
+        net_pb2.NetworkFormat.ACTIVATION_MISH,
+        path="format.network_format.default_activation",
+    )
+    embed_weights, embed_width = _matrix_f16(
+        context,
+        embed_weight,
+        input_width=body_width,
+        name=f"{prefix}/embed/matmul/w",
+        path=f"{path}.{('ip_val_w' if prefix == '/value' else 'ip_mov_w')}",
+    )
+    embed_bias_buffer, embed_bias_width = _vector_f16(
+        context,
+        embed_bias,
+        name=f"{prefix}/embed/add/w",
+        path=f"{path}.{('ip_val_b' if prefix == '/value' else 'ip_mov_b')}",
+    )
+    _require_equal_widths(
+        embed_bias_width,
+        embed_width,
+        path=f"{path} embedding bias",
+        expected_path="embedding output",
+    )
+    flattened_width = _SQUARE_COUNT * embed_width
+    hidden_weights, hidden_width = _matrix_f16(
+        context,
+        dense1_weight,
+        input_width=flattened_width,
+        name=f"{prefix}/dense1/matmul/w",
+        path=f"{path}.{'ip1_val_w' if prefix == '/value' else 'ip1_mov_w'}",
+    )
+    hidden_bias, hidden_bias_width = _vector_f16(
+        context,
+        dense1_bias,
+        name=f"{prefix}/dense1/add/w",
+        path=f"{path}.{'ip1_val_b' if prefix == '/value' else 'ip1_mov_b'}",
+    )
+    _require_equal_widths(
+        hidden_bias_width,
+        hidden_width,
+        path=f"{path} dense1 bias",
+        expected_path="dense1 output",
+    )
+    result_weights, result_width = _matrix_f16(
+        context,
+        dense2_weight,
+        input_width=hidden_width,
+        name=f"{prefix}/dense2/matmul/w",
+        path=f"{path}.{'ip2_val_w' if prefix == '/value' else 'ip2_mov_w'}",
+    )
+    _require_equal_widths(
+        result_width,
+        output_width,
+        path=f"{path} dense2 weight",
+        expected_path=f"{output_name} output",
+    )
+    result_bias, result_bias_width = _vector_f16(
+        context,
+        dense2_bias,
+        name=f"{prefix}/dense2/add/w",
+        path=f"{path}.{'ip2_val_b' if prefix == '/value' else 'ip2_mov_b'}",
+    )
+    _require_equal_widths(
+        result_bias_width,
+        output_width,
+        path=f"{path} dense2 bias",
+        expected_path=f"{output_name} output",
+    )
+    output = context.execution.external_buffer(
+        name=output_name,
+        shape=(context.batch_size, output_width),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
+        writable=True,
+    )
+
+    token_rows = context.batch_size * _SQUARE_COUNT
+    embedded = _temporary_f16(context, element_count=token_rows * embed_width)
+    matmul(
+        context.builder,
+        context.kernels,
+        embedded,
+        body,
+        embed_weights,
+        MatmulSpecialization(token_rows, embed_width, body_width, context.architecture),
+    )
+    add_vectors(
+        context.builder,
+        context.kernels,
+        embedded,
+        embedded,
+        embed_bias_buffer,
+        AddVectorsSpecialization(
+            token_rows * embed_width, embed_width, "mish", context.architecture
+        ),
+    )
+    hidden = _temporary_f16(context, element_count=context.batch_size * hidden_width)
+    matmul(
+        context.builder,
+        context.kernels,
+        hidden,
+        embedded,
+        hidden_weights,
+        MatmulSpecialization(
+            context.batch_size, hidden_width, flattened_width, context.architecture
+        ),
+    )
+    add_vectors(
+        context.builder,
+        context.kernels,
+        hidden,
+        hidden,
+        hidden_bias,
+        AddVectorsSpecialization(
+            context.batch_size * hidden_width,
+            hidden_width,
+            "mish",
+            context.architecture,
+        ),
+    )
+    result = _temporary_f16(context, element_count=context.batch_size * output_width)
+    matmul(
+        context.builder,
+        context.kernels,
+        result,
+        hidden,
+        result_weights,
+        MatmulSpecialization(
+            context.batch_size, output_width, hidden_width, context.architecture
+        ),
+    )
+    add_vectors(
+        context.builder,
+        context.kernels,
+        result,
+        result,
+        result_bias,
+        AddVectorsSpecialization(
+            context.batch_size * output_width,
+            output_width,
+            final_activation,
+            context.architecture,
+        ),
+    )
+    copy_type_converted(
+        context.builder,
+        context.kernels,
+        output,
+        result,
+        CopyTypeConvertedSpecialization(
+            context.batch_size * output_width, context.architecture
+        ),
+    )
+
+
+def _policy_embedding_layer(
+    weights: net_pb2.Weights,
+    field: str,
+) -> net_pb2.Weights.Layer:
+    """Resolve LC0's head-local, shared multihead, then legacy policy field."""
+    policy = weights.policy_heads.vanilla
+    if field == "ip_pol_w":
+        local = policy.ip_pol_w
+        shared = weights.policy_heads.ip_pol_w
+        legacy = weights.ip_pol_w
+    elif field == "ip_pol_b":
+        local = policy.ip_pol_b
+        shared = weights.policy_heads.ip_pol_b
+        legacy = weights.ip_pol_b
+    else:
+        message = f"unsupported policy embedding field {field}"
+        raise ValueError(message)
+    if local.params:
+        return local
+    if weights.policy_heads.HasField(field):
+        return shared
+    return legacy
 
 
 def _default_activation(

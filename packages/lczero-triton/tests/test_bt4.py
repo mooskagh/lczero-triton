@@ -6,17 +6,21 @@ from typing import cast
 import lczero_triton.bt4.kernels.add_bias_batched as add_bias_batched_module
 import lczero_triton.bt4.kernels.add_vectors as add_vectors_module
 import lczero_triton.bt4.kernels.batched_matmul as batched_matmul_module
+import lczero_triton.bt4.kernels.copy_type_converted as copy_type_converted_module
 import lczero_triton.bt4.kernels.expand_planes as expand_planes_module
 import lczero_triton.bt4.kernels.input_gating as input_gating_module
 import lczero_triton.bt4.kernels.layer_norm as layer_norm_module
+import lczero_triton.bt4.kernels.mapping_table as mapping_table_module
 import lczero_triton.bt4.kernels.matmul as matmul_module
 import lczero_triton.bt4.kernels.nchw_to_nhwc as nchw_to_nhwc_module
+import lczero_triton.bt4.kernels.policy_map as policy_map_module
 import lczero_triton.bt4.kernels.preprocess_attention_body as preprocess_module
+import lczero_triton.bt4.kernels.promotion_logits as promotion_logits_module
 import lczero_triton.bt4.kernels.softmax_64 as softmax_64_module
 import lczero_triton.bt4.network as network_module
 import net_pb2
 import pytest
-from lc0ex import Buffer, ExecutableBuilder, KernelArtifact
+from lc0ex import Buffer, ExecutableBuilder, KernelArtifact, SymbolArtifact
 from lc0ex.proto import lc0ex_pb2
 from lczero_triton.bt4._format import NetworkFormatError
 from lczero_triton.bt4.kernels.add_bias_batched import (
@@ -24,13 +28,20 @@ from lczero_triton.bt4.kernels.add_bias_batched import (
 )
 from lczero_triton.bt4.kernels.add_vectors import AddVectorsSpecialization
 from lczero_triton.bt4.kernels.batched_matmul import BatchedMatmulSpecialization
+from lczero_triton.bt4.kernels.copy_type_converted import (
+    CopyTypeConvertedSpecialization,
+)
 from lczero_triton.bt4.kernels.expand_planes import ExpandPlanesSpecialization
 from lczero_triton.bt4.kernels.input_gating import InputGatingSpecialization
 from lczero_triton.bt4.kernels.layer_norm import LayerNormSpecialization
 from lczero_triton.bt4.kernels.matmul import MatmulSpecialization
 from lczero_triton.bt4.kernels.nchw_to_nhwc import NchwToNhwcSpecialization
+from lczero_triton.bt4.kernels.policy_map import PolicyMapSpecialization
 from lczero_triton.bt4.kernels.preprocess_attention_body import (
     PreprocessAttentionBodySpecialization,
+)
+from lczero_triton.bt4.kernels.promotion_logits import (
+    PromotionLogitsSpecialization,
 )
 from lczero_triton.bt4.kernels.softmax_64 import Softmax64Specialization
 from lczero_triton.bt4.network import (
@@ -70,10 +81,32 @@ def _target_skeleton() -> net_pb2.Net:
     )
     network.weights.headcount = 1
     network.weights.encoder.add()
-    for field in ("ip2_pol_w", "ip3_pol_w", "ip4_pol_w"):
+    for field in (
+        "ip2_pol_w",
+        "ip2_pol_b",
+        "ip3_pol_w",
+        "ip3_pol_b",
+        "ip4_pol_w",
+    ):
         getattr(network.weights.policy_heads.vanilla, field).params = b"\0\0"
-    for field in ("ip_val_w", "ip1_val_w", "ip2_val_w"):
+    for field in (
+        "ip_val_w",
+        "ip_val_b",
+        "ip1_val_w",
+        "ip1_val_b",
+        "ip2_val_w",
+        "ip2_val_b",
+    ):
         getattr(network.weights.value_heads.winner, field).params = b"\0\0"
+    for field in (
+        "ip_mov_w",
+        "ip_mov_b",
+        "ip1_mov_w",
+        "ip1_mov_b",
+        "ip2_mov_w",
+        "ip2_mov_b",
+    ):
+        getattr(network.weights, field).params = b"\0\0"
     return network
 
 
@@ -255,6 +288,90 @@ def _stub_compilers(
     )
     monkeypatch.setattr(network_module, "active_architecture", _active_architecture)
     return records
+
+
+def _stub_head_compilers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, object]]:
+    """Replace all graph compilers, including output-head-only families."""
+    records = _stub_compilers(monkeypatch)
+    monkeypatch.setattr(
+        promotion_logits_module,
+        "compile_promotion_logits",
+        _compiler(records, "promotion_logits", 3),
+    )
+    monkeypatch.setattr(
+        policy_map_module,
+        "compile_policy_map",
+        _compiler(records, "policy_map", 3),
+    )
+    monkeypatch.setattr(
+        copy_type_converted_module,
+        "compile_copy_type_converted",
+        _compiler(records, "copy_type_converted", 2),
+    )
+    monkeypatch.setattr(
+        mapping_table_module,
+        "compile_symbol",
+        lambda *, architecture: SymbolArtifact(  # noqa: ARG005
+            binary_format=lc0ex_pb2.Binary.FORMAT_CUBIN,
+            binary_data=b"mapping",
+            symbol_name="lczero_bt4_mapping_table",
+        ),
+    )
+    monkeypatch.setattr(
+        network_module, "compile_symbol", mapping_table_module.compile_symbol
+    )
+    return records
+
+
+def _add_output_heads(  # noqa: PLR0913
+    network: net_pb2.Net,
+    *,
+    body_width: int,
+    policy_width: int,
+    policy_model_width: int,
+    value_width: int,
+    value_hidden_width: int,
+    moves_width: int,
+    moves_hidden_width: int,
+) -> None:
+    """Populate compact, dimensionally valid policy, WDL, and MLH heads."""
+    weights = network.weights
+    policy = weights.policy_heads.vanilla
+    _set_elements(weights.policy_heads.ip_pol_w, body_width * policy_width)
+    _set_elements(weights.policy_heads.ip_pol_b, policy_width)
+    _set_elements(policy.ip2_pol_w, policy_width * policy_model_width)
+    _set_elements(policy.ip2_pol_b, policy_model_width)
+    _set_elements(policy.ip3_pol_w, policy_width * policy_model_width)
+    _set_elements(policy.ip3_pol_b, policy_model_width)
+    _set_elements(policy.ip4_pol_w, policy_model_width * 4)
+
+    winner = weights.value_heads.winner
+    _set_elements(winner.ip_val_w, body_width * value_width)
+    _set_elements(winner.ip_val_b, value_width)
+    _set_elements(winner.ip1_val_w, 64 * value_width * value_hidden_width)
+    _set_elements(winner.ip1_val_b, value_hidden_width)
+    _set_elements(winner.ip2_val_w, value_hidden_width * 3)
+    _set_elements(winner.ip2_val_b, 3)
+
+    _set_elements(weights.ip_mov_w, body_width * moves_width)
+    _set_elements(weights.ip_mov_b, moves_width)
+    _set_elements(weights.ip1_mov_w, 64 * moves_width * moves_hidden_width)
+    _set_elements(weights.ip1_mov_b, moves_hidden_width)
+    _set_elements(weights.ip2_mov_w, moves_hidden_width)
+    _set_elements(weights.ip2_mov_b, 1)
+
+
+def _keep_body(
+    context: _BuildContext,
+    body: Buffer,
+    body_width: int,
+    weights: net_pb2.Weights,
+) -> Buffer:
+    """Skip encoder construction while retaining the embedding body."""
+    del context, body_width, weights
+    return body
 
 
 def _stop_after_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -641,6 +758,180 @@ def test_embedding_preserves_pointer_reinterpretation_skip_and_reuse(
         len({arguments[11][0], arguments[11][1], arguments[11][3]})
         == _REUSED_TEMPORARY_COUNT
     )
+
+
+def test_output_heads_build_contracts_and_independent_branches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All selected heads preserve names, operations, outputs, and body fan-out."""
+    network = _embedding_network(encoding_width=1, body_width=16, hidden_width=24)
+    _add_output_heads(
+        network,
+        body_width=16,
+        policy_width=12,
+        policy_model_width=8,
+        value_width=4,
+        value_hidden_width=6,
+        moves_width=3,
+        moves_hidden_width=5,
+    )
+    records = _stub_head_compilers(monkeypatch)
+    monkeypatch.setattr(network_module, "_encoder_tower", _keep_body)
+    builder = ExecutableBuilder()
+
+    build(builder, network, batch_size=2)
+    executable = builder.build()
+    nodes = executable.programs[0].nodes
+    functions = [executable.kernels[node.kernel_idx].function for node in nodes]
+    head_functions = functions[12:]
+
+    assert head_functions == [
+        "matmul",
+        "add_bias_batched",
+        "matmul",
+        "add_bias_batched",
+        "matmul",
+        "add_bias_batched",
+        "policy_qk",
+        "promotion_logits",
+        "policy_map",
+        "copy_type_converted",
+        "matmul",
+        "add_vectors",
+        "matmul",
+        "add_vectors",
+        "matmul",
+        "add_vectors",
+        "copy_type_converted",
+        "matmul",
+        "add_vectors",
+        "matmul",
+        "add_vectors",
+        "matmul",
+        "add_vectors",
+        "copy_type_converted",
+    ]
+    assert "softmax_64" not in head_functions
+
+    buffers = {buffer.name: buffer for buffer in executable.buffers}
+    expected_shapes = {
+        "/policy/dense1/matmul/w": (16, 12),
+        "/policy/dense1/add/w": (12,),
+        "/policy/Q/matmul/w": (12, 8),
+        "/policy/Q/add/w": (8,),
+        "/policy/K/matmul/w": (12, 8),
+        "/policy/K/add/w": (8,),
+        "/policy/promotion/matmul/w": (8, 4),
+        "/policy/scale/w": (1,),
+        "/value/embed/matmul/w": (16, 4),
+        "/value/embed/add/w": (4,),
+        "/value/dense1/matmul/w": (64 * 4, 6),
+        "/value/dense1/add/w": (6,),
+        "/value/dense2/matmul/w": (6, 3),
+        "/value/dense2/add/w": (3,),
+        "/mlh/embed/matmul/w": (16, 3),
+        "/mlh/embed/add/w": (3,),
+        "/mlh/dense1/matmul/w": (64 * 3, 5),
+        "/mlh/dense1/add/w": (5,),
+        "/mlh/dense2/matmul/w": (5, 1),
+        "/mlh/dense2/add/w": (1,),
+        "/output/policy": (2, 1858),
+        "/output/wdl": (2, 3),
+        "/output/mlh": (2, 1),
+    }
+    assert {
+        name: tuple(buffers[name].shape) for name in expected_shapes
+    } == expected_shapes
+    for name in ("/output/policy", "/output/wdl", "/output/mlh"):
+        buffer = buffers[name]
+        assert buffer.data_type == lc0ex_pb2.Buffer.DATA_TYPE_F32
+        assert (
+            executable.allocations[buffer.allocation_idx].lifetime
+            == lc0ex_pb2.Allocation.LIFETIME_EXECUTION
+        )
+    assert "/const/mapping_table" not in buffers
+
+    head_specializations = [specialization for _name, specialization in records][12:]
+    assert (
+        BatchedMatmulSpecialization("policy_qk", 2, 64, 64, 8, 1, _ARCHITECTURE)
+        in head_specializations
+    )
+    assert PromotionLogitsSpecialization(2, 8, _ARCHITECTURE) in head_specializations
+    assert PolicyMapSpecialization(2, _ARCHITECTURE) in head_specializations
+    assert CopyTypeConvertedSpecialization(2 * 1858, _ARCHITECTURE) in (
+        head_specializations
+    )
+    assert AddVectorsSpecialization(2, 1, "relu", _ARCHITECTURE) in (
+        head_specializations
+    )
+
+    arguments = [[_location(argument) for argument in node.arguments] for node in nodes]
+    head_start = 12
+    final_body = arguments[11][0]
+    assert arguments[head_start][1] == final_body
+    assert arguments[head_start + 10][1] == final_body
+    assert arguments[head_start + 17][1] == final_body
+    assert arguments[head_start + 6][0] == arguments[head_start + 7][0]
+    assert arguments[head_start + 7][0] == arguments[head_start + 8][1]
+    assert nodes[head_start + 8].arguments[2].HasField("symbol")
+    assert (
+        nodes[head_start + 8].arguments[2].symbol.symbol_name
+        == "lczero_bt4_mapping_table"
+    )
+    assert head_start + 9 not in nodes[head_start + 10].dependencies
+    assert head_start + 16 not in nodes[head_start + 17].dependencies
+
+
+def test_policy_embedding_prefers_head_local_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nonempty vanilla embedding overrides the shared multihead operands."""
+    network = _embedding_network(encoding_width=1, body_width=16, hidden_width=24)
+    _add_output_heads(
+        network,
+        body_width=16,
+        policy_width=12,
+        policy_model_width=8,
+        value_width=4,
+        value_hidden_width=6,
+        moves_width=3,
+        moves_hidden_width=5,
+    )
+    _set_elements(network.weights.policy_heads.vanilla.ip_pol_w, 16 * 10)
+    _set_elements(network.weights.policy_heads.vanilla.ip_pol_b, 10)
+    _set_elements(network.weights.policy_heads.vanilla.ip2_pol_w, 10 * 8)
+    _set_elements(network.weights.policy_heads.vanilla.ip3_pol_w, 10 * 8)
+    _stub_head_compilers(monkeypatch)
+    monkeypatch.setattr(network_module, "_encoder_tower", _keep_body)
+    builder = ExecutableBuilder()
+
+    build(builder, network, batch_size=1)
+    buffers = {buffer.name: tuple(buffer.shape) for buffer in builder.build().buffers}
+
+    assert buffers["/policy/dense1/matmul/w"] == (16, 10)
+
+
+def test_output_heads_reject_wrong_terminal_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Semantic output widths are fixed even though hidden widths are inferred."""
+    network = _embedding_network(encoding_width=1, body_width=16, hidden_width=24)
+    _add_output_heads(
+        network,
+        body_width=16,
+        policy_width=12,
+        policy_model_width=8,
+        value_width=4,
+        value_hidden_width=6,
+        moves_width=3,
+        moves_hidden_width=5,
+    )
+    _set_elements(network.weights.value_heads.winner.ip2_val_w, 6 * 2)
+    _stub_head_compilers(monkeypatch)
+    monkeypatch.setattr(network_module, "_encoder_tower", _keep_body)
+
+    with pytest.raises(NetworkFormatError, match="/output/wdl output"):
+        build(ExecutableBuilder(), network, batch_size=1)
 
 
 def test_embedding_rejects_matrix_count_not_divisible_by_input_width(

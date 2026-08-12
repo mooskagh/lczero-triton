@@ -173,8 +173,14 @@ def _validate_active_heads(weights: net_pb2.Weights) -> None:
     if not _has_policy_computation(weights.policy_heads.vanilla):
         message = "weights.policy_heads.vanilla: selected policy computation is missing"
         raise NetworkFormatError(message)
+    if weights.policy_heads.vanilla.pol_encoder:
+        message = "weights.policy_heads.vanilla.pol_encoder: not supported"
+        raise NetworkFormatError(message)
     if not _has_value_computation(weights.value_heads.winner):
         message = "weights.value_heads.winner: selected value computation is missing"
+        raise NetworkFormatError(message)
+    if not _has_moves_left_computation(weights):
+        message = "weights: selected moves-left computation is missing"
         raise NetworkFormatError(message)
 
 
@@ -213,7 +219,13 @@ def _has_policy_computation(policy: net_pb2.Weights.PolicyHead) -> bool:
     """Return whether the selected policy head has its active projections."""
     return all(
         policy.HasField(field) and _has_layer_data(getattr(policy, field))
-        for field in ("ip2_pol_w", "ip3_pol_w", "ip4_pol_w")
+        for field in (
+            "ip2_pol_w",
+            "ip2_pol_b",
+            "ip3_pol_w",
+            "ip3_pol_b",
+            "ip4_pol_w",
+        )
     )
 
 
@@ -221,5 +233,27 @@ def _has_value_computation(value: net_pb2.Weights.ValueHead) -> bool:
     """Return whether the selected WDL head has its active projections."""
     return all(
         value.HasField(field) and _has_layer_data(getattr(value, field))
-        for field in ("ip_val_w", "ip1_val_w", "ip2_val_w")
+        for field in (
+            "ip_val_w",
+            "ip_val_b",
+            "ip1_val_w",
+            "ip1_val_b",
+            "ip2_val_w",
+            "ip2_val_b",
+        )
+    )
+
+
+def _has_moves_left_computation(weights: net_pb2.Weights) -> bool:
+    """Return whether the selected moves-left head has all dense operands."""
+    return all(
+        weights.HasField(field) and _has_layer_data(getattr(weights, field))
+        for field in (
+            "ip_mov_w",
+            "ip_mov_b",
+            "ip1_mov_w",
+            "ip1_mov_b",
+            "ip2_mov_w",
+            "ip2_mov_b",
+        )
     )

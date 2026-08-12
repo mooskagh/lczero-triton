@@ -30,10 +30,32 @@ def _network() -> net_pb2.Net:
     )
     network.weights.headcount = 1
     network.weights.encoder.add()
-    for field in ("ip2_pol_w", "ip3_pol_w", "ip4_pol_w"):
+    for field in (
+        "ip2_pol_w",
+        "ip2_pol_b",
+        "ip3_pol_w",
+        "ip3_pol_b",
+        "ip4_pol_w",
+    ):
         getattr(network.weights.policy_heads.vanilla, field).params = b"\0\0"
-    for field in ("ip_val_w", "ip1_val_w", "ip2_val_w"):
+    for field in (
+        "ip_val_w",
+        "ip_val_b",
+        "ip1_val_w",
+        "ip1_val_b",
+        "ip2_val_w",
+        "ip2_val_b",
+    ):
         getattr(network.weights.value_heads.winner, field).params = b"\0\0"
+    for field in (
+        "ip_mov_w",
+        "ip_mov_b",
+        "ip1_mov_w",
+        "ip1_mov_b",
+        "ip2_mov_w",
+        "ip2_mov_b",
+    ):
+        getattr(network.weights, field).params = b"\0\0"
     return network
 
 
@@ -129,4 +151,22 @@ def test_validate_network_rejects_absent_winner_computation() -> None:
     network.weights.value_heads.winner.ClearField("ip2_val_w")
 
     with pytest.raises(NetworkFormatError, match="selected value computation"):
+        validate_network_format(network)
+
+
+def test_validate_network_rejects_policy_encoders() -> None:
+    """Policy-specific encoder towers are outside the selected graph."""
+    network = _network()
+    network.weights.policy_heads.vanilla.pol_encoder.add()
+
+    with pytest.raises(NetworkFormatError, match="pol_encoder"):
+        validate_network_format(network)
+
+
+def test_validate_network_rejects_absent_moves_left_computation() -> None:
+    """The selected moves-left format requires all three dense operations."""
+    network = _network()
+    network.weights.ClearField("ip2_mov_b")
+
+    with pytest.raises(NetworkFormatError, match="moves-left computation"):
         validate_network_format(network)
