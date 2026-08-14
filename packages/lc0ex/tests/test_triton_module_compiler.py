@@ -3,7 +3,6 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-import pytest
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
@@ -62,19 +61,3 @@ def test_artifact_from_triton_preserves_binary_abi_and_launch() -> None:
     assert artifact.grid == (2, 3, 1)
     assert artifact.block == (128, 1, 1)
     assert artifact.dynamic_shared_memory_bytes == _SHARED_MEMORY_BYTES
-
-
-def test_artifact_from_triton_rejects_missing_cubin() -> None:
-    """A linker artifact always carries a non-empty device binary."""
-    compiled = _FakeCompiledKernel(
-        name="kernel_exported",
-        asm={"cubin": b""},
-        metadata=_FakeMetadata(
-            num_warps=4,
-            shared=0,
-            target=_FakeTarget(backend="cuda", arch=120, warp_size=32),
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="non-empty CUBIN"):
-        artifact_from_triton(compiled, grid=(1, 1, 1), parameters=())

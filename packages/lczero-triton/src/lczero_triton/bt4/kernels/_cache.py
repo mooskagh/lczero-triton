@@ -39,16 +39,8 @@ class KernelCache:
                 specialization,
             )
             started = perf_counter()
-            try:
-                artifact = compiler(specialization)
-                handle = self._builder.add_kernel(artifact)
-            except Exception:
-                _LOGGER.exception(
-                    "kernel compilation failed for %s and specialization %r",
-                    compiler_name,
-                    specialization,
-                )
-                raise
+            artifact = compiler(specialization)
+            handle = self._builder.add_kernel(artifact)
             self._handles[key] = handle
             _LOGGER.info(
                 "kernel %s compilation completed for specialization %r in %.2fs",

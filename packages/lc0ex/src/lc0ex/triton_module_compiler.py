@@ -1,6 +1,5 @@
 """Convert Triton output into executable-linker artifacts."""
 
-import re
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,26 +10,16 @@ from triton.backends.nvidia.compiler import get_ptxas
 from lc0ex.kernel_builder import KernelArtifact
 from lc0ex.proto import lc0ex_pb2
 
-Grid = tuple[int, int, int]
-
-_ARCHITECTURE_PATTERN = re.compile(r"sm_(\d+)(?:a)?")
-
 
 def compile_ptx(ptx: str, *, architecture: str) -> bytes:
     """Assemble PTX for *architecture* with Triton's configured ptxas."""
-    match = _ARCHITECTURE_PATTERN.fullmatch(architecture)
-    if match is None:
-        message = f"invalid NVIDIA architecture: {architecture!r}"
-        raise ValueError(message)
-
     with TemporaryDirectory(prefix="lc0ex-ptx-") as directory:
-        path = Path(directory)
-        source_path = path / "module.ptx"
-        cubin_path = path / "module.cubin"
+        source_path = Path(directory) / "module.ptx"
+        cubin_path = source_path.with_suffix(".cubin")
         source_path.write_text(ptx, encoding="utf-8")
         subprocess.run(  # noqa: S603  # ptxas path is selected by Triton.
             (
-                get_ptxas(int(match.group(1))).path,
+                get_ptxas(int(architecture[3:].removesuffix("a"))).path,
                 f"--gpu-name={architecture}",
                 str(source_path),
                 "--output-file",
@@ -44,7 +33,7 @@ def compile_ptx(ptx: str, *, architecture: str) -> bytes:
 def artifact_from_triton(
     compiled: Any,
     *,
-    grid: Grid,
+    grid: tuple[int, int, int],
     parameters: tuple[lc0ex_pb2.ParameterType, ...],
 ) -> KernelArtifact:
     """Convert one compiled Triton entry point into a linker artifact."""
@@ -53,13 +42,9 @@ def artifact_from_triton(
         1,
         1,
     )
-    cubin = compiled.asm["cubin"]
-    if not isinstance(cubin, bytes) or not cubin:
-        message = "Triton compilation did not produce a non-empty CUBIN"
-        raise RuntimeError(message)
     return KernelArtifact(
         binary_format=lc0ex_pb2.Binary.FORMAT_CUBIN,
-        binary_data=cubin,
+        binary_data=compiled.asm["cubin"],
         function=compiled.name,
         parameters=parameters,
         grid=grid,
