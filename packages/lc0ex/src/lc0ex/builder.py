@@ -36,12 +36,8 @@ class ProgramBuilder:
         owner: "ExecutableBuilder",
         name: str,
         metadata: bytes | None,
-        token: object,
     ) -> None:
         """Initialize a program owned by *owner*."""
-        if token is not owner._program_token:  # noqa: SLF001
-            message = "programs must be created by an executable builder"
-            raise ValueError(message)
         self._owner = owner
         self._name = name
         self.metadata = metadata
@@ -122,11 +118,22 @@ class ProgramBuilder:
         readonly: Sequence[Buffer] = (),
     ) -> None:
         """Append a call to this program."""
-        self._owner._call_in_program(  # noqa: SLF001
-            self,
-            kernel,
-            *arguments,
-            readonly=readonly,
+        buffers = self._owner._buffers  # noqa: SLF001
+        self._invocations.append(
+            _KernelInvocation(
+                kernel=kernel,
+                arguments=arguments,
+                readonly=frozenset(
+                    set(readonly)
+                    | {
+                        argument
+                        for argument in arguments
+                        if isinstance(argument, Buffer)
+                        if not buffers.is_reusable(argument)
+                        and not buffers.is_writable(argument)
+                    },
+                ),
+            ),
         )
 
 
@@ -140,14 +147,9 @@ class ExecutableBuilder:
         self._buffers = BufferBuilder()
         self._kernels: dict[KernelHandle, KernelArtifact] = {}
         self._kernel_handles: dict[KernelArtifact, KernelHandle] = {}
-        self._binary_functions: dict[
-            tuple[lc0ex_pb2.Binary.Format, bytes, str], KernelArtifact
-        ] = {}
         self._symbols: dict[SymbolHandle, SymbolArtifact] = {}
         self._symbol_handles: dict[SymbolArtifact, SymbolHandle] = {}
         self._programs: list[ProgramBuilder] = []
-        self._program_names: set[str] = set()
-        self._program_token = object()
 
     def persistent_buffer(
         self,
@@ -175,16 +177,9 @@ class ExecutableBuilder:
         metadata: bytes | None = None,
     ) -> ProgramBuilder:
         """Create a named program with a private execution allocation."""
-        if not name:
-            message = "program name cannot be empty"
-            raise ValueError(message)
-        if name in self._program_names:
-            message = f"program {name!r} already exists"
-            raise ValueError(message)
         normalized_metadata = None if metadata is None else bytes(metadata)
-        result = ProgramBuilder(self, name, normalized_metadata, self._program_token)
+        result = ProgramBuilder(self, name, normalized_metadata)
         self._programs.append(result)
-        self._program_names.add(name)
         return result
 
     def set_target(
@@ -193,51 +188,27 @@ class ExecutableBuilder:
         architecture: str,
     ) -> Self:
         """Set the executable's compilation target and return this builder."""
-        target = (vendor, architecture)
-        if self._target is not None and self._target != target:
-            message = "target does not match the executable target"
-            raise ValueError(message)
-        self._target = target
+        self._target = (vendor, architecture)
         return self
 
     def set_metadata(self, metadata: bytes) -> Self:
         """Set opaque executable metadata and return this builder."""
-        normalized = bytes(metadata)
-        if self._metadata is not None and self._metadata != normalized:
-            message = "metadata does not match the executable metadata"
-            raise ValueError(message)
-        self._metadata = normalized
+        self._metadata = bytes(metadata)
         return self
 
     def add_kernel(self, kernel: KernelArtifact) -> KernelHandle:
         """Register a compiled kernel and return its opaque handle."""
-        if not kernel.function:
-            message = "kernel function cannot be empty"
-            raise ValueError(message)
-
         existing = self._kernel_handles.get(kernel)
         if existing is not None:
             return existing
 
-        symbol = (kernel.binary_format, kernel.binary_data, kernel.function)
-        existing_symbol = self._binary_functions.get(symbol)
-        if existing_symbol is not None and existing_symbol != kernel:
-            message = (
-                f"kernel function {kernel.function!r} is already registered differently"
-            )
-            raise ValueError(message)
-
         handle = KernelHandle()
         self._kernels[handle] = kernel
         self._kernel_handles[kernel] = handle
-        self._binary_functions[symbol] = kernel
         return handle
 
     def add_symbol(self, symbol: SymbolArtifact) -> SymbolHandle:
         """Register an immutable module symbol and return its opaque handle."""
-        if not symbol.symbol_name:
-            message = "symbol name cannot be empty"
-            raise ValueError(message)
         existing = self._symbol_handles.get(symbol)
         if existing is not None:
             return existing
@@ -302,80 +273,6 @@ class ExecutableBuilder:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(executable.SerializeToString())
         return executable
-
-    def _call_in_program(
-        self,
-        program: ProgramBuilder,
-        kernel: KernelHandle,
-        *arguments: Buffer | SymbolHandle,
-        readonly: Sequence[Buffer] = (),
-    ) -> None:
-        """Validate and append one invocation to *program*."""
-        if program._owner is not self:  # noqa: SLF001
-            message = "program does not belong to this executable builder"
-            raise ValueError(message)
-        artifact = self._kernels.get(kernel)
-        if artifact is None:
-            message = "kernel handle does not belong to this executable builder"
-            raise ValueError(message)
-
-        if len(arguments) != len(artifact.parameters):
-            message = "kernel argument count does not match its ABI"
-            raise ValueError(message)
-        if any(
-            parameter != lc0ex_pb2.PARAMETER_TYPE_POINTER
-            for parameter in artifact.parameters
-        ):
-            message = "kernel calls only support pointer parameters"
-            raise ValueError(message)
-        if any(
-            not isinstance(argument, Buffer | SymbolHandle) for argument in arguments
-        ):
-            message = "kernel arguments must be buffers or symbols"
-            raise ValueError(message)
-        if any(
-            isinstance(argument, Buffer) and not self._buffers.owns(argument)
-            for argument in arguments
-        ) or any(
-            isinstance(argument, SymbolHandle) and argument not in self._symbols
-            for argument in arguments
-        ):
-            message = "kernel arguments must belong to this executable builder"
-            raise ValueError(message)
-        if any(not self._buffers.owns(buffer) for buffer in readonly):
-            message = "read-only buffers must belong to this executable builder"
-            raise ValueError(message)
-        if any(
-            not any(buffer is argument for argument in arguments) for buffer in readonly
-        ):
-            message = "read-only buffers must be kernel arguments"
-            raise ValueError(message)
-        execution_allocations = {
-            self._buffers.allocation_of(argument)
-            for argument in arguments
-            if isinstance(argument, Buffer)
-            and not self._buffers.allocation_of(argument).is_persistent()
-        }
-        if execution_allocations and execution_allocations != {program._allocation}:  # noqa: SLF001
-            message = "kernel arguments belong to a different program"
-            raise ValueError(message)
-
-        program._invocations.append(  # noqa: SLF001
-            _KernelInvocation(
-                kernel=kernel,
-                arguments=arguments,
-                readonly=frozenset(
-                    set(readonly)
-                    | {
-                        argument
-                        for argument in arguments
-                        if isinstance(argument, Buffer)
-                        if not self._buffers.is_reusable(argument)
-                        and not self._buffers.is_writable(argument)
-                    },
-                ),
-            ),
-        )
 
     def _build_exports(
         self,

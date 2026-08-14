@@ -2,7 +2,6 @@
 
 # ruff: noqa: PLR2004
 
-import pytest
 from lc0ex import (
     Buffer,
     ExecutableBuilder,
@@ -15,7 +14,6 @@ from lc0ex.proto import lc0ex_pb2
 
 F16 = lc0ex_pb2.Buffer.DATA_TYPE_F16
 POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
-U32 = lc0ex_pb2.PARAMETER_TYPE_U32
 TARGET_ARCHITECTURE = "sm_80"
 
 
@@ -77,14 +75,6 @@ def test_add_kernel_and_call_serializes_generic_metadata() -> None:
         argument.allocation.offset
         for argument in executable.programs[0].nodes[0].arguments
     ] == [0, 2, 4]
-
-
-def test_set_target_rejects_conflicting_architecture() -> None:
-    """A later compilation target cannot replace the executable target."""
-    builder = _builder()
-
-    with pytest.raises(ValueError, match="does not match"):
-        builder.set_target(lc0ex_pb2.Target.VENDOR_NVIDIA, "sm_90")
 
 
 def test_readonly_external_buffers_have_no_dependency() -> None:
@@ -153,22 +143,6 @@ def test_independent_raw_temporaries_do_not_reuse_storage() -> None:
     executable = builder.build()
 
     assert executable.programs[0].execution_allocation.size_bytes == 128
-
-
-def test_call_rejects_foreign_and_non_pointer_handles() -> None:
-    """Kernel calls retain ownership and pointer-ABI validation."""
-    builder = _builder()
-    program = builder.program(name="main")
-    foreign = _builder()
-    foreign_buffer = _external(foreign, "foreign")
-    pointer_kernel = builder.add_kernel(_artifact())
-    u32_kernel = builder.add_kernel(_artifact(function="u32", parameters=(U32,)))
-    local_buffer = _external(builder, "local")
-
-    with pytest.raises(ValueError, match="belong"):
-        program.call(pointer_kernel, foreign_buffer)
-    with pytest.raises(ValueError, match="pointer"):
-        program.call(u32_kernel, local_buffer)
 
 
 def test_add_kernel_deduplicates_identical_artifacts() -> None:
