@@ -6,7 +6,7 @@ from typing import cast
 import pytest
 import torch
 import triton
-from lc0ex import Buffer, ExecutableBuilder
+from lc0ex import Buffer, ExecutableBuilder, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lczero_triton.bt4.kernels._cache import KernelCache
 from lczero_triton.bt4.kernels.layer_norm import (
@@ -348,7 +348,8 @@ def test_specialization_rejects_unknown_activation() -> None:
 def test_graph_validation_precedes_compilation() -> None:
     """Optional operands and unsafe broadcast aliases fail without CUDA."""
     builder = ExecutableBuilder()
-    buffer = builder.temporary_buffer(size_bytes=512, alignment_bytes=2)
+    program = builder.program(name="main")
+    buffer = program.temporary_buffer(size_bytes=512, alignment_bytes=2)
     kernels = KernelCache(builder)
     without_skip = LayerNormSpecialization(
         1,
@@ -367,7 +368,7 @@ def test_graph_validation_precedes_compilation() -> None:
 
     with pytest.raises(ValueError, match="supplied together"):
         layer_norm(
-            builder,
+            program,
             kernels,
             buffer,
             buffer,
@@ -379,7 +380,7 @@ def test_graph_validation_precedes_compilation() -> None:
         )
     with pytest.raises(ValueError, match="match the specialization"):
         layer_norm(
-            builder,
+            program,
             kernels,
             buffer,
             buffer,
@@ -390,7 +391,7 @@ def test_graph_validation_precedes_compilation() -> None:
         )
     with pytest.raises(ValueError, match="broadcast parameters"):
         layer_norm(
-            builder,
+            program,
             kernels,
             buffer,
             buffer,
@@ -429,7 +430,7 @@ def test_compilation_captures_variant_abi_and_launch(variant: str) -> None:
 
 
 def _external_buffer(
-    builder: ExecutableBuilder,
+    program: ProgramBuilder,
     name: str,
     shape: Sequence[int],
     *,
@@ -438,13 +439,13 @@ def _external_buffer(
 ) -> Buffer:
     """Declare one FP16 test buffer with the requested lifetime."""
     if persistent:
-        return builder.persistent_buffer(
+        return program.persistent_buffer(
             name=name,
             shape=shape,
             dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
             writable=writable,
         )
-    return builder.execution_buffer(
+    return program.buffer(
         name=name,
         shape=shape,
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -457,16 +458,17 @@ def _external_buffer(
 def test_graph_call_preserves_deepnorm_argument_order() -> None:
     """DeepNorm graph arguments follow the fused CUDA operation's pointer ABI."""
     builder = ExecutableBuilder()
-    output = _external_buffer(builder, "output", (2, 256), writable=True)
-    input_ = _external_buffer(builder, "input", (2, 256))
-    skip = _external_buffer(builder, "skip", (2, 256))
-    bias = _external_buffer(builder, "bias", (256,), persistent=True)
-    gammas = _external_buffer(builder, "gammas", (256,), persistent=True)
-    betas = _external_buffer(builder, "betas", (256,), persistent=True)
-    alpha = _external_buffer(builder, "alpha", (1,), persistent=True)
+    program = builder.program(name="main")
+    output = _external_buffer(program, "output", (2, 256), writable=True)
+    input_ = _external_buffer(program, "input", (2, 256))
+    skip = _external_buffer(program, "skip", (2, 256))
+    bias = _external_buffer(program, "bias", (256,), persistent=True)
+    gammas = _external_buffer(program, "gammas", (256,), persistent=True)
+    betas = _external_buffer(program, "betas", (256,), persistent=True)
+    alpha = _external_buffer(program, "alpha", (1,), persistent=True)
 
     layer_norm(
-        builder,
+        program,
         KernelCache(builder),
         output,
         input_,

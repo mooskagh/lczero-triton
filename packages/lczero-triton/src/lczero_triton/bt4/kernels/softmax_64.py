@@ -7,7 +7,7 @@ from typing import cast
 import torch
 import triton
 import triton.language as tl
-from lc0ex import Buffer, ExecutableBuilder, KernelArtifact
+from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
@@ -129,7 +129,7 @@ def compile_softmax_64(
 
 
 def softmax_64(
-    builder: ExecutableBuilder,
+    builder: ProgramBuilder,
     kernels: KernelCache,
     output: Buffer,
     scaled_qk: Buffer,

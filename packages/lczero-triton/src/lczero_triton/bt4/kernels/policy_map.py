@@ -7,7 +7,7 @@ from typing import cast
 import torch
 import triton
 import triton.language as tl
-from lc0ex import Buffer, ExecutableBuilder, KernelArtifact, SymbolHandle
+from lc0ex import Buffer, KernelArtifact, ProgramBuilder, SymbolHandle
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
@@ -145,7 +145,7 @@ def compile_policy_map(
 
 
 def policy_map(
-    builder: ExecutableBuilder,
+    builder: ProgramBuilder,
     kernels: KernelCache,
     output: Buffer,
     input_: Buffer,

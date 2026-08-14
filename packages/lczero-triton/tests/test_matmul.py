@@ -127,13 +127,14 @@ def test_compilation_captures_selected_configuration_and_static_launch() -> None
 def test_graph_call_preserves_output_activation_weight_order() -> None:
     """The graph ABI places the destination before both readonly operands."""
     builder = ExecutableBuilder()
-    output = builder.execution_buffer(
+    program = builder.program(name="main")
+    output = program.buffer(
         name="output",
         shape=(169, 3),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
         writable=True,
     )
-    activations = builder.execution_buffer(
+    activations = program.buffer(
         name="activations",
         shape=(169, 128),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -145,7 +146,7 @@ def test_graph_call_preserves_output_activation_weight_order() -> None:
     )
 
     matmul(
-        builder,
+        program,
         KernelCache(builder),
         output,
         activations,
@@ -198,11 +199,12 @@ def test_compilation_rejects_a_different_active_architecture() -> None:
 def test_graph_call_rejects_output_aliasing_before_compilation() -> None:
     """Dense GEMM cannot overwrite either source while tiles remain active."""
     builder = ExecutableBuilder()
-    buffer = builder.temporary_buffer(size_bytes=2, alignment_bytes=2)
+    program = builder.program(name="main")
+    buffer = program.temporary_buffer(size_bytes=2, alignment_bytes=2)
 
     with pytest.raises(ValueError, match="cannot alias"):
         matmul(
-            builder,
+            program,
             KernelCache(builder),
             buffer,
             buffer,

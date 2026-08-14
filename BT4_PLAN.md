@@ -267,7 +267,7 @@ message AllocationLocation {
 ```
 
 Use `Node.Argument.Symbol`, containing `binary_idx` and `symbol_name`, for an
-immutable pointer exported from an embedded CUBIN. `ExecutableBuilder.call()`
+immutable pointer exported from an embedded CUBIN. `ProgramBuilder.call()`
 accepts `Buffer | SymbolHandle` pointer arguments. Symbols are not buffers:
 they are implicitly readonly and do not participate in allocation planning,
 dependencies, or temporary reuse.

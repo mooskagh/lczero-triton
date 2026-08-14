@@ -79,8 +79,7 @@ _LOGGER = logging.getLogger(__name__)
 class _BuildContext:
     """Construction services shared by grammar productions in one build."""
 
-    builder: ExecutableBuilder
-    execution: ProgramBuilder
+    builder: ProgramBuilder
     kernels: KernelCache
     batch_size: int
     architecture: int
@@ -130,21 +129,20 @@ def build(
     for size in sizes:
         program_name = "main" if len(sizes) == 1 else f"batch-{size}"
         _LOGGER.info("building program %s for batch size %d", program_name, size)
-        with builder.program(name=program_name) as program:
-            context = _BuildContext(
-                builder=builder,
-                execution=program,
-                kernels=kernels,
-                batch_size=size,
-                architecture=active_architecture(),
-                default_encoding=network.format.weights_encoding,
-                default_activation=default_activation,
-                ffn_activation=ffn_activation,
-                smolgen_activation=smolgen_activation,
-                fingerprint=fingerprint,
-                fingerprint_layers=fingerprint_layers,
-            )
-            _network(context, network.weights)
+        program = builder.program(name=program_name)
+        context = _BuildContext(
+            builder=program,
+            kernels=kernels,
+            batch_size=size,
+            architecture=active_architecture(),
+            default_encoding=network.format.weights_encoding,
+            default_activation=default_activation,
+            ffn_activation=ffn_activation,
+            smolgen_activation=smolgen_activation,
+            fingerprint=fingerprint,
+            fingerprint_layers=fingerprint_layers,
+        )
+        _network(context, network.weights)
         _LOGGER.info("finished program %s", program_name)
     builder.set_metadata(fingerprint.SerializeToString(deterministic=True))
     _LOGGER.info("finished BT4 graph construction")
@@ -350,12 +348,12 @@ def _fingerprint_network(
 
 def _inputs(context: _BuildContext) -> tuple[Buffer, Buffer]:
     """Declare the packed execution inputs consumed by plane expansion."""
-    masks = context.execution.buffer(
+    masks = context.builder.buffer(
         name="/input/plane_masks",
         shape=(context.batch_size, _INPUT_CHANNELS),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_U64,
     )
-    values = context.execution.buffer(
+    values = context.builder.buffer(
         name="/input/plane_values",
         shape=(context.batch_size, _INPUT_CHANNELS),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
@@ -1427,7 +1425,7 @@ def _policy_head(
         shape=(1,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
     )
-    output = context.execution.buffer(
+    output = context.builder.buffer(
         name="/output/policy",
         shape=(context.batch_size, 1858),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
@@ -1671,7 +1669,7 @@ def _dense_output_head(  # noqa: PLR0913
         path=f"{path} dense2 bias",
         expected_path=f"{output_name} output",
     )
-    output = context.execution.buffer(
+    output = context.builder.buffer(
         name=output_name,
         shape=(context.batch_size, output_width),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
@@ -1951,7 +1949,7 @@ def _temporary_f16(
     if element_count <= 0:
         message = "temporary element count must be positive"
         raise ValueError(message)
-    return context.execution.temporary_buffer(
+    return context.builder.temporary_buffer(
         size_bytes=element_count * _F16_SIZE_BYTES,
         alignment_bytes=alignment_bytes,
     )

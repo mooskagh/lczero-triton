@@ -5,7 +5,7 @@ from typing import cast
 
 import pytest
 import torch
-from lc0ex import Buffer, ExecutableBuilder
+from lc0ex import Buffer, ExecutableBuilder, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lczero_triton.bt4.kernels._cache import KernelCache
 from lczero_triton.bt4.kernels.batched_matmul import (
@@ -131,16 +131,17 @@ def test_specialization_rejects_unknown_operation_and_target() -> None:
 def test_graph_validation_precedes_compilation() -> None:
     """Scale and alias errors do not trigger GPU compilation."""
     builder = ExecutableBuilder()
-    buffer = builder.temporary_buffer(size_bytes=2, alignment_bytes=2)
+    program = builder.program(name="main")
+    buffer = program.temporary_buffer(size_bytes=2, alignment_bytes=2)
     kernels = KernelCache(builder)
     qk = BatchedMatmulSpecialization("body_qk", 1, 1, 1, 1, 1, 80)
     attention_v = BatchedMatmulSpecialization("body_attention_v", 1, 1, 1, 1, 1, 80)
 
     with pytest.raises(ValueError, match="require scale"):
-        batched_matmul(builder, kernels, buffer, buffer, buffer, qk)
+        batched_matmul(program, kernels, buffer, buffer, buffer, qk)
     with pytest.raises(ValueError, match="does not"):
         batched_matmul(
-            builder,
+            program,
             kernels,
             buffer,
             buffer,
@@ -150,7 +151,7 @@ def test_graph_validation_precedes_compilation() -> None:
         )
     with pytest.raises(ValueError, match="cannot alias"):
         batched_matmul(
-            builder,
+            program,
             kernels,
             buffer,
             buffer,
@@ -365,7 +366,7 @@ def test_compilation_captures_selected_launch_and_abi(
 
 
 def _external_buffer(
-    builder: ExecutableBuilder,
+    program: ProgramBuilder,
     name: str,
     shape: Sequence[int],
     *,
@@ -374,13 +375,13 @@ def _external_buffer(
 ) -> Buffer:
     """Declare one test execution buffer."""
     if persistent:
-        return builder.persistent_buffer(
+        return program.persistent_buffer(
             name=name,
             shape=shape,
             dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
             writable=writable,
         )
-    return builder.execution_buffer(
+    return program.buffer(
         name=name,
         shape=shape,
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -396,6 +397,7 @@ def test_graph_call_has_only_physical_operands(
 ) -> None:
     """The graph ABI allocates no pointer arrays or head-layout temporaries."""
     builder = ExecutableBuilder()
+    program = builder.program(name="main")
     heads = _TEST_HEADS if operation != "policy_qk" else 1
     batch_count = 2 * heads
     specialization = BatchedMatmulSpecialization(
@@ -414,9 +416,9 @@ def test_graph_call_has_only_physical_operands(
         else (2, 16, heads * 16)
     )
     right_shape = (2, 16, heads * 16)
-    output = _external_buffer(builder, "output", output_shape, writable=True)
-    left = _external_buffer(builder, "left", left_shape)
-    right = _external_buffer(builder, "right", right_shape)
+    output = _external_buffer(program, "output", output_shape, writable=True)
+    left = _external_buffer(program, "left", left_shape)
+    right = _external_buffer(program, "right", right_shape)
     scale_name = (
         "/policy/scale/w" if operation == "policy_qk" else "/encoder0/mha/QK/scale/w"
     )
@@ -424,7 +426,7 @@ def test_graph_call_has_only_physical_operands(
         None
         if operation == "body_attention_v"
         else _external_buffer(
-            builder,
+            program,
             scale_name,
             (1,),
             persistent=True,
@@ -432,7 +434,7 @@ def test_graph_call_has_only_physical_operands(
     )
 
     batched_matmul(
-        builder,
+        program,
         KernelCache(builder),
         output,
         left,
@@ -466,23 +468,24 @@ def test_graph_call_has_only_physical_operands(
 def test_graph_dependencies_follow_physical_buffer_flow() -> None:
     """A subsequent QK read depends on the producer of its query buffer."""
     builder = ExecutableBuilder()
+    program = builder.program(name="main")
     specialization = BatchedMatmulSpecialization(
         "body_qk", 4, 16, 16, 16, _TEST_HEADS, _architecture()
     )
     kernels = KernelCache(builder)
-    first_output = _external_buffer(builder, "first_output", (4, 16, 16), writable=True)
-    final_output = _external_buffer(builder, "final_output", (4, 16, 16), writable=True)
-    queries = _external_buffer(builder, "queries", (2, 16, 32))
-    keys = _external_buffer(builder, "keys", (2, 16, 32))
+    first_output = _external_buffer(program, "first_output", (4, 16, 16), writable=True)
+    final_output = _external_buffer(program, "final_output", (4, 16, 16), writable=True)
+    queries = _external_buffer(program, "queries", (2, 16, 32))
+    keys = _external_buffer(program, "keys", (2, 16, 32))
     scale = _external_buffer(
-        builder,
+        program,
         "/encoder0/mha/QK/scale/w",
         (1,),
         persistent=True,
     )
 
     batched_matmul(
-        builder,
+        program,
         kernels,
         first_output,
         queries,
@@ -491,7 +494,7 @@ def test_graph_dependencies_follow_physical_buffer_flow() -> None:
         scale=scale,
     )
     batched_matmul(
-        builder,
+        program,
         kernels,
         final_output,
         first_output,

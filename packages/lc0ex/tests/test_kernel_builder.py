@@ -62,11 +62,12 @@ def _external(
 def test_add_kernel_and_call_serializes_generic_metadata() -> None:
     """The generic builder serializes registered pointer kernels and calls."""
     builder = _builder()
+    program = builder.program(name="main")
     kernel = builder.add_kernel(_artifact(parameters=(POINTER, POINTER, POINTER)))
     first = _external(builder, "first")
     second = _external(builder, "second")
     third = _external(builder, "third")
-    builder.call(kernel, first, second, third)
+    program.call(kernel, first, second, third)
 
     executable = builder.build()
 
@@ -89,10 +90,11 @@ def test_set_target_rejects_conflicting_architecture() -> None:
 def test_readonly_external_buffers_have_no_dependency() -> None:
     """Named persistent ranges default to readonly accesses."""
     builder = _builder()
+    program = builder.program(name="main")
     kernel = builder.add_kernel(_artifact())
     buffer = _external(builder, "weights")
-    builder.call(kernel, buffer)
-    builder.call(kernel, buffer)
+    program.call(kernel, buffer)
+    program.call(kernel, buffer)
 
     nodes = builder.build().programs[0].nodes
 
@@ -103,11 +105,12 @@ def test_readonly_external_buffers_have_no_dependency() -> None:
 def test_writer_and_reader_dependencies_follow_opaque_identity() -> None:
     """Writers order readers and later writers of the same storage handle."""
     builder = _builder()
+    program = builder.program(name="main")
     kernel = builder.add_kernel(_artifact())
     buffer = _external(builder, "output", writable=True)
-    builder.call(kernel, buffer)
-    builder.call(kernel, buffer, readonly=(buffer,))
-    builder.call(kernel, buffer)
+    program.call(kernel, buffer)
+    program.call(kernel, buffer, readonly=(buffer,))
+    program.call(kernel, buffer)
 
     nodes = builder.build().programs[0].nodes
 
@@ -118,12 +121,13 @@ def test_writer_and_reader_dependencies_follow_opaque_identity() -> None:
 def test_ordered_raw_temporaries_reuse_one_range() -> None:
     """Temporaries may alias only after dependencies order their accesses."""
     builder = _builder()
+    program = builder.program(name="main")
     kernel = builder.add_kernel(_artifact(parameters=(POINTER, POINTER)))
-    first = builder.temporary_buffer(size_bytes=64, alignment_bytes=32)
-    second = builder.temporary_buffer(size_bytes=64, alignment_bytes=32)
+    first = program.temporary_buffer(size_bytes=64, alignment_bytes=32)
+    second = program.temporary_buffer(size_bytes=64, alignment_bytes=32)
     bridge = _external(builder, "bridge", writable=True)
-    builder.call(kernel, first, bridge)
-    builder.call(kernel, bridge, second, readonly=(bridge,))
+    program.call(kernel, first, bridge)
+    program.call(kernel, bridge, second, readonly=(bridge,))
 
     executable = builder.build()
     nodes = executable.programs[0].nodes
@@ -139,11 +143,12 @@ def test_ordered_raw_temporaries_reuse_one_range() -> None:
 def test_independent_raw_temporaries_do_not_reuse_storage() -> None:
     """Potentially concurrent temporary accesses require distinct ranges."""
     builder = _builder()
+    program = builder.program(name="main")
     kernel = builder.add_kernel(_artifact())
-    first = builder.temporary_buffer(size_bytes=64, alignment_bytes=32)
-    second = builder.temporary_buffer(size_bytes=64, alignment_bytes=32)
-    builder.call(kernel, first)
-    builder.call(kernel, second)
+    first = program.temporary_buffer(size_bytes=64, alignment_bytes=32)
+    second = program.temporary_buffer(size_bytes=64, alignment_bytes=32)
+    program.call(kernel, first)
+    program.call(kernel, second)
 
     executable = builder.build()
 
@@ -153,6 +158,7 @@ def test_independent_raw_temporaries_do_not_reuse_storage() -> None:
 def test_call_rejects_foreign_and_non_pointer_handles() -> None:
     """Kernel calls retain ownership and pointer-ABI validation."""
     builder = _builder()
+    program = builder.program(name="main")
     foreign = _builder()
     foreign_buffer = _external(foreign, "foreign")
     pointer_kernel = builder.add_kernel(_artifact())
@@ -160,9 +166,9 @@ def test_call_rejects_foreign_and_non_pointer_handles() -> None:
     local_buffer = _external(builder, "local")
 
     with pytest.raises(ValueError, match="belong"):
-        builder.call(pointer_kernel, foreign_buffer)
+        program.call(pointer_kernel, foreign_buffer)
     with pytest.raises(ValueError, match="pointer"):
-        builder.call(u32_kernel, local_buffer)
+        program.call(u32_kernel, local_buffer)
 
 
 def test_add_kernel_deduplicates_identical_artifacts() -> None:
@@ -178,6 +184,7 @@ def test_add_kernel_deduplicates_identical_artifacts() -> None:
 def test_symbol_argument_serializes_as_immutable_module_pointer() -> None:
     """A module symbol is a pointer argument, not a callable graph node."""
     builder = _builder()
+    program = builder.program(name="main")
     kernel = builder.add_kernel(_artifact(parameters=(POINTER, POINTER)))
     output = _external(builder, "output", writable=True)
     symbol = builder.add_symbol(
@@ -187,7 +194,7 @@ def test_symbol_argument_serializes_as_immutable_module_pointer() -> None:
             symbol_name="mapping_table",
         )
     )
-    builder.call(kernel, output, symbol)
+    program.call(kernel, output, symbol)
 
     executable = builder.build()
     argument = executable.programs[0].nodes[0].arguments[1]

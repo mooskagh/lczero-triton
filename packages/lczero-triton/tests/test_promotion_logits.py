@@ -5,7 +5,7 @@ from dataclasses import fields
 
 import pytest
 import torch
-from lc0ex import Buffer, ExecutableBuilder
+from lc0ex import Buffer, ExecutableBuilder, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lczero_triton.bt4.kernels._cache import KernelCache
 from lczero_triton.bt4.kernels.promotion_logits import (
@@ -123,12 +123,13 @@ def test_specialization_rejects_invalid_static_values(
 def test_graph_alias_validation_precedes_compilation() -> None:
     """The writable policy record cannot also be a projection input."""
     builder = ExecutableBuilder()
-    buffer = builder.temporary_buffer(size_bytes=2, alignment_bytes=2)
+    program = builder.program(name="main")
+    buffer = program.temporary_buffer(size_bytes=2, alignment_bytes=2)
     specialization = PromotionLogitsSpecialization(1, 16, 80)
 
     with pytest.raises(ValueError, match="cannot alias"):
         promotion_logits(
-            builder,
+            program,
             KernelCache(builder),
             buffer,
             buffer,
@@ -240,7 +241,7 @@ def test_compilation_captures_selected_launch_and_pointer_abi() -> None:
 
 
 def _external_buffer(
-    builder: ExecutableBuilder,
+    program: ProgramBuilder,
     name: str,
     shape: Sequence[int],
     *,
@@ -249,13 +250,13 @@ def _external_buffer(
 ) -> Buffer:
     """Declare one FP16 external buffer for graph tests."""
     if persistent:
-        return builder.persistent_buffer(
+        return program.persistent_buffer(
             name=name,
             shape=shape,
             dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
             writable=writable,
         )
-    return builder.execution_buffer(
+    return program.buffer(
         name=name,
         shape=shape,
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -268,16 +269,17 @@ def _external_buffer(
 def test_graph_call_uses_in_place_records_and_tracks_dependencies() -> None:
     """Promotion calls expose only physical tensors and serialize record writes."""
     builder = ExecutableBuilder()
+    program = builder.program(name="main")
     specialization = PromotionLogitsSpecialization(2, 32, _architecture())
     policy_records = _external_buffer(
-        builder,
+        program,
         "policy_records",
         (2, _POLICY_RECORD_SIZE),
         writable=True,
     )
-    policy_keys = _external_buffer(builder, "policy_keys", (2, 64, 32))
+    policy_keys = _external_buffer(program, "policy_keys", (2, 64, 32))
     weights = _external_buffer(
-        builder,
+        program,
         "/policy/promotion/matmul/w",
         (32, 4),
         persistent=True,
@@ -285,7 +287,7 @@ def test_graph_call_uses_in_place_records_and_tracks_dependencies() -> None:
     kernels = KernelCache(builder)
 
     promotion_logits(
-        builder,
+        program,
         kernels,
         policy_records,
         policy_keys,
@@ -293,7 +295,7 @@ def test_graph_call_uses_in_place_records_and_tracks_dependencies() -> None:
         specialization,
     )
     promotion_logits(
-        builder,
+        program,
         kernels,
         policy_records,
         policy_keys,

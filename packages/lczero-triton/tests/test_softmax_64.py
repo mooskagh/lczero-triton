@@ -5,7 +5,7 @@ from dataclasses import fields
 
 import pytest
 import torch
-from lc0ex import Buffer, ExecutableBuilder
+from lc0ex import Buffer, ExecutableBuilder, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lczero_triton.bt4.kernels._cache import KernelCache
 from lczero_triton.bt4.kernels.softmax_64 import (
@@ -211,14 +211,14 @@ def test_compilation_captures_selected_launch_and_pointer_abi() -> None:
 
 
 def _external_buffer(
-    builder: ExecutableBuilder,
+    program: ProgramBuilder,
     name: str,
     shape: Sequence[int],
     *,
     writable: bool = False,
 ) -> Buffer:
     """Declare one FP16 execution buffer for graph tests."""
-    return builder.execution_buffer(
+    return program.buffer(
         name=name,
         shape=shape,
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
@@ -231,15 +231,16 @@ def _external_buffer(
 def test_graph_call_preserves_in_place_abi_and_dependencies() -> None:
     """An in-place QK write remains visible to the following attention consumer."""
     builder = ExecutableBuilder()
+    program = builder.program(name="main")
     shape = (4, _SOFTMAX_WIDTH)
-    scaled_qk = _external_buffer(builder, "scaled_qk", shape, writable=True)
-    smolgen = _external_buffer(builder, "smolgen", shape)
-    output = _external_buffer(builder, "output", shape, writable=True)
+    scaled_qk = _external_buffer(program, "scaled_qk", shape, writable=True)
+    smolgen = _external_buffer(program, "smolgen", shape)
+    output = _external_buffer(program, "output", shape, writable=True)
     specialization = Softmax64Specialization(4, _architecture())
     kernels = KernelCache(builder)
 
     softmax_64(
-        builder,
+        program,
         kernels,
         scaled_qk,
         scaled_qk,
@@ -247,7 +248,7 @@ def test_graph_call_preserves_in_place_abi_and_dependencies() -> None:
         specialization,
     )
     softmax_64(
-        builder,
+        program,
         kernels,
         output,
         scaled_qk,

@@ -119,11 +119,12 @@ def test_same_named_buffers_are_private_to_programs() -> None:
     assert tuple(executable.programs[1].buffers[0].shape) == (2,)
 
 
-def test_temporary_buffer_uses_the_implicit_program() -> None:
-    """Anonymous raw ranges are owned by the implicit program."""
+def test_temporary_buffer_is_owned_by_its_program() -> None:
+    """Anonymous raw ranges are owned by their explicit program."""
     builder = _builder()
+    program = builder.program(name="main")
 
-    result = builder.temporary_buffer(size_bytes=2, alignment_bytes=2)
+    result = program.temporary_buffer(size_bytes=2, alignment_bytes=2)
 
     assert isinstance(result, Buffer)
 
@@ -131,7 +132,8 @@ def test_temporary_buffer_uses_the_implicit_program() -> None:
 def test_temporary_buffer_is_omitted_when_not_used_by_a_program() -> None:
     """Unused anonymous ranges do not force an execution allocation."""
     builder = _builder()
-    builder.temporary_buffer(size_bytes=128, alignment_bytes=64)
+    program = builder.program(name="main")
+    program.temporary_buffer(size_bytes=128, alignment_bytes=64)
 
     assert not builder.build().programs[0].HasField("execution_allocation")
 
@@ -155,9 +157,10 @@ def test_temporary_buffer_is_packed_in_program_allocation() -> None:
 def test_temporary_buffer_rejects_invalid_size(size_bytes: int) -> None:
     """Raw internal storage must have a positive uint64 byte count."""
     builder = _builder()
+    program = builder.program(name="main")
 
     with pytest.raises(ValueError, match="positive uint64"):
-        builder.temporary_buffer(size_bytes=size_bytes, alignment_bytes=1)
+        program.temporary_buffer(size_bytes=size_bytes, alignment_bytes=1)
 
 
 def test_named_execution_buffers_serialize_in_program_allocation() -> None:

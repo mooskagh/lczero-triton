@@ -109,19 +109,20 @@ def test_real_compilation_produces_pointer_abi_and_static_launch() -> None:
 def test_copy_graph_call_preserves_output_input_argument_order() -> None:
     """The family API serializes destination before its readonly source."""
     builder = ExecutableBuilder()
-    output = builder.execution_buffer(
+    program = builder.program(name="main")
+    output = program.buffer(
         name="output",
         shape=(257,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F32,
         writable=True,
     )
-    input_ = builder.execution_buffer(
+    input_ = program.buffer(
         name="input",
         shape=(257,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
     )
     copy_type_converted(
-        builder,
+        program,
         KernelCache(builder),
         output,
         input_,
@@ -204,21 +205,22 @@ def test_remaining_step_five_families_capture_autotuned_artifacts() -> None:
 def test_policy_map_serializes_embedded_symbol_argument() -> None:
     """Policy gathering uses a module symbol rather than an external buffer."""
     builder = ExecutableBuilder()
-    output = builder.execution_buffer(
+    program = builder.program(name="main")
+    output = program.buffer(
         name="output",
         shape=(2, 1858),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
         writable=True,
     )
-    input_ = builder.execution_buffer(
+    input_ = program.buffer(
         name="input",
         shape=(2, 4288),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
     )
     architecture = _architecture()
-    mapping = builder.add_symbol(compile_symbol(architecture=f"sm_{architecture}"))
+    mapping = program.add_symbol(compile_symbol(architecture=f"sm_{architecture}"))
     policy_map(
-        builder,
+        program,
         KernelCache(builder),
         output,
         input_,

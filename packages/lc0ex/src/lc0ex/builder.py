@@ -6,7 +6,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Self
 
-from lc0ex.buffer_builder import Allocation, AllocationPlan, Buffer, BufferBuilder
+from lc0ex.buffer_builder import AllocationPlan, Buffer, BufferBuilder
 from lc0ex.kernel_builder import (
     KernelArtifact,
     KernelHandle,
@@ -17,7 +17,6 @@ from lc0ex.proto import lc0ex_pb2
 
 _MAGIC = 0x1C0E
 _FORMAT = 1
-_PROGRAM_NAME = "main"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,20 +53,6 @@ class ProgramBuilder:
         """Return the immutable program name."""
         return self._name
 
-    @property
-    def allocation(self) -> Allocation:
-        """Return this program's private execution allocation."""
-        return self._allocation
-
-    def __enter__(self) -> Self:
-        """Make this program the target of owner-level graph calls."""
-        self._owner._push_program(self)  # noqa: SLF001
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        """Restore the previous active program."""
-        self._owner._pop_program(self)  # noqa: SLF001
-
     def buffer(
         self,
         *,
@@ -94,6 +79,33 @@ class ProgramBuilder:
             size_bytes=size_bytes,
             alignment_bytes=alignment_bytes,
         )
+
+    def persistent_buffer(
+        self,
+        *,
+        name: str,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+        writable: bool = False,
+        alignment_bytes: int | None = None,
+    ) -> Buffer:
+        """Create a named persistent buffer in the executable allocation."""
+        return self._owner.persistent_buffer(
+            name=name,
+            shape=shape,
+            dtype=dtype,
+            writable=writable,
+            alignment_bytes=alignment_bytes,
+        )
+
+    def set_target(
+        self,
+        vendor: lc0ex_pb2.Target.Vendor,
+        architecture: str,
+    ) -> Self:
+        """Set the executable target and return this program builder."""
+        self._owner.set_target(vendor, architecture)
+        return self
 
     def add_kernel(self, kernel: KernelArtifact) -> KernelHandle:
         """Register a kernel in the owning executable."""
@@ -134,9 +146,7 @@ class ExecutableBuilder:
         self._symbols: dict[SymbolHandle, SymbolArtifact] = {}
         self._symbol_handles: dict[SymbolArtifact, SymbolHandle] = {}
         self._programs: list[ProgramBuilder] = []
-        self._program_indices: dict[str, ProgramBuilder] = {}
-        self._active_programs: list[ProgramBuilder] = []
-        self._default_program: ProgramBuilder | None = None
+        self._program_names: set[str] = set()
         self._program_token = object()
 
     def persistent_buffer(
@@ -158,31 +168,6 @@ class ExecutableBuilder:
             alignment_bytes=alignment_bytes,
         )
 
-    def execution_buffer(
-        self,
-        *,
-        name: str,
-        shape: Sequence[int],
-        dtype: lc0ex_pb2.Buffer.DataType,
-        writable: bool = False,
-        alignment_bytes: int | None = None,
-    ) -> Buffer:
-        """Create a named buffer in the implicit single program."""
-        return self._get_default_program().buffer(
-            name=name,
-            shape=shape,
-            dtype=dtype,
-            writable=writable,
-            alignment_bytes=alignment_bytes,
-        )
-
-    def temporary_buffer(self, *, size_bytes: int, alignment_bytes: int) -> Buffer:
-        """Create a raw buffer in the implicit single program."""
-        return self._get_default_program().temporary_buffer(
-            size_bytes=size_bytes,
-            alignment_bytes=alignment_bytes,
-        )
-
     def program(
         self,
         *,
@@ -193,13 +178,13 @@ class ExecutableBuilder:
         if not name:
             message = "program name cannot be empty"
             raise ValueError(message)
-        if name in self._program_indices:
+        if name in self._program_names:
             message = f"program {name!r} already exists"
             raise ValueError(message)
         normalized_metadata = None if metadata is None else bytes(metadata)
         result = ProgramBuilder(self, name, normalized_metadata, self._program_token)
         self._programs.append(result)
-        self._program_indices[name] = result
+        self._program_names.add(name)
         return result
 
     def set_target(
@@ -262,20 +247,6 @@ class ExecutableBuilder:
         self._symbol_handles[symbol] = handle
         return handle
 
-    def call(
-        self,
-        kernel: KernelHandle,
-        *arguments: Buffer | SymbolHandle,
-        readonly: Sequence[Buffer] = (),
-    ) -> None:
-        """Append a call to the active or inferred program."""
-        self._call_in_program(
-            self._infer_program(arguments),
-            kernel,
-            *arguments,
-            readonly=readonly,
-        )
-
     def build(self) -> lc0ex_pb2.NeuralExecutable:
         """Create and return a new neural executable."""
         executable = lc0ex_pb2.NeuralExecutable(magic=_MAGIC, format=_FORMAT)
@@ -332,57 +303,6 @@ class ExecutableBuilder:
         output_path.write_bytes(executable.SerializeToString())
         return executable
 
-    def _push_program(self, program: ProgramBuilder) -> None:
-        """Push a program onto the active graph target stack."""
-        if program._owner is not self:  # noqa: SLF001
-            message = "program does not belong to this executable builder"
-            raise ValueError(message)
-        self._active_programs.append(program)
-
-    def _pop_program(self, program: ProgramBuilder) -> None:
-        """Pop the expected active graph target."""
-        if not self._active_programs or self._active_programs[-1] is not program:
-            message = "program context is not the active builder context"
-            raise RuntimeError(message)
-        self._active_programs.pop()
-
-    def _get_default_program(self) -> ProgramBuilder:
-        """Create the implicit single-program graph when needed."""
-        if self._default_program is None:
-            existing = self._program_indices.get(_PROGRAM_NAME)
-            self._default_program = (
-                existing if existing is not None else self.program(name=_PROGRAM_NAME)
-            )
-        return self._default_program
-
-    def _infer_program(
-        self,
-        arguments: tuple[Buffer | SymbolHandle, ...],
-    ) -> ProgramBuilder:
-        """Infer a program from active context and execution buffers."""
-        if self._active_programs:
-            return self._active_programs[-1]
-        programs = {
-            self._program_for_buffer(argument)
-            for argument in arguments
-            if isinstance(argument, Buffer)
-            and self._buffers.owns(argument)
-            and not self._buffers.allocation_of(argument).is_persistent()
-        }
-        if len(programs) > 1:
-            message = "kernel arguments belong to different programs"
-            raise ValueError(message)
-        return next(iter(programs), self._get_default_program())
-
-    def _program_for_buffer(self, buffer: Buffer) -> ProgramBuilder:
-        """Find the program owning an execution buffer."""
-        allocation = self._buffers.allocation_of(buffer)
-        for program in self._programs:
-            if program._allocation is allocation:  # noqa: SLF001
-                return program
-        message = "execution buffer does not belong to a known program"
-        raise RuntimeError(message)
-
     def _call_in_program(
         self,
         program: ProgramBuilder,
@@ -430,13 +350,13 @@ class ExecutableBuilder:
         ):
             message = "read-only buffers must be kernel arguments"
             raise ValueError(message)
-        execution_programs = {
-            self._program_for_buffer(argument)
+        execution_allocations = {
+            self._buffers.allocation_of(argument)
             for argument in arguments
             if isinstance(argument, Buffer)
             and not self._buffers.allocation_of(argument).is_persistent()
         }
-        if execution_programs and execution_programs != {program}:
+        if execution_allocations and execution_allocations != {program._allocation}:  # noqa: SLF001
             message = "kernel arguments belong to a different program"
             raise ValueError(message)
 

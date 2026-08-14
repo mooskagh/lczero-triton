@@ -20,38 +20,6 @@ class Allocation:
         """Return whether this allocation belongs to the executable."""
         return self._persistent
 
-    def external_buffer(
-        self,
-        *,
-        name: str,
-        shape: Sequence[int],
-        dtype: lc0ex_pb2.Buffer.DataType,
-        writable: bool = False,
-        alignment_bytes: int | None = None,
-    ) -> "Buffer":
-        """Create or retrieve a named external buffer in this allocation."""
-        return self._owner.external_buffer(
-            self,
-            name=name,
-            shape=shape,
-            dtype=dtype,
-            writable=writable,
-            alignment_bytes=alignment_bytes,
-        )
-
-    def temporary_buffer(
-        self,
-        *,
-        size_bytes: int,
-        alignment_bytes: int,
-    ) -> "Buffer":
-        """Create an unnamed reusable range in this allocation."""
-        return self._owner.temporary_buffer(
-            self,
-            size_bytes=size_bytes,
-            alignment_bytes=alignment_bytes,
-        )
-
     def belongs_to(self, owner: "BufferBuilder") -> bool:
         """Return whether this allocation belongs to *owner*."""
         return self._owner is owner
