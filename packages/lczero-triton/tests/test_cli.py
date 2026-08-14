@@ -67,11 +67,11 @@ def test_main_keeps_artifact_path_on_stdout_and_progress_on_stderr(
         builder: _Builder,
         network: object,
         *,
-        batch_sizes: list[int] | None,
+        batch_sizes: list[int],
     ) -> None:
         assert isinstance(builder, _Builder)
         assert network is object_network
-        assert batch_sizes == [1]
+        assert batch_sizes == [169]
         sys.stdout.write("autotuning progress\n")
 
     monkeypatch.setattr(cli, "ExecutableBuilder", _Builder)
@@ -88,8 +88,6 @@ def test_main_keeps_artifact_path_on_stdout_and_progress_on_stderr(
                 "network.pb.gz",
                 "--output",
                 "output.lc0ex",
-                "--batch-size",
-                "1",
             ]
         )
         == 0

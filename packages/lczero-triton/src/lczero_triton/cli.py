@@ -15,6 +15,7 @@ from lczero_triton.bt4.network import build
 
 _LOGGER = logging.getLogger(__name__)
 _AUTOTUNE_PRINT_ENV = "TRITON_PRINT_AUTOTUNING"
+_DEFAULT_BATCH_SIZE = 169
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -27,7 +28,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     builder = ExecutableBuilder()
     _LOGGER.info("starting graph construction")
     with _autotune_progress(), redirect_stdout(sys.stderr):
-        build(builder, network, batch_sizes=arguments.batch_sizes)
+        build(
+            builder,
+            network,
+            batch_sizes=arguments.batch_sizes or [_DEFAULT_BATCH_SIZE],
+        )
     _LOGGER.info("serializing executable to %s", arguments.output)
     builder.build_and_write(arguments.output)
     sys.stdout.write(f"{arguments.output}\n")

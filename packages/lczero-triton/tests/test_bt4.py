@@ -22,7 +22,6 @@ import net_pb2
 import pytest
 from lc0ex import Buffer, ExecutableBuilder, KernelArtifact, SymbolArtifact
 from lc0ex.proto import lc0ex_pb2
-from lczero_triton.bt4._format import NetworkFormatError
 from lczero_triton.bt4.kernels.add_bias_batched import (
     AddBiasBatchedSpecialization,
 )
@@ -47,7 +46,6 @@ from lczero_triton.bt4.kernels.softmax_64 import Softmax64Specialization
 from lczero_triton.bt4.network import (
     _BuildContext,
     _default_activation,
-    _layer_elements,
     _resolve_activation,
     build,
 )
@@ -571,15 +569,6 @@ def _present_fingerprint_layers(
 def test_build_entry_point_is_importable() -> None:
     """BT4 graph construction is exposed through the protobuf-driven API."""
     assert callable(build)
-
-
-def test_build_rejects_non_positive_batch_sizes_before_network_validation() -> None:
-    """Invalid batches fail before allocations or protobuf traversal."""
-    with pytest.raises(
-        ValueError,
-        match="batch_sizes must contain only positive values",
-    ):
-        build(ExecutableBuilder(), net_pb2.Net(), batch_sizes=(0,))
 
 
 def test_build_normalizes_and_builds_encoder(
@@ -1173,63 +1162,6 @@ def test_policy_embedding_prefers_head_local_weights(
     assert buffers["/policy/dense1/matmul/w"] == (16, 10)
 
 
-def test_output_heads_reject_wrong_terminal_width(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Semantic output widths are fixed even though hidden widths are inferred."""
-    network = _embedding_network(encoding_width=1, body_width=16, hidden_width=24)
-    _add_output_heads(
-        network,
-        body_width=16,
-        policy_width=12,
-        policy_model_width=8,
-        value_width=4,
-        value_hidden_width=6,
-        moves_width=3,
-        moves_hidden_width=5,
-    )
-    _set_elements(network.weights.value_heads.winner.ip2_val_w, 6 * 2)
-    _stub_head_compilers(monkeypatch)
-    monkeypatch.setattr(network_module, "_encoder_tower", _keep_body)
-
-    with pytest.raises(NetworkFormatError, match="/output/wdl output"):
-        build(ExecutableBuilder(), network, batch_sizes=(1,))
-
-
-def test_embedding_rejects_matrix_count_not_divisible_by_input_width(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A matrix output width must be inferable from its known operation input."""
-    network = _embedding_network(encoding_width=1, body_width=16, hidden_width=32)
-    _set_elements(network.weights.ip_emb_ffn.dense1_w, 16 * 32 + 1)
-    _stub_compilers(monkeypatch)
-    _stop_after_embedding(monkeypatch)
-
-    with pytest.raises(
-        NetworkFormatError,
-        match=r"weights\.ip_emb_ffn\.dense1_w: .*not divisible",
-    ):
-        build(ExecutableBuilder(), network, batch_sizes=(2,))
-
-
-def test_layer_elements_uses_layer_encoding_override() -> None:
-    """A layer encoding supersedes the enclosing file encoding."""
-    layer = net_pb2.Weights.Layer(
-        params=b"\0\0",
-        encoding=net_pb2.Weights.Layer.LINEAR16,
-    )
-
-    assert _layer_elements(layer, net_pb2.Format.UNKNOWN, path="weights.layer") == 1
-
-
-def test_layer_elements_rejects_odd_payload() -> None:
-    """LINEAR16 dimensions require whole encoded half values."""
-    layer = net_pb2.Weights.Layer(params=b"\0")
-
-    with pytest.raises(NetworkFormatError, match=r"weights\.layer: LINEAR16 payload"):
-        _layer_elements(layer, net_pb2.Format.LINEAR16, path="weights.layer")
-
-
 @pytest.mark.parametrize(
     ("default", "expected"),
     [
@@ -1255,7 +1187,6 @@ def test_explicit_activation_overrides_default() -> None:
         _resolve_activation(
             net_pb2.NetworkFormat.ACTIVATION_SWISH,
             net_pb2.NetworkFormat.ACTIVATION_MISH,
-            path="format.network_format.smolgen_activation",
         )
         == net_pb2.NetworkFormat.ACTIVATION_SWISH
     )

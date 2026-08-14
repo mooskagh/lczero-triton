@@ -10,7 +10,6 @@ from lc0ex import Buffer, ExecutableBuilder, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 
 from lczero_triton.bt4._format import (
-    NetworkFormatError,
     normalize_network,
     validate_network_format,
 )
@@ -68,7 +67,6 @@ from lczero_triton.bt4.kernels.softmax_64 import (
 )
 
 _F16_SIZE_BYTES = 2
-_DEFAULT_BATCH_SIZE = 169
 _INPUT_CHANNELS = 112
 _POSITION_CHANNELS = 12
 _SQUARE_COUNT = 64
@@ -83,10 +81,6 @@ class _BuildContext:
     kernels: KernelCache
     batch_size: int
     architecture: int
-    default_encoding: net_pb2.Format.Encoding
-    default_activation: net_pb2.NetworkFormat.ActivationFunction
-    ffn_activation: net_pb2.NetworkFormat.ActivationFunction
-    smolgen_activation: net_pb2.NetworkFormat.ActivationFunction
     fingerprint: net_pb2.Net
     fingerprint_layers: dict[str, net_pb2.Weights.Layer]
 
@@ -95,11 +89,9 @@ def build(
     builder: ExecutableBuilder,
     network: net_pb2.Net,
     *,
-    batch_sizes: Sequence[int] | None = None,
+    batch_sizes: Sequence[int],
 ) -> None:
     """Traverse the active network and append one or more batch programs."""
-    sizes = _normalize_batch_sizes(batch_sizes)
-
     _LOGGER.info("normalizing and validating BT4 network")
     normalize_network(network)
     validate_network_format(network)
@@ -108,12 +100,10 @@ def build(
     ffn_activation = _resolve_activation(
         network_format.ffn_activation,
         default_activation,
-        path="format.network_format.ffn_activation",
     )
     smolgen_activation = _resolve_activation(
         network_format.smolgen_activation,
         default_activation,
-        path="format.network_format.smolgen_activation",
     )
     fingerprint, fingerprint_layers = _fingerprint_network(
         network,
@@ -123,11 +113,11 @@ def build(
     kernels = KernelCache(builder)
     _LOGGER.info(
         "building BT4 graph for batch sizes %s with %d encoder layers",
-        sizes,
+        batch_sizes,
         len(network.weights.encoder),
     )
-    for size in sizes:
-        program_name = "main" if len(sizes) == 1 else f"batch-{size}"
+    for size in batch_sizes:
+        program_name = "main" if len(batch_sizes) == 1 else f"batch-{size}"
         _LOGGER.info("building program %s for batch size %d", program_name, size)
         program = builder.program(name=program_name)
         context = _BuildContext(
@@ -135,10 +125,6 @@ def build(
             kernels=kernels,
             batch_size=size,
             architecture=active_architecture(),
-            default_encoding=network.format.weights_encoding,
-            default_activation=default_activation,
-            ffn_activation=ffn_activation,
-            smolgen_activation=smolgen_activation,
             fingerprint=fingerprint,
             fingerprint_layers=fingerprint_layers,
         )
@@ -146,23 +132,6 @@ def build(
         _LOGGER.info("finished program %s", program_name)
     builder.set_metadata(fingerprint.SerializeToString(deterministic=True))
     _LOGGER.info("finished BT4 graph construction")
-
-
-def _normalize_batch_sizes(
-    batch_sizes: Sequence[int] | None,
-) -> tuple[int, ...]:
-    """Validate and normalize the requested fixed batch program sizes."""
-    sizes = (_DEFAULT_BATCH_SIZE,) if batch_sizes is None else tuple(batch_sizes)
-    if not sizes:
-        message = "batch_sizes must not be empty"
-        raise ValueError(message)
-    if any(size <= 0 for size in sizes):
-        message = "batch_sizes must contain only positive values"
-        raise ValueError(message)
-    if len(set(sizes)) != len(sizes):
-        message = "batch_sizes must not contain duplicates"
-        raise ValueError(message)
-    return sizes
 
 
 def _network(context: _BuildContext, weights: net_pb2.Weights) -> None:
@@ -361,26 +330,12 @@ def _inputs(context: _BuildContext) -> tuple[Buffer, Buffer]:
     return masks, values
 
 
-def _embedding(  # noqa: PLR0915
+def _embedding(
     context: _BuildContext,
     inputs: tuple[Buffer, Buffer],
     weights: net_pb2.Weights,
 ) -> tuple[Buffer, int]:
     """Build dense positional preprocessing, gated embedding, and embedding FFN."""
-    if weights.residual:
-        message = "weights.residual: convolutional input towers are not supported"
-        raise NetworkFormatError(message)
-    _require_activation(
-        context.default_activation,
-        net_pb2.NetworkFormat.ACTIVATION_MISH,
-        path="format.network_format.default_activation",
-    )
-    _require_activation(
-        context.ffn_activation,
-        net_pb2.NetworkFormat.ACTIVATION_MISH,
-        path="format.network_format.ffn_activation",
-    )
-
     position_input_width = _SQUARE_COUNT * _POSITION_CHANNELS
     position_weights, position_output_width = _matrix_f16(
         context,
@@ -389,25 +344,13 @@ def _embedding(  # noqa: PLR0915
         name="/attn_body/embedding/preprocess/matmul/w",
         path="weights.ip_emb_preproc_w",
     )
-    position_bias, position_bias_width = _vector_f16(
+    position_bias = _vector_f16(
         context,
         weights.ip_emb_preproc_b,
         name="/attn_body/embedding/preprocess/add/w",
         path="weights.ip_emb_preproc_b",
     )
-    _require_equal_widths(
-        position_bias_width,
-        position_output_width,
-        path="weights.ip_emb_preproc_b",
-        expected_path="weights.ip_emb_preproc_w output",
-    )
-    encoding_width, remainder = divmod(position_output_width, _SQUARE_COUNT)
-    if remainder:
-        message = (
-            "weights.ip_emb_preproc_w: output width must contain an integral "
-            "number of channels for every square"
-        )
-        raise NetworkFormatError(message)
+    encoding_width = position_output_width // _SQUARE_COUNT
 
     embedding_input_width = _INPUT_CHANNELS + encoding_width
     embedding_weights, body_width = _matrix_f16(
@@ -417,50 +360,39 @@ def _embedding(  # noqa: PLR0915
         name="/attn_body/matmul/w",
         path="weights.ip_emb_w",
     )
-    embedding_bias, embedding_bias_width = _vector_f16(
+    embedding_bias = _vector_f16(
         context,
         weights.ip_emb_b,
         name="/attn_body/add/w",
         path="weights.ip_emb_b",
     )
-    _require_equal_widths(
-        embedding_bias_width,
-        body_width,
-        path="weights.ip_emb_b",
-        expected_path="weights.ip_emb_w output",
-    )
-    embedding_gammas, gamma_width = _vector_f16(
+    embedding_gammas = _vector_f16(
         context,
         weights.ip_emb_ln_gammas,
         name="/attn_body/ln/w/scale",
         path="weights.ip_emb_ln_gammas",
     )
-    embedding_betas, beta_width = _vector_f16(
+    embedding_betas = _vector_f16(
         context,
         weights.ip_emb_ln_betas,
         name="/attn_body/ln/w/bias",
         path="weights.ip_emb_ln_betas",
     )
-    _require_body_width(gamma_width, body_width, path="weights.ip_emb_ln_gammas")
-    _require_body_width(beta_width, body_width, path="weights.ip_emb_ln_betas")
 
-    multiplicative_gate, multiplicative_width = _matrix_f16(
+    multiplicative_gate, _ = _matrix_f16(
         context,
         weights.ip_mult_gate,
         input_width=_SQUARE_COUNT,
         name="/ip_mul_gate/w",
         path="weights.ip_mult_gate",
     )
-    additive_gate, additive_width = _matrix_f16(
+    additive_gate, _ = _matrix_f16(
         context,
         weights.ip_add_gate,
         input_width=_SQUARE_COUNT,
         name="/ip_add_gate/w",
         path="weights.ip_add_gate",
     )
-    _require_body_width(multiplicative_width, body_width, path="weights.ip_mult_gate")
-    _require_body_width(additive_width, body_width, path="weights.ip_add_gate")
-
     dense1_weights, hidden_width = _matrix_f16(
         context,
         weights.ip_emb_ffn.dense1_w,
@@ -468,39 +400,23 @@ def _embedding(  # noqa: PLR0915
         name="/attn_body/ffn/dense1/w/w",
         path="weights.ip_emb_ffn.dense1_w",
     )
-    dense1_bias, dense1_bias_width = _vector_f16(
+    dense1_bias = _vector_f16(
         context,
         weights.ip_emb_ffn.dense1_b,
         name="/attn_body/ffn/dense1/b/w",
         path="weights.ip_emb_ffn.dense1_b",
     )
-    _require_equal_widths(
-        dense1_bias_width,
-        hidden_width,
-        path="weights.ip_emb_ffn.dense1_b",
-        expected_path="weights.ip_emb_ffn.dense1_w output",
-    )
-    dense2_weights, dense2_width = _matrix_f16(
+    dense2_weights, _ = _matrix_f16(
         context,
         weights.ip_emb_ffn.dense2_w,
         input_width=hidden_width,
         name="/attn_body/ffn/dense2/w/w",
         path="weights.ip_emb_ffn.dense2_w",
     )
-    _require_body_width(
-        dense2_width,
-        body_width,
-        path="weights.ip_emb_ffn.dense2_w output",
-    )
-    dense2_bias, dense2_bias_width = _vector_f16(
+    dense2_bias = _vector_f16(
         context,
         weights.ip_emb_ffn.dense2_b,
         name="/attn_body/ffn/dense2/b/w",
-        path="weights.ip_emb_ffn.dense2_b",
-    )
-    _require_body_width(
-        dense2_bias_width,
-        body_width,
         path="weights.ip_emb_ffn.dense2_b",
     )
     alpha = context.builder.persistent_buffer(
@@ -508,26 +424,16 @@ def _embedding(  # noqa: PLR0915
         shape=(1,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
     )
-    ffn_gammas, ffn_gamma_width = _vector_f16(
+    ffn_gammas = _vector_f16(
         context,
         weights.ip_emb_ffn_ln_gammas,
         name="/attn_body/ln2/w/scale",
         path="weights.ip_emb_ffn_ln_gammas",
     )
-    ffn_betas, ffn_beta_width = _vector_f16(
+    ffn_betas = _vector_f16(
         context,
         weights.ip_emb_ffn_ln_betas,
         name="/attn_body/ln2/w/bias",
-        path="weights.ip_emb_ffn_ln_betas",
-    )
-    _require_body_width(
-        ffn_gamma_width,
-        body_width,
-        path="weights.ip_emb_ffn_ln_gammas",
-    )
-    _require_body_width(
-        ffn_beta_width,
-        body_width,
         path="weights.ip_emb_ffn_ln_betas",
     )
 
@@ -795,11 +701,6 @@ def _smolgen(  # noqa: PLR0913
     head_count: int,
 ) -> tuple[Buffer, int]:
     """Build local Smolgen compression and its two normalized dense layers."""
-    _require_activation(
-        context.smolgen_activation,
-        net_pb2.NetworkFormat.ACTIVATION_SWISH,
-        path="format.network_format.smolgen_activation",
-    )
     smolgen = encoder.mha.smolgen
     path = f"weights.{prefix[1:]}.mha.smolgen"
     compress_weights, compression_width = _matrix_f16(
@@ -816,41 +717,23 @@ def _smolgen(  # noqa: PLR0913
         name=f"{prefix}/smolgen/dense1/w/w",
         path=f"{path}.dense1_w",
     )
-    dense1_bias, dense1_bias_width = _vector_f16(
+    dense1_bias = _vector_f16(
         context,
         smolgen.dense1_b,
         name=f"{prefix}/smolgen/dense1/b/w",
         path=f"{path}.dense1_b",
     )
-    _require_equal_widths(
-        dense1_bias_width,
-        hidden_width,
-        path=f"{path}.dense1_b",
-        expected_path=f"{path}.dense1_w output",
-    )
-    ln1_gammas, ln1_gamma_width = _vector_f16(
+    ln1_gammas = _vector_f16(
         context,
         smolgen.ln1_gammas,
         name=f"{prefix}/smolgen/ln1/w/scale",
         path=f"{path}.ln1_gammas",
     )
-    ln1_betas, ln1_beta_width = _vector_f16(
+    ln1_betas = _vector_f16(
         context,
         smolgen.ln1_betas,
         name=f"{prefix}/smolgen/ln1/w/bias",
         path=f"{path}.ln1_betas",
-    )
-    _require_equal_widths(
-        ln1_gamma_width,
-        hidden_width,
-        path=f"{path}.ln1_gammas",
-        expected_path=f"{path}.dense1_w output",
-    )
-    _require_equal_widths(
-        ln1_beta_width,
-        hidden_width,
-        path=f"{path}.ln1_betas",
-        expected_path=f"{path}.dense1_w output",
     )
     dense2_weights, generated_total_width = _matrix_f16(
         context,
@@ -859,39 +742,25 @@ def _smolgen(  # noqa: PLR0913
         name=f"{prefix}/smolgen/dense2/w/w",
         path=f"{path}.dense2_w",
     )
-    generated_width, remainder = divmod(generated_total_width, head_count)
-    if remainder:
-        message = f"{path}.dense2_w: output width must be divisible by head count"
-        raise NetworkFormatError(message)
-    dense2_bias, dense2_bias_width = _vector_f16(
+    generated_width = generated_total_width // head_count
+    dense2_bias = _vector_f16(
         context,
         smolgen.dense2_b,
         name=f"{prefix}/smolgen/dense2/b/w",
         path=f"{path}.dense2_b",
     )
-    ln2_gammas, ln2_gamma_width = _vector_f16(
+    ln2_gammas = _vector_f16(
         context,
         smolgen.ln2_gammas,
         name=f"{prefix}/smolgen/ln2/w/scale",
         path=f"{path}.ln2_gammas",
     )
-    ln2_betas, ln2_beta_width = _vector_f16(
+    ln2_betas = _vector_f16(
         context,
         smolgen.ln2_betas,
         name=f"{prefix}/smolgen/ln2/w/bias",
         path=f"{path}.ln2_betas",
     )
-    for width, field in (
-        (dense2_bias_width, "dense2_b"),
-        (ln2_gamma_width, "ln2_gammas"),
-        (ln2_beta_width, "ln2_betas"),
-    ):
-        _require_equal_widths(
-            width,
-            generated_total_width,
-            path=f"{path}.{field}",
-            expected_path=f"{path}.dense2_w output",
-        )
 
     token_rows = context.batch_size * _SQUARE_COUNT
     compressed = _temporary_f16(context, element_count=token_rows * compression_width)
@@ -985,7 +854,7 @@ def _attention(  # noqa: PLR0913
     """Build shared Smolgen projection and the encoder Q/K/V attention path."""
     mha = encoder.mha
     path = f"weights.{prefix[1:]}"
-    shared_weights, smolgen_output_width = _matrix_f16(
+    shared_weights, _ = _matrix_f16(
         context,
         shared_smolgen,
         input_width=generated_width,
@@ -993,14 +862,8 @@ def _attention(  # noqa: PLR0913
         path="weights.smolgen_w",
     )
     expected_smolgen_width = _SQUARE_COUNT * _SQUARE_COUNT
-    _require_equal_widths(
-        smolgen_output_width,
-        expected_smolgen_width,
-        path="weights.smolgen_w output",
-        expected_path="64-way attention logits",
-    )
 
-    projections: list[tuple[Buffer, Buffer, int, str]] = []
+    projections: list[tuple[Buffer, Buffer, int]] = []
     for label, weight_field, bias_field in (
         ("Q", mha.q_w, mha.q_b),
         ("K", mha.k_w, mha.k_b),
@@ -1013,61 +876,41 @@ def _attention(  # noqa: PLR0913
             name=f"{prefix}/mha/{label}/w/w",
             path=f"{path}.mha.{label.lower()}_w",
         )
-        bias, bias_width = _vector_f16(
+        bias = _vector_f16(
             context,
             bias_field,
             name=f"{prefix}/mha/{label}/b/w",
             path=f"{path}.mha.{label.lower()}_b",
         )
-        _require_equal_widths(
-            bias_width,
-            width,
-            path=f"{path}.mha.{label.lower()}_b",
-            expected_path=f"{path}.mha.{label.lower()}_w output",
-        )
-        projections.append((weights, bias, width, label))
+        projections.append((weights, bias, width))
     model_width = projections[0][2]
-    for _weights, _bias, width, label in projections[1:]:
-        _require_equal_widths(
-            width,
-            model_width,
-            path=f"{path}.mha.{label.lower()}_w output",
-            expected_path=f"{path}.mha.q_w output",
-        )
-    head_depth, remainder = divmod(model_width, head_count)
-    if remainder:
-        message = f"{path}.mha.q_w: output width must be divisible by head count"
-        raise NetworkFormatError(message)
+    head_depth = model_width // head_count
 
-    output_weights, output_width = _matrix_f16(
+    output_weights, _ = _matrix_f16(
         context,
         mha.dense_w,
         input_width=model_width,
         name=f"{prefix}/mha/out/dense/w/w",
         path=f"{path}.mha.dense_w",
     )
-    _require_body_width(output_width, body_width, path=f"{path}.mha.dense_w output")
-    output_bias, output_bias_width = _vector_f16(
+    output_bias = _vector_f16(
         context,
         mha.dense_b,
         name=f"{prefix}/mha/out/dense/b/w",
         path=f"{path}.mha.dense_b",
     )
-    _require_body_width(output_bias_width, body_width, path=f"{path}.mha.dense_b")
-    gammas, gamma_width = _vector_f16(
+    gammas = _vector_f16(
         context,
         encoder.ln1_gammas,
         name=f"{prefix}/ln1/w/scale",
         path=f"{path}.ln1_gammas",
     )
-    betas, beta_width = _vector_f16(
+    betas = _vector_f16(
         context,
         encoder.ln1_betas,
         name=f"{prefix}/ln1/w/bias",
         path=f"{path}.ln1_betas",
     )
-    _require_body_width(gamma_width, body_width, path=f"{path}.ln1_gammas")
-    _require_body_width(beta_width, body_width, path=f"{path}.ln1_betas")
     scale = context.builder.persistent_buffer(
         name=f"{prefix}/mha/QK/scale/w",
         shape=(1,),
@@ -1098,7 +941,7 @@ def _attention(  # noqa: PLR0913
         ),
     )
     projected: list[Buffer] = []
-    for weights, bias, width, _label in projections:
+    for weights, bias, width in projections:
         value = _temporary_f16(context, element_count=token_rows * width)
         matmul(
             context.builder,
@@ -1207,11 +1050,6 @@ def _ffn(
     prefix: str,
 ) -> Buffer:
     """Build an encoder FFN and its DeepNorm residual layer normalization."""
-    _require_activation(
-        context.ffn_activation,
-        net_pb2.NetworkFormat.ACTIVATION_MISH,
-        path="format.network_format.ffn_activation",
-    )
     path = f"weights.{prefix[1:]}"
     dense1_weights, hidden_width = _matrix_f16(
         context,
@@ -1220,50 +1058,37 @@ def _ffn(
         name=f"{prefix}/ffn/dense1/w/w",
         path=f"{path}.ffn.dense1_w",
     )
-    dense1_bias, dense1_bias_width = _vector_f16(
+    dense1_bias = _vector_f16(
         context,
         encoder.ffn.dense1_b,
         name=f"{prefix}/ffn/dense1/b/w",
         path=f"{path}.ffn.dense1_b",
     )
-    _require_equal_widths(
-        dense1_bias_width,
-        hidden_width,
-        path=f"{path}.ffn.dense1_b",
-        expected_path=f"{path}.ffn.dense1_w output",
-    )
-    dense2_weights, output_width = _matrix_f16(
+    dense2_weights, _ = _matrix_f16(
         context,
         encoder.ffn.dense2_w,
         input_width=hidden_width,
         name=f"{prefix}/ffn/dense2/w/w",
         path=f"{path}.ffn.dense2_w",
     )
-    _require_body_width(output_width, body_width, path=f"{path}.ffn.dense2_w output")
-    dense2_bias, dense2_bias_width = _vector_f16(
+    dense2_bias = _vector_f16(
         context,
         encoder.ffn.dense2_b,
         name=f"{prefix}/ffn/dense2/b/w",
         path=f"{path}.ffn.dense2_b",
     )
-    gammas, gamma_width = _vector_f16(
+    gammas = _vector_f16(
         context,
         encoder.ln2_gammas,
         name=f"{prefix}/ln2/w/scale",
         path=f"{path}.ln2_gammas",
     )
-    betas, beta_width = _vector_f16(
+    betas = _vector_f16(
         context,
         encoder.ln2_betas,
         name=f"{prefix}/ln2/w/bias",
         path=f"{path}.ln2_betas",
     )
-    for width, field in (
-        (dense2_bias_width, "ffn.dense2_b"),
-        (gamma_width, "ln2_gammas"),
-        (beta_width, "ln2_betas"),
-    ):
-        _require_body_width(width, body_width, path=f"{path}.{field}")
     alpha = context.builder.persistent_buffer(
         name=f"{prefix}/ffn/alpha/w",
         shape=(1,),
@@ -1332,15 +1157,7 @@ def _policy_head(
     weights: net_pb2.Weights,
 ) -> None:
     """Build the selected vanilla attention-policy branch."""
-    _require_activation(
-        context.default_activation,
-        net_pb2.NetworkFormat.ACTIVATION_MISH,
-        path="format.network_format.default_activation",
-    )
     policy = weights.policy_heads.vanilla
-    if policy.pol_encoder:
-        message = "weights.policy_heads.vanilla.pol_encoder: not supported"
-        raise NetworkFormatError(message)
 
     embedding_weights_layer = _policy_embedding_layer(weights, "ip_pol_w")
     embedding_bias_layer = _policy_embedding_layer(weights, "ip_pol_b")
@@ -1351,17 +1168,11 @@ def _policy_head(
         name="/policy/dense1/matmul/w",
         path="weights.policy_heads.vanilla.ip_pol_w",
     )
-    embedding_bias, embedding_bias_width = _vector_f16(
+    embedding_bias = _vector_f16(
         context,
         embedding_bias_layer,
         name="/policy/dense1/add/w",
         path="weights.policy_heads.vanilla.ip_pol_b",
-    )
-    _require_equal_widths(
-        embedding_bias_width,
-        policy_width,
-        path="weights.policy_heads.vanilla.ip_pol_b",
-        expected_path="policy embedding output",
     )
     query_weights, model_width = _matrix_f16(
         context,
@@ -1370,55 +1181,31 @@ def _policy_head(
         name="/policy/Q/matmul/w",
         path="weights.policy_heads.vanilla.ip2_pol_w",
     )
-    query_bias, query_bias_width = _vector_f16(
+    query_bias = _vector_f16(
         context,
         policy.ip2_pol_b,
         name="/policy/Q/add/w",
         path="weights.policy_heads.vanilla.ip2_pol_b",
     )
-    _require_equal_widths(
-        query_bias_width,
-        model_width,
-        path="weights.policy_heads.vanilla.ip2_pol_b",
-        expected_path="policy Q output",
-    )
-    key_weights, key_width = _matrix_f16(
+    key_weights, _ = _matrix_f16(
         context,
         policy.ip3_pol_w,
         input_width=policy_width,
         name="/policy/K/matmul/w",
         path="weights.policy_heads.vanilla.ip3_pol_w",
     )
-    _require_equal_widths(
-        key_width,
-        model_width,
-        path="weights.policy_heads.vanilla.ip3_pol_w",
-        expected_path="policy Q output",
-    )
-    key_bias, key_bias_width = _vector_f16(
+    key_bias = _vector_f16(
         context,
         policy.ip3_pol_b,
         name="/policy/K/add/w",
         path="weights.policy_heads.vanilla.ip3_pol_b",
     )
-    _require_equal_widths(
-        key_bias_width,
-        model_width,
-        path="weights.policy_heads.vanilla.ip3_pol_b",
-        expected_path="policy Q output",
-    )
-    promotion_weights, promotion_width = _matrix_f16(
+    promotion_weights, _ = _matrix_f16(
         context,
         policy.ip4_pol_w,
         input_width=model_width,
         name="/policy/promotion/matmul/w",
         path="weights.policy_heads.vanilla.ip4_pol_w",
-    )
-    _require_equal_widths(
-        promotion_width,
-        4,
-        path="weights.policy_heads.vanilla.ip4_pol_w",
-        expected_path="promotion output",
     )
     scale = context.builder.persistent_buffer(
         name="/policy/scale/w",
@@ -1600,11 +1387,6 @@ def _dense_output_head(  # noqa: PLR0913
     final_activation: Literal["none", "relu"],
 ) -> None:
     """Build a per-square embedding followed by two flattened dense layers."""
-    _require_activation(
-        context.default_activation,
-        net_pb2.NetworkFormat.ACTIVATION_MISH,
-        path="format.network_format.default_activation",
-    )
     embed_weights, embed_width = _matrix_f16(
         context,
         embed_weight,
@@ -1612,17 +1394,11 @@ def _dense_output_head(  # noqa: PLR0913
         name=f"{prefix}/embed/matmul/w",
         path=f"{path}.{('ip_val_w' if prefix == '/value' else 'ip_mov_w')}",
     )
-    embed_bias_buffer, embed_bias_width = _vector_f16(
+    embed_bias_buffer = _vector_f16(
         context,
         embed_bias,
         name=f"{prefix}/embed/add/w",
         path=f"{path}.{('ip_val_b' if prefix == '/value' else 'ip_mov_b')}",
-    )
-    _require_equal_widths(
-        embed_bias_width,
-        embed_width,
-        path=f"{path} embedding bias",
-        expected_path="embedding output",
     )
     flattened_width = _SQUARE_COUNT * embed_width
     hidden_weights, hidden_width = _matrix_f16(
@@ -1632,42 +1408,24 @@ def _dense_output_head(  # noqa: PLR0913
         name=f"{prefix}/dense1/matmul/w",
         path=f"{path}.{'ip1_val_w' if prefix == '/value' else 'ip1_mov_w'}",
     )
-    hidden_bias, hidden_bias_width = _vector_f16(
+    hidden_bias = _vector_f16(
         context,
         dense1_bias,
         name=f"{prefix}/dense1/add/w",
         path=f"{path}.{'ip1_val_b' if prefix == '/value' else 'ip1_mov_b'}",
     )
-    _require_equal_widths(
-        hidden_bias_width,
-        hidden_width,
-        path=f"{path} dense1 bias",
-        expected_path="dense1 output",
-    )
-    result_weights, result_width = _matrix_f16(
+    result_weights, _ = _matrix_f16(
         context,
         dense2_weight,
         input_width=hidden_width,
         name=f"{prefix}/dense2/matmul/w",
         path=f"{path}.{'ip2_val_w' if prefix == '/value' else 'ip2_mov_w'}",
     )
-    _require_equal_widths(
-        result_width,
-        output_width,
-        path=f"{path} dense2 weight",
-        expected_path=f"{output_name} output",
-    )
-    result_bias, result_bias_width = _vector_f16(
+    result_bias = _vector_f16(
         context,
         dense2_bias,
         name=f"{prefix}/dense2/add/w",
         path=f"{path}.{'ip2_val_b' if prefix == '/value' else 'ip2_mov_b'}",
-    )
-    _require_equal_widths(
-        result_bias_width,
-        output_width,
-        path=f"{path} dense2 bias",
-        expected_path=f"{output_name} output",
     )
     output = context.builder.buffer(
         name=output_name,
@@ -1761,17 +1519,10 @@ def _policy_embedding_layer(
 ) -> net_pb2.Weights.Layer:
     """Resolve LC0's head-local, shared multihead, then legacy policy field."""
     policy = weights.policy_heads.vanilla
-    if field == "ip_pol_w":
-        local = policy.ip_pol_w
-        shared = weights.policy_heads.ip_pol_w
-        legacy = weights.ip_pol_w
-    elif field == "ip_pol_b":
-        local = policy.ip_pol_b
-        shared = weights.policy_heads.ip_pol_b
-        legacy = weights.ip_pol_b
-    else:
-        message = f"unsupported policy embedding field {field}"
-        raise ValueError(message)
+    local, shared, legacy = {
+        "ip_pol_w": (policy.ip_pol_w, weights.policy_heads.ip_pol_w, weights.ip_pol_w),
+        "ip_pol_b": (policy.ip_pol_b, weights.policy_heads.ip_pol_b, weights.ip_pol_b),
+    }[field]
     if local.params:
         return local
     if weights.policy_heads.HasField(field):
@@ -1791,53 +1542,15 @@ def _default_activation(
             net_pb2.NetworkFormat.ACTIVATION_MISH
         ),
     }
-    try:
-        return activations[value]
-    except KeyError as error:
-        message = f"format.network_format.default_activation: unsupported enum {value}"
-        raise NetworkFormatError(message) from error
+    return activations[value]
 
 
 def _resolve_activation(
     value: net_pb2.NetworkFormat.ActivationFunction,
     default: net_pb2.NetworkFormat.ActivationFunction,
-    *,
-    path: str,
 ) -> net_pb2.NetworkFormat.ActivationFunction:
-    """Resolve an explicit/default activation and reject unsupported variants."""
-    resolved = default if value == net_pb2.NetworkFormat.ACTIVATION_DEFAULT else value
-    supported = {
-        net_pb2.NetworkFormat.ACTIVATION_RELU,
-        net_pb2.NetworkFormat.ACTIVATION_MISH,
-        net_pb2.NetworkFormat.ACTIVATION_SELU,
-        net_pb2.NetworkFormat.ACTIVATION_SWISH,
-        net_pb2.NetworkFormat.ACTIVATION_RELU_2,
-        net_pb2.NetworkFormat.ACTIVATION_NONE,
-    }
-    if resolved not in supported:
-        message = f"{path}: unsupported activation enum {resolved}"
-        raise NetworkFormatError(message)
-    return resolved
-
-
-def _layer_elements(
-    layer: net_pb2.Weights.Layer,
-    default_encoding: net_pb2.Format.Encoding,
-    *,
-    path: str,
-) -> int:
-    """Return LINEAR16 element count while retaining layer payloads opaque."""
-    encoding = layer.encoding if layer.HasField("encoding") else default_encoding
-    if encoding != net_pb2.Format.LINEAR16:
-        message = f"{path}: expected LINEAR16 encoding, got {encoding}"
-        raise NetworkFormatError(message)
-    if len(layer.params) % _F16_SIZE_BYTES:
-        message = f"{path}: LINEAR16 payload has an odd byte count"
-        raise NetworkFormatError(message)
-    if not layer.params:
-        message = f"{path}: missing LINEAR16 payload"
-        raise NetworkFormatError(message)
-    return len(layer.params) // _F16_SIZE_BYTES
+    """Resolve an explicit activation or the format default."""
+    return default if value == net_pb2.NetworkFormat.ACTIVATION_DEFAULT else value
 
 
 def _fingerprint_layer(
@@ -1845,11 +1558,7 @@ def _fingerprint_layer(
     path: str,
 ) -> None:
     """Mark one consumed source layer in the sparse fingerprint."""
-    fingerprint_layer = context.fingerprint_layers.get(path)
-    if fingerprint_layer is None:
-        message = f"internal error: consumed layer {path} is missing from fingerprint"
-        raise RuntimeError(message)
-    fingerprint_layer.SetInParent()
+    context.fingerprint_layers[path].SetInParent()
 
 
 def _vector_f16(
@@ -1858,17 +1567,14 @@ def _vector_f16(
     *,
     name: str,
     path: str,
-) -> tuple[Buffer, int]:
+) -> Buffer:
     """Declare an FP16 vector whose width is inferred from its payload."""
-    width = _layer_elements(layer, context.default_encoding, path=path)
+    width = len(layer.params) // _F16_SIZE_BYTES
     _fingerprint_layer(context, path)
-    return (
-        context.builder.persistent_buffer(
-            name=name,
-            shape=(width,),
-            dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
-        ),
-        width,
+    return context.builder.persistent_buffer(
+        name=name,
+        shape=(width,),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
     )
 
 
@@ -1881,15 +1587,9 @@ def _matrix_f16(
     path: str,
 ) -> tuple[Buffer, int]:
     """Infer and declare an ONNX-layout FP16 matrix from its known input width."""
-    element_count = _layer_elements(layer, context.default_encoding, path=path)
+    element_count = len(layer.params) // _F16_SIZE_BYTES
     _fingerprint_layer(context, path)
-    output_width, remainder = divmod(element_count, input_width)
-    if remainder:
-        message = (
-            f"{path}: {element_count} elements are not divisible by input width "
-            f"{input_width}"
-        )
-        raise NetworkFormatError(message)
+    output_width = element_count // input_width
     return (
         context.builder.persistent_buffer(
             name=name,
@@ -1900,45 +1600,6 @@ def _matrix_f16(
     )
 
 
-def _require_equal_widths(
-    actual: int,
-    expected: int,
-    *,
-    path: str,
-    expected_path: str,
-) -> None:
-    """Require dimensions joined by one operation to agree."""
-    if actual != expected:
-        message = (
-            f"{path}: width {actual} does not match {expected_path} width {expected}"
-        )
-        raise NetworkFormatError(message)
-
-
-def _require_body_width(actual: int, expected: int, *, path: str) -> None:
-    """Require one embedding operand to preserve the residual body width."""
-    _require_equal_widths(
-        actual,
-        expected,
-        path=path,
-        expected_path="attention body",
-    )
-
-
-def _require_activation(
-    actual: net_pb2.NetworkFormat.ActivationFunction,
-    expected: net_pb2.NetworkFormat.ActivationFunction,
-    *,
-    path: str,
-) -> None:
-    """Require an activation implemented by the current embedding kernels."""
-    if actual != expected:
-        message = (
-            f"{path}: embedding graph requires activation enum {expected}, got {actual}"
-        )
-        raise NetworkFormatError(message)
-
-
 def _temporary_f16(
     context: _BuildContext,
     *,
@@ -1946,9 +1607,6 @@ def _temporary_f16(
     alignment_bytes: int = 256,
 ) -> Buffer:
     """Allocate one opaque FP16 temporary by its raw byte extent."""
-    if element_count <= 0:
-        message = "temporary element count must be positive"
-        raise ValueError(message)
     return context.builder.temporary_buffer(
         size_bytes=element_count * _F16_SIZE_BYTES,
         alignment_bytes=alignment_bytes,
