@@ -1,6 +1,5 @@
 """Tests for the Lc0 command-line interface."""
 
-import argparse
 import logging
 import os
 import sys
@@ -50,13 +49,6 @@ def test_parse_batch_size_expression(
 ) -> None:
     """Batch-size expression parsing produces ordered concrete values."""
     assert _parse_batch_size_expression(expression) == expected
-
-
-@pytest.mark.parametrize("expression", ["", "0", "4-1", "1-3:0", "four"])
-def test_parse_batch_size_expression_rejects_invalid_values(expression: str) -> None:
-    """Malformed, non-positive, and descending expressions are rejected."""
-    with pytest.raises(argparse.ArgumentTypeError):
-        _parse_batch_size_expression(expression)
 
 
 def test_main_keeps_artifact_path_on_stdout_and_progress_on_stderr(

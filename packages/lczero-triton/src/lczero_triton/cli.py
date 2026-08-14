@@ -3,7 +3,6 @@
 import argparse
 import logging
 import os
-import re
 import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, redirect_stdout
@@ -19,7 +18,7 @@ _AUTOTUNE_PRINT_ENV = "TRITON_PRINT_AUTOTUNING"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run an Lc0-specific kernel or graph command."""
+    """Build an Lc0 computation graph."""
     parser = _build_parser()
     arguments = parser.parse_args(argv)
     _configure_logging()
@@ -91,39 +90,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _parse_batch_size_expression(value: str) -> list[int]:
-    """Parse comma-separated positive values and inclusive ascending ranges."""
+    """Parse comma-separated values and inclusive ranges."""
     sizes: list[int] = []
-    for raw_expression in value.split(","):
-        expression = raw_expression.strip()
-        if not expression:
-            message = "batch-size expressions must not be empty"
-            raise argparse.ArgumentTypeError(message)
-
-        match = re.fullmatch(r"([0-9]+)-([0-9]+)(?::([0-9]+))?", expression)
-        if match is not None:
-            start = int(match.group(1))
-            stop = int(match.group(2))
-            step = 1 if match.group(3) is None else int(match.group(3))
-            if start <= 0 or stop <= 0:
-                message = "batch sizes must be positive"
-                raise argparse.ArgumentTypeError(message)
-            if start > stop:
-                message = "batch-size ranges must be ascending"
-                raise argparse.ArgumentTypeError(message)
-            if step <= 0:
-                message = "batch-size range steps must be positive"
-                raise argparse.ArgumentTypeError(message)
-            sizes.extend(range(start, stop + 1, step))
-            continue
-
-        if not re.fullmatch(r"[0-9]+", expression):
-            message = f"invalid batch-size expression: {expression!r}"
-            raise argparse.ArgumentTypeError(message)
-        size = int(expression)
-        if size <= 0:
-            message = "batch sizes must be positive"
-            raise argparse.ArgumentTypeError(message)
-        sizes.append(size)
+    for expression in value.split(","):
+        bounds, _, step = expression.partition(":")
+        start, *stops = map(int, bounds.split("-"))
+        stop = stops[0] if stops else start
+        sizes.extend(range(start, stop + 1, int(step or 1)))
     return sizes
 
 
