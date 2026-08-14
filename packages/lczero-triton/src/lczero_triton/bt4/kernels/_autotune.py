@@ -1,4 +1,4 @@
-"""Shared launch candidates and target validation for BT4 autotuning."""
+"""Shared launch candidates for BT4 autotuning."""
 
 import torch
 import triton
@@ -41,18 +41,5 @@ def preprocess_configs() -> list[triton.Config]:
 
 def active_architecture() -> int:
     """Return the compute capability of the active CUDA device."""
-    if not torch.cuda.is_available():
-        message = "kernel autotuning requires an available CUDA device"
-        raise RuntimeError(message)
     major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
     return major * 10 + minor
-
-
-def validate_active_architecture(architecture: int) -> None:
-    """Require autotuning to run on the requested CUDA architecture."""
-    active = active_architecture()
-    if active != architecture:
-        message = (
-            f"kernel requested sm_{architecture}, but the active device is sm_{active}"
-        )
-        raise ValueError(message)

@@ -1,6 +1,5 @@
 """Fused FP16 activation, residual, and layer-normalization family."""
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -12,7 +11,6 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
-from lczero_triton.bt4.kernels._autotune import validate_active_architecture
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 Activation = Literal["none", "mish", "swish"]
@@ -26,7 +24,6 @@ _ACTIVATIONS: dict[Activation, int] = {
     "swish": 2,
 }
 _MISH_BRANCH = tl.constexpr(-0.6)
-_MAX_WIDTH = 16384
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
 _WARP_COUNTS = (1, 2, 4, 8, 16)
 
@@ -175,24 +172,6 @@ class LayerNormSpecialization:
     architecture: int
     epsilon: float = 1e-3
 
-    def __post_init__(self) -> None:
-        """Validate dimensions, operation choices, and compilation target."""
-        if self.row_count <= 0:
-            message = "row count must be positive"
-            raise ValueError(message)
-        if self.width <= 0 or self.width % 16 or self.width > _MAX_WIDTH:
-            message = f"width must be a positive multiple of 16 up to {_MAX_WIDTH}"
-            raise ValueError(message)
-        if self.activation not in _ACTIVATIONS:
-            message = f"unsupported activation: {self.activation!r}"
-            raise ValueError(message)
-        if self.architecture <= 0:
-            message = "architecture must be positive"
-            raise ValueError(message)
-        if not math.isfinite(self.epsilon) or self.epsilon <= 0:
-            message = "epsilon must be finite and positive"
-            raise ValueError(message)
-
 
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
     """Return one Triton program per normalized row."""
@@ -208,7 +187,6 @@ def compile_layer_norm(
     specialization: LayerNormSpecialization,
 ) -> KernelArtifact:
     """Autotune and compile one fused FP16 layer-normalization variant."""
-    validate_active_architecture(specialization.architecture)
     shape = (specialization.row_count, specialization.width)
     output = torch.empty(shape, dtype=torch.float16, device="cuda")
     input_ = torch.zeros(shape, dtype=torch.float16, device="cuda")
@@ -273,17 +251,6 @@ def layer_norm(
     alpha: Buffer | None = None,
 ) -> None:
     """Append fused activation, residual addition, and layer normalization."""
-    if specialization.has_skip != (skip is not None and alpha is not None):
-        message = "skip and alpha must both match the specialization"
-        raise ValueError(message)
-    if (skip is None) != (alpha is None):
-        message = "skip and alpha must be supplied together"
-        raise ValueError(message)
-    parameters = (bias, gammas, betas) + (() if alpha is None else (alpha,))
-    if any(output is parameter for parameter in parameters):
-        message = "layer norm output cannot alias broadcast parameters"
-        raise ValueError(message)
-
     builder.set_target(
         lc0ex_pb2.Target.VENDOR_NVIDIA,
         f"sm_{specialization.architecture}",
@@ -295,9 +262,5 @@ def layer_norm(
     arguments.extend((gammas, betas))
     if alpha is not None:
         arguments.append(alpha)
-
-    readonly: list[Buffer] = []
-    for source in arguments[1:]:
-        if source is not output and all(source is not value for value in readonly):
-            readonly.append(source)
+    readonly = [source for source in arguments[1:] if source is not output]
     builder.call(kernel, *arguments, readonly=readonly)

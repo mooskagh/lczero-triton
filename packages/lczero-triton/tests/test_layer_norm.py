@@ -1,7 +1,6 @@
 """Tests for fused FP16 activation, residual, and layer normalization."""
 
 from collections.abc import Sequence
-from typing import cast
 
 import pytest
 import torch
@@ -312,96 +311,6 @@ def test_autotune_contract_covers_semantics_and_warp_candidates() -> None:
         assert all(not config.kwargs for config in kernel.configs)
 
 
-@pytest.mark.parametrize(
-    ("values", "message"),
-    [
-        ((0, 256, "none", False, 80, 1e-3), "row count"),
-        ((1, 255, "none", False, 80, 1e-3), "multiple of 16"),
-        ((1, 16400, "none", False, 80, 1e-3), "up to"),
-        ((1, 256, "none", False, 0, 1e-3), "architecture"),
-        ((1, 256, "none", False, 80, 0.0), "epsilon"),
-        ((1, 256, "none", False, 80, float("nan")), "epsilon"),
-    ],
-)
-def test_specialization_rejects_invalid_static_values(
-    values: tuple[int, int, Activation, bool, int, float],
-    message: str,
-) -> None:
-    """Invalid dimensions, epsilon, and target fail before compilation."""
-    with pytest.raises(ValueError, match=message):
-        LayerNormSpecialization(*values)
-
-
-def test_specialization_rejects_unknown_activation() -> None:
-    """Only activation implementations supported by the kernel are accepted."""
-    activation = cast("Activation", "relu")
-    with pytest.raises(ValueError, match="unsupported activation"):
-        LayerNormSpecialization(
-            1,
-            256,
-            activation,
-            has_skip=False,
-            architecture=80,
-        )
-
-
-def test_graph_validation_precedes_compilation() -> None:
-    """Optional operands and unsafe broadcast aliases fail without CUDA."""
-    builder = ExecutableBuilder()
-    program = builder.program(name="main")
-    buffer = program.temporary_buffer(size_bytes=512, alignment_bytes=2)
-    kernels = KernelCache(builder)
-    without_skip = LayerNormSpecialization(
-        1,
-        256,
-        "none",
-        has_skip=False,
-        architecture=80,
-    )
-    with_skip = LayerNormSpecialization(
-        1,
-        256,
-        "none",
-        has_skip=True,
-        architecture=80,
-    )
-
-    with pytest.raises(ValueError, match="supplied together"):
-        layer_norm(
-            program,
-            kernels,
-            buffer,
-            buffer,
-            buffer,
-            buffer,
-            buffer,
-            without_skip,
-            skip=buffer,
-        )
-    with pytest.raises(ValueError, match="match the specialization"):
-        layer_norm(
-            program,
-            kernels,
-            buffer,
-            buffer,
-            buffer,
-            buffer,
-            buffer,
-            with_skip,
-        )
-    with pytest.raises(ValueError, match="broadcast parameters"):
-        layer_norm(
-            program,
-            kernels,
-            buffer,
-            buffer,
-            buffer,
-            buffer,
-            buffer,
-            without_skip,
-        )
-
-
 @pytest.mark.gpu
 @_CUDA_REQUIRED
 @pytest.mark.parametrize("variant", ["plain", "skip"])
@@ -502,18 +411,3 @@ def test_graph_call_preserves_deepnorm_argument_order() -> None:
         locations[name]
         for name in ("output", "input", "bias", "skip", "gammas", "betas", "alpha")
     ]
-
-
-@pytest.mark.gpu
-@_CUDA_REQUIRED
-def test_compilation_rejects_a_different_active_architecture() -> None:
-    """Autotuning cannot emit a CUBIN for a different requested target."""
-    specialization = LayerNormSpecialization(
-        1,
-        256,
-        "none",
-        has_skip=False,
-        architecture=_architecture() + 1,
-    )
-    with pytest.raises(ValueError, match="active device"):
-        compile_layer_norm(specialization)

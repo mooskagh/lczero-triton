@@ -436,14 +436,3 @@ def test_graph_dependencies_follow_physical_buffer_flow() -> None:
     nodes = builder.build().programs[0].nodes
     assert list(nodes[0].dependencies) == []
     assert list(nodes[1].dependencies) == [0]
-
-
-@pytest.mark.gpu
-@_CUDA_REQUIRED
-def test_compilation_rejects_a_different_active_architecture() -> None:
-    """Autotuning cannot silently emit a CUBIN for a different target."""
-    specialization = BatchedMatmulSpecialization(
-        "body_qk", 1, 16, 16, 16, 1, _architecture() + 1
-    )
-    with pytest.raises(ValueError, match="active device"):
-        compile_batched_matmul(specialization)

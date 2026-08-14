@@ -11,10 +11,7 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
-from lczero_triton.bt4.kernels._autotune import (
-    elementwise_configs,
-    validate_active_architecture,
-)
+from lczero_triton.bt4.kernels._autotune import elementwise_configs
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 Activation = Literal["none", "mish"]
@@ -79,35 +76,16 @@ class AddBiasBatchedSpecialization:
     activation: Activation
     architecture: int
 
-    def __post_init__(self) -> None:
-        """Validate dimensions, activation, and launch configuration."""
-        if any(
-            value <= 0
-            for value in (self.batch_count, self.row_count, self.channel_count)
-        ):
-            message = "tensor dimensions must be positive"
-            raise ValueError(message)
-        if self.activation not in _ACTIVATIONS:
-            message = f"unsupported activation: {self.activation!r}"
-            raise ValueError(message)
-        if self.architecture <= 0:
-            message = "architecture must be positive"
-            raise ValueError(message)
 
-
-def _element_count(configuration: Mapping[str, object]) -> int:
-    """Return the tensor element count from kernel configuration values."""
-    return (
+def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
+    """Return the flat bias-addition grid for a tuning candidate."""
+    element_count = (
         cast("int", configuration["batch_count"])
         * cast("int", configuration["row_count"])
         * cast("int", configuration["channel_count"])
     )
-
-
-def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
-    """Return the flat bias-addition grid for a tuning candidate."""
     block_size = cast("int", configuration["block_size"])
-    return ((_element_count(configuration) + block_size - 1) // block_size,)
+    return ((element_count + block_size - 1) // block_size,)
 
 
 def _artifact_grid(
@@ -123,7 +101,6 @@ def compile_add_bias_batched(
     specialization: AddBiasBatchedSpecialization,
 ) -> KernelArtifact:
     """Autotune and compile one batched FP16 bias-broadcast specialization."""
-    validate_active_architecture(specialization.architecture)
     element_count = (
         specialization.batch_count
         * specialization.row_count
@@ -162,17 +139,10 @@ def add_bias_batched(
     specialization: AddBiasBatchedSpecialization,
 ) -> None:
     """Append batched bias broadcasting, retaining valid in-place writes."""
-    if output is bias and specialization.row_count != 1:
-        message = "output cannot alias a bias broadcast across rows"
-        raise ValueError(message)
     builder.set_target(
         lc0ex_pb2.Target.VENDOR_NVIDIA,
         f"sm_{specialization.architecture}",
     )
     kernel = kernels.get(compile_add_bias_batched, specialization)
-    readonly = []
-    if input_ is not output:
-        readonly.append(input_)
-    if bias is not output:
-        readonly.append(bias)
+    readonly = [source for source in (input_, bias) if source is not output]
     builder.call(kernel, output, input_, bias, readonly=readonly)

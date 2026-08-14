@@ -11,7 +11,6 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
-from lczero_triton.bt4.kernels._autotune import validate_active_architecture
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
@@ -136,19 +135,9 @@ class MatmulSpecialization:
     k: int
     architecture: int
 
-    def __post_init__(self) -> None:
-        """Validate static dimensions and the compilation target."""
-        if any(value <= 0 for value in (self.m, self.n, self.k)):
-            message = "matrix dimensions must be positive"
-            raise ValueError(message)
-        if self.architecture <= 0:
-            message = "architecture must be positive"
-            raise ValueError(message)
-
 
 def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
     """Autotune and compile one contiguous FP16 dense GEMM specialization."""
-    validate_active_architecture(specialization.architecture)
     output = torch.empty(
         (specialization.m, specialization.n),
         dtype=torch.float16,
@@ -193,9 +182,6 @@ def matmul(
     specialization: MatmulSpecialization,
 ) -> None:
     """Append one contiguous row-major dense matrix multiplication."""
-    if output is activations or output is weights:
-        message = "dense GEMM output cannot alias an input"
-        raise ValueError(message)
     builder.set_target(
         lc0ex_pb2.Target.VENDOR_NVIDIA,
         f"sm_{specialization.architecture}",

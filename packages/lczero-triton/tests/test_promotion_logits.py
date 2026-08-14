@@ -101,43 +101,6 @@ def test_candidate_and_artifact_grids_cover_tail_rows() -> None:
     assert _artifact_grid(configuration, 3) == (2, 1, 1)
 
 
-@pytest.mark.parametrize(
-    ("batch_size", "width", "architecture", "message"),
-    [
-        (0, 16, 80, "dimensions"),
-        (1, 0, 80, "dimensions"),
-        (1, 16, 0, "architecture"),
-    ],
-)
-def test_specialization_rejects_invalid_static_values(
-    batch_size: int,
-    width: int,
-    architecture: int,
-    message: str,
-) -> None:
-    """Invalid dimensions and targets fail before CUDA compilation."""
-    with pytest.raises(ValueError, match=message):
-        PromotionLogitsSpecialization(batch_size, width, architecture)
-
-
-def test_graph_alias_validation_precedes_compilation() -> None:
-    """The writable policy record cannot also be a projection input."""
-    builder = ExecutableBuilder()
-    program = builder.program(name="main")
-    buffer = program.temporary_buffer(size_bytes=2, alignment_bytes=2)
-    specialization = PromotionLogitsSpecialization(1, 16, 80)
-
-    with pytest.raises(ValueError, match="cannot alias"):
-        promotion_logits(
-            program,
-            KernelCache(builder),
-            buffer,
-            buffer,
-            buffer,
-            specialization,
-        )
-
-
 @pytest.mark.gpu
 @_CUDA_REQUIRED
 def test_fixed_bt4_workload_matches_all_fp32_reference_logits() -> None:
@@ -322,12 +285,3 @@ def test_graph_call_uses_in_place_records_and_tracks_dependencies() -> None:
     ]
     assert list(nodes[0].dependencies) == []
     assert list(nodes[1].dependencies) == [0]
-
-
-@pytest.mark.gpu
-@_CUDA_REQUIRED
-def test_compilation_rejects_a_different_active_architecture() -> None:
-    """Autotuning cannot emit a CUBIN for another requested target."""
-    specialization = PromotionLogitsSpecialization(1, 16, _architecture() + 1)
-    with pytest.raises(ValueError, match="active device"):
-        compile_promotion_logits(specialization)

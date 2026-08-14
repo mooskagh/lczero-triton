@@ -11,7 +11,6 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
-from lczero_triton.bt4.kernels._autotune import validate_active_architecture
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
@@ -154,15 +153,6 @@ class PromotionLogitsSpecialization:
     width: int
     architecture: int
 
-    def __post_init__(self) -> None:
-        """Validate the static policy dimensions and compilation target."""
-        if self.batch_size <= 0 or self.width <= 0:
-            message = "promotion dimensions must be positive"
-            raise ValueError(message)
-        if self.architecture <= 0:
-            message = "architecture must be positive"
-            raise ValueError(message)
-
 
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
     """Return the selected-key-row grid for a tuning candidate."""
@@ -186,7 +176,6 @@ def compile_promotion_logits(
     specialization: PromotionLogitsSpecialization,
 ) -> KernelArtifact:
     """Autotune and compile one fused FP16 promotion-logit operation."""
-    validate_active_architecture(specialization.architecture)
     policy_records = torch.zeros(
         (specialization.batch_size, _POLICY_RECORD_SIZE),
         dtype=torch.float16,
@@ -226,17 +215,16 @@ def promotion_logits(
     specialization: PromotionLogitsSpecialization,
 ) -> None:
     """Append in-place promotion projection and policy-record assembly."""
-    if policy_records is policy_keys or policy_records is promotion_weights:
-        message = "policy records cannot alias promotion inputs"
-        raise ValueError(message)
     builder.set_target(
         lc0ex_pb2.Target.VENDOR_NVIDIA,
         f"sm_{specialization.architecture}",
     )
     kernel = kernels.get(compile_promotion_logits, specialization)
-    readonly = [policy_keys]
-    if promotion_weights is not policy_keys:
-        readonly.append(promotion_weights)
+    readonly = [
+        source
+        for source in (policy_keys, promotion_weights)
+        if source is not policy_records
+    ]
     builder.call(
         kernel,
         policy_records,

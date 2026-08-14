@@ -11,13 +11,9 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
-from lczero_triton.bt4.kernels._autotune import (
-    elementwise_configs,
-    validate_active_architecture,
-)
+from lczero_triton.bt4.kernels._autotune import elementwise_configs
 from lczero_triton.bt4.kernels._cache import KernelCache
 
-_MASK_BITS = 64
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
 
 
@@ -54,18 +50,6 @@ class ExpandPlanesSpecialization:
     architecture: int
     square_count: int = 64
 
-    def __post_init__(self) -> None:
-        """Validate dimensions and launch configuration."""
-        if self.plane_count <= 0 or self.square_count <= 0:
-            message = "plane and square counts must be positive"
-            raise ValueError(message)
-        if self.architecture <= 0:
-            message = "architecture must be positive"
-            raise ValueError(message)
-        if self.square_count > _MASK_BITS:
-            message = "U64 plane masks support at most 64 squares"
-            raise ValueError(message)
-
 
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
     """Return the flat plane-expansion grid for a tuning candidate."""
@@ -91,7 +75,6 @@ def compile_expand_planes(
     specialization: ExpandPlanesSpecialization,
 ) -> KernelArtifact:
     """Autotune and compile one packed-plane expansion specialization."""
-    validate_active_architecture(specialization.architecture)
     output = torch.empty(
         (specialization.plane_count, specialization.square_count),
         dtype=torch.float16,

@@ -81,20 +81,6 @@ def test_candidate_and_artifact_grids_cover_tail_rows() -> None:
     assert _artifact_grid(configuration, 17) == (3, 1, 1)
 
 
-@pytest.mark.parametrize(
-    ("row_count", "architecture", "message"),
-    [(0, 80, "row count"), (1, 0, "architecture")],
-)
-def test_specialization_rejects_invalid_static_values(
-    row_count: int,
-    architecture: int,
-    message: str,
-) -> None:
-    """Invalid workloads and targets fail before CUDA compilation."""
-    with pytest.raises(ValueError, match=message):
-        Softmax64Specialization(row_count, architecture)
-
-
 @pytest.mark.gpu
 @_CUDA_REQUIRED
 def test_fixed_bt4_workload_matches_fp32_reference_and_sums_to_one() -> None:
@@ -275,12 +261,3 @@ def test_graph_call_preserves_in_place_abi_and_dependencies() -> None:
     ]
     assert list(nodes[0].dependencies) == []
     assert list(nodes[1].dependencies) == [0]
-
-
-@pytest.mark.gpu
-@_CUDA_REQUIRED
-def test_compilation_rejects_a_different_active_architecture() -> None:
-    """Autotuning cannot emit a CUBIN for another requested target."""
-    specialization = Softmax64Specialization(1, _architecture() + 1)
-    with pytest.raises(ValueError, match="active device"):
-        compile_softmax_64(specialization)

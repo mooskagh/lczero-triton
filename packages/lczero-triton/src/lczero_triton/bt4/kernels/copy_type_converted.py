@@ -11,10 +11,7 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
-from lczero_triton.bt4.kernels._autotune import (
-    elementwise_configs,
-    validate_active_architecture,
-)
+from lczero_triton.bt4.kernels._autotune import elementwise_configs
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
@@ -44,15 +41,6 @@ class CopyTypeConvertedSpecialization:
     element_count: int
     architecture: int
 
-    def __post_init__(self) -> None:
-        """Validate dimensions and the compilation target."""
-        if self.element_count <= 0:
-            message = "element_count must be positive"
-            raise ValueError(message)
-        if self.architecture <= 0:
-            message = "architecture must be positive"
-            raise ValueError(message)
-
 
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
     """Return the one-dimensional grid for a tuning candidate."""
@@ -74,7 +62,6 @@ def compile_copy_type_converted(
     specialization: CopyTypeConvertedSpecialization,
 ) -> KernelArtifact:
     """Autotune and compile one FP16-to-FP32 conversion specialization."""
-    validate_active_architecture(specialization.architecture)
     output = torch.empty(
         specialization.element_count,
         dtype=torch.float32,

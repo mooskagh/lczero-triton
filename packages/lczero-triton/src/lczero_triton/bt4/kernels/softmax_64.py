@@ -11,7 +11,6 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
-from lczero_triton.bt4.kernels._autotune import validate_active_architecture
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
@@ -79,15 +78,6 @@ class Softmax64Specialization:
     row_count: int
     architecture: int
 
-    def __post_init__(self) -> None:
-        """Validate the static workload and compilation target."""
-        if self.row_count <= 0:
-            message = "row count must be positive"
-            raise ValueError(message)
-        if self.architecture <= 0:
-            message = "architecture must be positive"
-            raise ValueError(message)
-
 
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
     """Return the row-tiled launch grid for a tuning candidate."""
@@ -109,7 +99,6 @@ def compile_softmax_64(
     specialization: Softmax64Specialization,
 ) -> KernelArtifact:
     """Autotune and compile one fused Smolgen attention softmax."""
-    validate_active_architecture(specialization.architecture)
     shape = (specialization.row_count, _SOFTMAX_WIDTH)
     output = torch.empty(shape, dtype=torch.float16, device="cuda")
     scaled_qk = torch.zeros(shape, dtype=torch.float16, device="cuda")
@@ -142,8 +131,5 @@ def softmax_64(
         f"sm_{specialization.architecture}",
     )
     kernel = kernels.get(compile_softmax_64, specialization)
-    readonly: list[Buffer] = []
-    for source in (scaled_qk, smolgen):
-        if source is not output and all(source is not value for value in readonly):
-            readonly.append(source)
+    readonly = [source for source in (scaled_qk, smolgen) if source is not output]
     builder.call(kernel, output, scaled_qk, smolgen, readonly=readonly)

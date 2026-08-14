@@ -11,10 +11,7 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder, SymbolHandle
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
-from lczero_triton.bt4.kernels._autotune import (
-    elementwise_configs,
-    validate_active_architecture,
-)
+from lczero_triton.bt4.kernels._autotune import elementwise_configs
 from lczero_triton.bt4.kernels._cache import KernelCache
 from lczero_triton.bt4.kernels.mapping_table import values as mapping_values
 
@@ -61,34 +58,14 @@ class PolicyMapSpecialization:
     input_element_count: int = 4288
     output_element_count: int = 1858
 
-    def __post_init__(self) -> None:
-        """Validate dimensions and launch configuration."""
-        if any(
-            value <= 0
-            for value in (
-                self.batch_size,
-                self.input_element_count,
-                self.output_element_count,
-            )
-        ):
-            message = "tensor dimensions must be positive"
-            raise ValueError(message)
-        if self.architecture <= 0:
-            message = "architecture must be positive"
-            raise ValueError(message)
-
-
-def _element_count(configuration: Mapping[str, object]) -> int:
-    """Return the output element count from kernel configuration values."""
-    return cast("int", configuration["batch_size"]) * cast(
-        "int", configuration["output_element_count"]
-    )
-
 
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
     """Return the flat policy-gather grid for a tuning candidate."""
+    element_count = cast("int", configuration["batch_size"]) * cast(
+        "int", configuration["output_element_count"]
+    )
     block_size = cast("int", configuration["block_size"])
-    return ((_element_count(configuration) + block_size - 1) // block_size,)
+    return ((element_count + block_size - 1) // block_size,)
 
 
 def _artifact_grid(
@@ -119,7 +96,6 @@ def compile_policy_map(
     specialization: PolicyMapSpecialization,
 ) -> KernelArtifact:
     """Autotune and compile one FP16 attention-policy gather specialization."""
-    validate_active_architecture(specialization.architecture)
     element_count = specialization.batch_size * specialization.output_element_count
     output = torch.empty(element_count, dtype=torch.float16, device="cuda")
     input_ = torch.zeros(
@@ -153,9 +129,6 @@ def policy_map(
     specialization: PolicyMapSpecialization,
 ) -> None:
     """Append symbol-backed attention-policy gathering to an executable graph."""
-    if output is input_:
-        message = "policy mapping cannot operate in place"
-        raise ValueError(message)
     builder.set_target(
         lc0ex_pb2.Target.VENDOR_NVIDIA,
         f"sm_{specialization.architecture}",

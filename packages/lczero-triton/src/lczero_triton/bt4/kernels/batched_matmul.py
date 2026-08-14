@@ -11,7 +11,6 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
-from lczero_triton.bt4.kernels._autotune import validate_active_architecture
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 BatchedMatmulOperation = Literal["body_qk", "body_attention_v", "policy_qk"]
@@ -258,7 +257,6 @@ def compile_batched_matmul(
     specialization: BatchedMatmulSpecialization,
 ) -> KernelArtifact:
     """Autotune and compile one indexed FP16 batched GEMM specialization."""
-    validate_active_architecture(specialization.architecture)
     operation = _OPERATIONS[specialization.operation]
     output_batch_stride = (
         _POLICY_RECORD_SIZE

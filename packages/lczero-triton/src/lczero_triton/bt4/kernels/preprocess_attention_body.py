@@ -11,10 +11,7 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
-from lczero_triton.bt4.kernels._autotune import (
-    preprocess_configs,
-    validate_active_architecture,
-)
+from lczero_triton.bt4.kernels._autotune import preprocess_configs
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
@@ -74,23 +71,6 @@ class PreprocessAttentionBodySpecialization:
     architecture: int
     square_count: int = 64
 
-    def __post_init__(self) -> None:
-        """Validate dimensions and launch configuration."""
-        if any(
-            value <= 0
-            for value in (
-                self.batch_size,
-                self.input_channels,
-                self.encoding_channels,
-                self.square_count,
-            )
-        ):
-            message = "tensor dimensions must be positive"
-            raise ValueError(message)
-        if self.architecture <= 0:
-            message = "architecture must be positive"
-            raise ValueError(message)
-
 
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int, int, int]:
     """Return the three-dimensional channel-tiled preprocessing grid."""
@@ -126,7 +106,6 @@ def compile_preprocess_attention_body(
     specialization: PreprocessAttentionBodySpecialization,
 ) -> KernelArtifact:
     """Autotune and compile one attention-input preprocessing specialization."""
-    validate_active_architecture(specialization.architecture)
     output_channels = specialization.input_channels + specialization.encoding_channels
     output = torch.empty(
         (specialization.batch_size, specialization.square_count, output_channels),

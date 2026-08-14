@@ -11,10 +11,7 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
-from lczero_triton.bt4.kernels._autotune import (
-    elementwise_configs,
-    validate_active_architecture,
-)
+from lczero_triton.bt4.kernels._autotune import elementwise_configs
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 Activation = Literal["none", "mish", "relu"]
@@ -78,18 +75,6 @@ class AddVectorsSpecialization:
     activation: Activation
     architecture: int
 
-    def __post_init__(self) -> None:
-        """Validate dimensions, activation, and launch configuration."""
-        if self.element_count <= 0 or self.bias_element_count <= 0:
-            message = "element counts must be positive"
-            raise ValueError(message)
-        if self.activation not in _ACTIVATIONS:
-            message = f"unsupported activation: {self.activation!r}"
-            raise ValueError(message)
-        if self.architecture <= 0:
-            message = "architecture must be positive"
-            raise ValueError(message)
-
 
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
     """Return the flat vector-addition grid for a tuning candidate."""
@@ -111,7 +96,6 @@ def compile_add_vectors(
     specialization: AddVectorsSpecialization,
 ) -> KernelArtifact:
     """Autotune and compile one periodic FP16 vector-addition specialization."""
-    validate_active_architecture(specialization.architecture)
     output = torch.empty(
         specialization.element_count,
         dtype=torch.float16,
@@ -152,20 +136,10 @@ def add_vectors(
     specialization: AddVectorsSpecialization,
 ) -> None:
     """Append periodic vector addition, retaining valid in-place writes."""
-    if (
-        output is bias
-        and specialization.bias_element_count != specialization.element_count
-    ):
-        message = "output cannot alias a periodically broadcast bias"
-        raise ValueError(message)
     builder.set_target(
         lc0ex_pb2.Target.VENDOR_NVIDIA,
         f"sm_{specialization.architecture}",
     )
     kernel = kernels.get(compile_add_vectors, specialization)
-    readonly = []
-    if input_ is not output:
-        readonly.append(input_)
-    if bias is not output:
-        readonly.append(bias)
+    readonly = [source for source in (input_, bias) if source is not output]
     builder.call(kernel, output, input_, bias, readonly=readonly)

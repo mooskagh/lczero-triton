@@ -11,10 +11,7 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
-from lczero_triton.bt4.kernels._autotune import (
-    elementwise_configs,
-    validate_active_architecture,
-)
+from lczero_triton.bt4.kernels._autotune import elementwise_configs
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
@@ -63,32 +60,16 @@ class InputGatingSpecialization:
     channel_count: int
     architecture: int
 
-    def __post_init__(self) -> None:
-        """Validate dimensions and launch configuration."""
-        if any(
-            value <= 0
-            for value in (self.batch_size, self.square_count, self.channel_count)
-        ):
-            message = "tensor dimensions must be positive"
-            raise ValueError(message)
-        if self.architecture <= 0:
-            message = "architecture must be positive"
-            raise ValueError(message)
 
-
-def _element_count(configuration: Mapping[str, object]) -> int:
-    """Return the tensor element count from kernel configuration values."""
-    return (
+def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
+    """Return the flat gating grid for a tuning candidate."""
+    element_count = (
         cast("int", configuration["batch_size"])
         * cast("int", configuration["square_count"])
         * cast("int", configuration["channel_count"])
     )
-
-
-def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
-    """Return the flat gating grid for a tuning candidate."""
     block_size = cast("int", configuration["block_size"])
-    return ((_element_count(configuration) + block_size - 1) // block_size,)
+    return ((element_count + block_size - 1) // block_size,)
 
 
 def _artifact_grid(
@@ -104,7 +85,6 @@ def compile_input_gating(
     specialization: InputGatingSpecialization,
 ) -> KernelArtifact:
     """Autotune and compile one ONNX-layout FP16 input-gating specialization."""
-    validate_active_architecture(specialization.architecture)
     element_count = (
         specialization.batch_size
         * specialization.square_count
@@ -155,9 +135,11 @@ def input_gating(
         f"sm_{specialization.architecture}",
     )
     kernel = kernels.get(compile_input_gating, specialization)
-    readonly = [multiplicative_gate, additive_gate]
-    if input_ is not output:
-        readonly.append(input_)
+    readonly = [
+        source
+        for source in (input_, multiplicative_gate, additive_gate)
+        if source is not output
+    ]
     builder.call(
         kernel,
         output,
