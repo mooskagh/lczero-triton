@@ -18,10 +18,9 @@ import lczero_triton.bt4.kernels.preprocess_attention_body as preprocess_module
 import lczero_triton.bt4.kernels.promotion_logits as promotion_logits_module
 import lczero_triton.bt4.kernels.softmax_64 as softmax_64_module
 import lczero_triton.bt4.network as network_module
-import net_pb2
 import pytest
 from lc0ex import Buffer, ExecutableBuilder, KernelArtifact, SymbolArtifact
-from lc0ex.proto import lc0ex_pb2
+from lc0ex.proto import lc0ex_pb2, net_pb2
 from lczero_triton.bt4.kernels.add_bias_batched import (
     AddBiasBatchedSpecialization,
 )

@@ -26,5 +26,5 @@ modules/
 *.egg-info/
 
 # Generated protobuf bindings.
-packages/lc0ex/src/*_pb2.py
-packages/lc0ex/src/*_pb2.pyi
+packages/lc0ex/src/lc0ex/proto/*_pb2.py
+packages/lc0ex/src/lc0ex/proto/*_pb2.pyi

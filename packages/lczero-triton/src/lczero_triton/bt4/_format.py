@@ -3,8 +3,8 @@
 import gzip
 from pathlib import Path
 
-import net_pb2
 from google.protobuf.message import DecodeError
+from lc0ex.proto import net_pb2
 
 _WEIGHT_MAGIC = 0x1C0
 

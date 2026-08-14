@@ -3,8 +3,8 @@
 import gzip
 from pathlib import Path
 
-import net_pb2
 import pytest
+from lc0ex.proto import net_pb2
 from lczero_triton.bt4._format import (
     NetworkFormatError,
     load_network,

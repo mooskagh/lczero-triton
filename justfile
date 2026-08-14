@@ -1,7 +1,7 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 proto_sources := "lc0ex.proto net.proto"
-proto_output := "packages/lc0ex/src"
+proto_output := "packages/lc0ex/src/lc0ex/proto"
 python_paths := "packages"
 
 # List available recipes.
@@ -13,7 +13,6 @@ build-proto:
     mkdir -p "{{ proto_output }}"
     uv run --frozen python -m grpc_tools.protoc \
         --proto_path="submodules/lc0/proto" \
-        --proto_path="proto" \
         --python_out="{{ proto_output }}" \
         --pyi_out="{{ proto_output }}" \
         {{ proto_sources }}

@@ -27,7 +27,7 @@ package = false
 line-length = 88
 target-version = "py313"
 extend-exclude = [
-    "packages/lc0ex/src/*_pb2.py",
+    "packages/lc0ex/src/lc0ex/proto/*_pb2.py",
     "packages/lczero-triton/typings",
 ]
 
@@ -80,8 +80,8 @@ disable_error_code = [
 
 [[tool.mypy.overrides]]
 module = [
-    "lc0ex_pb2",
-    "net_pb2",
+    "lc0ex.proto.lc0ex_pb2",
+    "lc0ex.proto.net_pb2",
 ]
 disable_error_code = ["type-arg"] # grpcio-tools emits bare Mapping types.
 

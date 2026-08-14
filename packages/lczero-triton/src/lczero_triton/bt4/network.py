@@ -5,9 +5,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-import net_pb2
 from lc0ex import Buffer, ExecutableBuilder, ProgramBuilder
-from lc0ex.proto import lc0ex_pb2
+from lc0ex.proto import lc0ex_pb2, net_pb2
 
 from lczero_triton.bt4._format import (
     normalize_network,
