@@ -68,6 +68,7 @@ from lczero_triton.bt4.kernels.softmax_64 import (
 )
 
 _F16_SIZE_BYTES = 2
+_DEFAULT_BATCH_SIZE = 169
 _INPUT_CHANNELS = 112
 _POSITION_CHANNELS = 12
 _SQUARE_COUNT = 64
@@ -95,11 +96,10 @@ def build(
     builder: ExecutableBuilder,
     network: net_pb2.Net,
     *,
-    batch_size: int | None = None,
     batch_sizes: Sequence[int] | None = None,
 ) -> None:
     """Traverse the active network and append one or more batch programs."""
-    sizes = _normalize_batch_sizes(batch_size, batch_sizes)
+    sizes = _normalize_batch_sizes(batch_sizes)
 
     _LOGGER.info("normalizing and validating BT4 network")
     normalize_network(network)
@@ -151,23 +151,15 @@ def build(
 
 
 def _normalize_batch_sizes(
-    batch_size: int | None,
     batch_sizes: Sequence[int] | None,
 ) -> tuple[int, ...]:
     """Validate and normalize the requested fixed batch program sizes."""
-    if batch_size is not None and batch_sizes is not None:
-        message = "specify batch_size or batch_sizes, not both"
-        raise ValueError(message)
-    sizes: tuple[int, ...]
-    if batch_sizes is None:
-        sizes = (169 if batch_size is None else batch_size,)
-    else:
-        sizes = tuple(batch_sizes)
+    sizes = (_DEFAULT_BATCH_SIZE,) if batch_sizes is None else tuple(batch_sizes)
     if not sizes:
         message = "batch_sizes must not be empty"
         raise ValueError(message)
     if any(size <= 0 for size in sizes):
-        message = "batch_size must be positive"
+        message = "batch_sizes must contain only positive values"
         raise ValueError(message)
     if len(set(sizes)) != len(sizes):
         message = "batch_sizes must not contain duplicates"

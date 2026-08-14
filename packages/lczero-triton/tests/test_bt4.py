@@ -573,10 +573,13 @@ def test_build_entry_point_is_importable() -> None:
     assert callable(build)
 
 
-def test_build_rejects_non_positive_batch_before_network_validation() -> None:
+def test_build_rejects_non_positive_batch_sizes_before_network_validation() -> None:
     """Invalid batches fail before allocations or protobuf traversal."""
-    with pytest.raises(ValueError, match="batch_size must be positive"):
-        build(ExecutableBuilder(), net_pb2.Net(), batch_size=0)
+    with pytest.raises(
+        ValueError,
+        match="batch_sizes must contain only positive values",
+    ):
+        build(ExecutableBuilder(), net_pb2.Net(), batch_sizes=(0,))
 
 
 def test_build_normalizes_and_builds_encoder(
@@ -596,7 +599,7 @@ def test_build_normalizes_and_builds_encoder(
     _stub_compilers(monkeypatch)
     _stop_after_encoders(monkeypatch)
 
-    build(ExecutableBuilder(), network, batch_size=1)
+    build(ExecutableBuilder(), network, batch_sizes=(1,))
 
     assert (
         network.format.network_format.network
@@ -617,7 +620,7 @@ def test_build_stores_sparse_network_fingerprint(
     _stop_after_embedding(monkeypatch)
     builder = ExecutableBuilder()
 
-    build(builder, network, batch_size=2)
+    build(builder, network, batch_sizes=(2,))
 
     fingerprint = _parse_fingerprint(builder)
     network_format = fingerprint.format.network_format
@@ -647,7 +650,7 @@ def test_build_stores_sparse_network_fingerprint(
     assert all(not layer.dims for layer in active_layers)
 
 
-def test_fingerprint_ignores_weight_values_encodings_and_batch_size(
+def test_fingerprint_ignores_weight_values_encodings_and_batch_sizes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Transport details and executable batch variants do not affect identity."""
@@ -662,8 +665,8 @@ def test_fingerprint_ignores_weight_values_encodings_and_batch_size(
     _stop_after_embedding(monkeypatch)
     first_builder = ExecutableBuilder()
     second_builder = ExecutableBuilder()
-    build(first_builder, first, batch_size=1)
-    build(second_builder, second, batch_size=3)
+    build(first_builder, first, batch_sizes=(1,))
+    build(second_builder, second, batch_sizes=(3,))
 
     assert first_builder.build().metadata == second_builder.build().metadata
 
@@ -717,7 +720,7 @@ def test_full_graph_fingerprint_contains_all_active_layers(
     _stub_head_compilers(monkeypatch)
     builder = ExecutableBuilder()
 
-    build(builder, network, batch_size=1)
+    build(builder, network, batch_sizes=(1,))
 
     active_layers = _present_fingerprint_layers(_parse_fingerprint(builder))
     assert len(active_layers) == _FULL_FINGERPRINT_LAYER_COUNT
@@ -737,8 +740,8 @@ def test_fingerprint_changes_when_semantic_enum_changes(
     _stop_after_embedding(monkeypatch)
     first_builder = ExecutableBuilder()
     second_builder = ExecutableBuilder()
-    build(first_builder, first, batch_size=1)
-    build(second_builder, second, batch_size=1)
+    build(first_builder, first, batch_sizes=(1,))
+    build(second_builder, second, batch_sizes=(1,))
 
     assert first_builder.build().metadata != second_builder.build().metadata
 
@@ -762,7 +765,7 @@ def test_encoder_builds_names_order_and_specializations(
     _stop_after_encoders(monkeypatch)
     builder = ExecutableBuilder()
 
-    build(builder, network, batch_size=2)
+    build(builder, network, batch_sizes=(2,))
     executable = builder.build()
     nodes = executable.programs[0].nodes
     functions = [executable.kernels[node.kernel_idx].function for node in nodes]
@@ -856,7 +859,7 @@ def test_embedding_infers_external_shapes_from_layer_counts(
     _stop_after_embedding(monkeypatch)
     builder = ExecutableBuilder()
 
-    build(builder, network, batch_size=2)
+    build(builder, network, batch_sizes=(2,))
     executable = builder.build()
     buffers = {
         buffer.name: buffer
@@ -919,7 +922,7 @@ def test_embedding_builds_expected_operations_and_specializations(
     _stop_after_embedding(monkeypatch)
     builder = ExecutableBuilder()
 
-    build(builder, network, batch_size=2)
+    build(builder, network, batch_sizes=(2,))
     executable = builder.build()
     nodes = executable.programs[0].nodes
     functions = [executable.kernels[node.kernel_idx].function for node in nodes]
@@ -976,7 +979,7 @@ def test_embedding_preserves_pointer_reinterpretation_skip_and_reuse(
     _stop_after_embedding(monkeypatch)
     builder = ExecutableBuilder()
 
-    build(builder, network, batch_size=2)
+    build(builder, network, batch_sizes=(2,))
     executable = builder.build()
     nodes = executable.programs[0].nodes
     arguments = [[_location(argument) for argument in node.arguments] for node in nodes]
@@ -1035,7 +1038,7 @@ def test_output_heads_build_contracts_and_independent_branches(
     monkeypatch.setattr(network_module, "_encoder_tower", _keep_body)
     builder = ExecutableBuilder()
 
-    build(builder, network, batch_size=2)
+    build(builder, network, batch_sizes=(2,))
     executable = builder.build()
     nodes = executable.programs[0].nodes
     functions = [executable.kernels[node.kernel_idx].function for node in nodes]
@@ -1164,7 +1167,7 @@ def test_policy_embedding_prefers_head_local_weights(
     monkeypatch.setattr(network_module, "_encoder_tower", _keep_body)
     builder = ExecutableBuilder()
 
-    build(builder, network, batch_size=1)
+    build(builder, network, batch_sizes=(1,))
     buffers = {buffer.name: tuple(buffer.shape) for buffer in builder.build().buffers}
 
     assert buffers["/policy/dense1/matmul/w"] == (16, 10)
@@ -1190,7 +1193,7 @@ def test_output_heads_reject_wrong_terminal_width(
     monkeypatch.setattr(network_module, "_encoder_tower", _keep_body)
 
     with pytest.raises(NetworkFormatError, match="/output/wdl output"):
-        build(ExecutableBuilder(), network, batch_size=1)
+        build(ExecutableBuilder(), network, batch_sizes=(1,))
 
 
 def test_embedding_rejects_matrix_count_not_divisible_by_input_width(
@@ -1206,7 +1209,7 @@ def test_embedding_rejects_matrix_count_not_divisible_by_input_width(
         NetworkFormatError,
         match=r"weights\.ip_emb_ffn\.dense1_w: .*not divisible",
     ):
-        build(ExecutableBuilder(), network, batch_size=2)
+        build(ExecutableBuilder(), network, batch_sizes=(2,))
 
 
 def test_layer_elements_uses_layer_encoding_override() -> None:

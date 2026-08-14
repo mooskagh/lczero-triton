@@ -1,5 +1,6 @@
 """Tests for the Lc0 command-line interface."""
 
+import argparse
 import logging
 import os
 import sys
@@ -7,11 +8,15 @@ from pathlib import Path
 
 import pytest
 from lczero_triton import cli
-from lczero_triton.cli import _build_parser, _configure_logging
+from lczero_triton.cli import (
+    _build_parser,
+    _configure_logging,
+    _parse_batch_size_expression,
+)
 
 
-def test_parser_accepts_graph_network_and_batch_size() -> None:
-    """Graph construction accepts its source network and optional batch size."""
+def test_parser_expands_batch_size_lists_ranges_and_repeated_options() -> None:
+    """Graph construction expands all batch-size expressions into concrete values."""
     arguments = _build_parser().parse_args(
         [
             "graph",
@@ -20,12 +25,38 @@ def test_parser_accepts_graph_network_and_batch_size() -> None:
             "--output",
             "output.lc0ex",
             "--batch-size",
-            "1",
+            "1,3",
+            "--batch-size",
+            "5-9:2",
         ]
     )
 
     assert arguments.command == "graph"
-    assert arguments.batch_sizes == [1]
+    assert arguments.batch_sizes == [1, 3, 5, 7, 9]
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("1", [1]),
+        ("1,2,4", [1, 2, 4]),
+        ("4-8", [4, 5, 6, 7, 8]),
+        ("4-10:3", [4, 7, 10]),
+    ],
+)
+def test_parse_batch_size_expression(
+    expression: str,
+    expected: list[int],
+) -> None:
+    """Batch-size expression parsing produces ordered concrete values."""
+    assert _parse_batch_size_expression(expression) == expected
+
+
+@pytest.mark.parametrize("expression", ["", "0", "4-1", "1-3:0", "four"])
+def test_parse_batch_size_expression_rejects_invalid_values(expression: str) -> None:
+    """Malformed, non-positive, and descending expressions are rejected."""
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_batch_size_expression(expression)
 
 
 def test_main_keeps_artifact_path_on_stdout_and_progress_on_stderr(

@@ -3,6 +3,7 @@
 import argparse
 import logging
 import os
+import re
 import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, redirect_stdout
@@ -78,21 +79,52 @@ def _build_parser() -> argparse.ArgumentParser:
     graph_parser.add_argument(
         "--batch-size",
         dest="batch_sizes",
-        type=_positive_integer,
-        action="append",
+        type=_parse_batch_size_expression,
+        action="extend",
         default=None,
-        help="fixed batch size to compile; repeat for multiple programs",
+        help=(
+            "fixed batch sizes to compile; use comma-separated values or "
+            "inclusive ranges such as 1,2,4-16:2"
+        ),
     )
     return parser
 
 
-def _positive_integer(value: str) -> int:
-    """Parse an argparse integer that must be positive."""
-    parsed = int(value)
-    if parsed <= 0:
-        message = "must be positive"
-        raise argparse.ArgumentTypeError(message)
-    return parsed
+def _parse_batch_size_expression(value: str) -> list[int]:
+    """Parse comma-separated positive values and inclusive ascending ranges."""
+    sizes: list[int] = []
+    for raw_expression in value.split(","):
+        expression = raw_expression.strip()
+        if not expression:
+            message = "batch-size expressions must not be empty"
+            raise argparse.ArgumentTypeError(message)
+
+        match = re.fullmatch(r"([0-9]+)-([0-9]+)(?::([0-9]+))?", expression)
+        if match is not None:
+            start = int(match.group(1))
+            stop = int(match.group(2))
+            step = 1 if match.group(3) is None else int(match.group(3))
+            if start <= 0 or stop <= 0:
+                message = "batch sizes must be positive"
+                raise argparse.ArgumentTypeError(message)
+            if start > stop:
+                message = "batch-size ranges must be ascending"
+                raise argparse.ArgumentTypeError(message)
+            if step <= 0:
+                message = "batch-size range steps must be positive"
+                raise argparse.ArgumentTypeError(message)
+            sizes.extend(range(start, stop + 1, step))
+            continue
+
+        if not re.fullmatch(r"[0-9]+", expression):
+            message = f"invalid batch-size expression: {expression!r}"
+            raise argparse.ArgumentTypeError(message)
+        size = int(expression)
+        if size <= 0:
+            message = "batch sizes must be positive"
+            raise argparse.ArgumentTypeError(message)
+        sizes.append(size)
+    return sizes
 
 
 if __name__ == "__main__":

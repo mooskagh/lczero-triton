@@ -194,7 +194,6 @@ def build(
     builder: ExecutableBuilder,
     network: net_pb2.Net,
     *,
-    batch_size: int | None = None,
     batch_sizes: Sequence[int] | None = None,
 ) -> None:
 ```
