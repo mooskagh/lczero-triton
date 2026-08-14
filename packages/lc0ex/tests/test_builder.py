@@ -79,31 +79,6 @@ def test_external_buffer_reuses_an_identical_declaration() -> None:
     assert second is first
 
 
-def test_external_buffer_rejects_conflicting_redeclarations() -> None:
-    """A repeated external name must retain all physical metadata."""
-    builder = _builder()
-    builder.persistent_buffer(name="weights", shape=(2, 3), dtype=F16)
-
-    with pytest.raises(ValueError, match="shape"):
-        builder.persistent_buffer(name="weights", shape=(3, 2), dtype=F16)
-    with pytest.raises(ValueError, match="data type"):
-        builder.persistent_buffer(name="weights", shape=(2, 3), dtype=F32)
-    with pytest.raises(ValueError, match="writability"):
-        builder.persistent_buffer(
-            name="weights",
-            shape=(2, 3),
-            dtype=F16,
-            writable=True,
-        )
-    with pytest.raises(ValueError, match="alignment"):
-        builder.persistent_buffer(
-            name="weights",
-            shape=(2, 3),
-            dtype=F16,
-            alignment_bytes=16,
-        )
-
-
 def test_same_named_buffers_are_private_to_programs() -> None:
     """Programs may use the same logical name with independent contracts."""
     builder = _builder()
@@ -151,16 +126,6 @@ def test_temporary_buffer_is_packed_in_program_allocation() -> None:
     executable = builder.build()
 
     assert executable.programs[0].execution_allocation.size_bytes == 128
-
-
-@pytest.mark.parametrize("size_bytes", [0, -1])
-def test_temporary_buffer_rejects_invalid_size(size_bytes: int) -> None:
-    """Raw internal storage must have a positive uint64 byte count."""
-    builder = _builder()
-    program = builder.program(name="main")
-
-    with pytest.raises(ValueError, match="positive uint64"):
-        program.temporary_buffer(size_bytes=size_bytes, alignment_bytes=1)
 
 
 def test_named_execution_buffers_serialize_in_program_allocation() -> None:

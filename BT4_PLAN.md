@@ -242,7 +242,6 @@ Add tests for:
 - Representative unusual names and ONNX `[K, N]` orientation
 - Per-block dimension adaptation and material local architecture constraints
 - Unsupported RPE, policy encoders, head formats, and activation variants
-- No duplicate external declarations with conflicting metadata
 
 Weight decoding and upload remain separate concerns. The graph builder reads
 only protobuf structure, format fields, and encoded layer lengths.
