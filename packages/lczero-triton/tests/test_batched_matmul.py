@@ -1,7 +1,6 @@
 """Tests for indexed batched attention matrix multiplication."""
 
 from collections.abc import Sequence
-from typing import cast
 
 import pytest
 import torch
@@ -90,75 +89,6 @@ def test_autotune_keys_cover_every_indexing_decision() -> None:
     }
     assert qk_configs == set(_TILE_CONFIGS)
     assert attention_v_configs == set(_TILE_CONFIGS)
-
-
-@pytest.mark.parametrize(
-    ("values", "message"),
-    [
-        (("body_qk", 0, 1, 1, 1, 1), "positive"),
-        (("body_qk", 3, 1, 1, 1, 2), "divisible"),
-        (("policy_qk", 2, 1, 1, 1, 2), "one logical matrix"),
-        (("policy_qk", 1, 65, 66, 1, 1), "exceeds"),
-    ],
-)
-def test_specialization_rejects_invalid_layouts(
-    values: tuple[BatchedMatmulOperation, int, int, int, int, int],
-    message: str,
-) -> None:
-    """Logical matrices must fit their operation's physical layout."""
-    operation, batch_count, m, n, k, heads = values
-    with pytest.raises(ValueError, match=message):
-        BatchedMatmulSpecialization(
-            operation,
-            batch_count,
-            m,
-            n,
-            k,
-            heads,
-            80,
-        )
-
-
-def test_specialization_rejects_unknown_operation_and_target() -> None:
-    """The operation convention and CUDA target are explicit static inputs."""
-    invalid = cast("BatchedMatmulOperation", "unknown")
-    with pytest.raises(ValueError, match="unsupported"):
-        BatchedMatmulSpecialization(invalid, 1, 1, 1, 1, 1, 80)
-    with pytest.raises(ValueError, match="architecture"):
-        BatchedMatmulSpecialization("body_qk", 1, 1, 1, 1, 1, 0)
-
-
-def test_graph_validation_precedes_compilation() -> None:
-    """Scale and alias errors do not trigger GPU compilation."""
-    builder = ExecutableBuilder()
-    program = builder.program(name="main")
-    buffer = program.temporary_buffer(size_bytes=2, alignment_bytes=2)
-    kernels = KernelCache(builder)
-    qk = BatchedMatmulSpecialization("body_qk", 1, 1, 1, 1, 1, 80)
-    attention_v = BatchedMatmulSpecialization("body_attention_v", 1, 1, 1, 1, 1, 80)
-
-    with pytest.raises(ValueError, match="require scale"):
-        batched_matmul(program, kernels, buffer, buffer, buffer, qk)
-    with pytest.raises(ValueError, match="does not"):
-        batched_matmul(
-            program,
-            kernels,
-            buffer,
-            buffer,
-            buffer,
-            attention_v,
-            scale=buffer,
-        )
-    with pytest.raises(ValueError, match="cannot alias"):
-        batched_matmul(
-            program,
-            kernels,
-            buffer,
-            buffer,
-            buffer,
-            qk,
-            scale=buffer,
-        )
 
 
 @pytest.mark.gpu

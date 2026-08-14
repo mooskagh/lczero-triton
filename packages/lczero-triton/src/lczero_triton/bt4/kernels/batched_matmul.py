@@ -17,11 +17,9 @@ from lczero_triton.bt4.kernels._cache import KernelCache
 BatchedMatmulOperation = Literal["body_qk", "body_attention_v", "policy_qk"]
 
 _BODY_QK = tl.constexpr(0)
-_BODY_ATTENTION_V = 1
-_POLICY_QK = tl.constexpr(2)
 _OPERATIONS: dict[BatchedMatmulOperation, int] = {
     "body_qk": 0,
-    "body_attention_v": _BODY_ATTENTION_V,
+    "body_attention_v": 1,
     "policy_qk": 2,
 }
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
@@ -255,74 +253,36 @@ class BatchedMatmulSpecialization:
     heads_per_sample: int
     architecture: int
 
-    def __post_init__(self) -> None:
-        """Validate the operation, dimensions, layout, and target."""
-        if self.operation not in _OPERATIONS:
-            message = f"unsupported batched matmul operation: {self.operation!r}"
-            raise ValueError(message)
-        if any(
-            value <= 0
-            for value in (
-                self.batch_count,
-                self.m,
-                self.n,
-                self.k,
-                self.heads_per_sample,
-            )
-        ):
-            message = "batched matrix dimensions must be positive"
-            raise ValueError(message)
-        if self.batch_count % self.heads_per_sample != 0:
-            message = "batch count must be divisible by heads per sample"
-            raise ValueError(message)
-        if self.operation == "policy_qk":
-            if self.heads_per_sample != 1:
-                message = "policy QK must have one logical matrix per sample"
-                raise ValueError(message)
-            if self.m * self.n > _POLICY_RECORD_SIZE:
-                message = "policy QK matrix exceeds its output record"
-                raise ValueError(message)
-        if self.architecture <= 0:
-            message = "architecture must be positive"
-            raise ValueError(message)
-
-
-def _sample_count(specialization: BatchedMatmulSpecialization) -> int:
-    """Return the physical sample count represented by logical matrices."""
-    return specialization.batch_count // specialization.heads_per_sample
-
 
 def compile_batched_matmul(
     specialization: BatchedMatmulSpecialization,
 ) -> KernelArtifact:
     """Autotune and compile one indexed FP16 batched GEMM specialization."""
     validate_active_architecture(specialization.architecture)
-    sample_count = _sample_count(specialization)
     operation = _OPERATIONS[specialization.operation]
+    output_batch_stride = (
+        _POLICY_RECORD_SIZE
+        if specialization.operation == "policy_qk"
+        else specialization.m * specialization.n
+    )
+    output = torch.empty(
+        specialization.batch_count * output_batch_stride,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    left = torch.zeros(
+        specialization.batch_count * specialization.m * specialization.k,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    right = torch.zeros(
+        specialization.batch_count * specialization.n * specialization.k,
+        dtype=torch.float16,
+        device="cuda",
+    )
     parameters: tuple[int, ...]
 
     if specialization.operation == "body_attention_v":
-        output = torch.empty(
-            sample_count
-            * specialization.m
-            * specialization.heads_per_sample
-            * specialization.n,
-            dtype=torch.float16,
-            device="cuda",
-        )
-        left = torch.zeros(
-            specialization.batch_count * specialization.m * specialization.k,
-            dtype=torch.float16,
-            device="cuda",
-        )
-        right = torch.zeros(
-            sample_count
-            * specialization.k
-            * specialization.heads_per_sample
-            * specialization.n,
-            dtype=torch.float16,
-            device="cuda",
-        )
         compiled = _attention_v_kernel[_autotune_grid](
             output,
             left,
@@ -336,31 +296,6 @@ def compile_batched_matmul(
         selected = _attention_v_kernel.best_config
         parameters = (_POINTER, _POINTER, _POINTER)
     else:
-        if specialization.operation == "body_qk":
-            left_size = (
-                sample_count
-                * specialization.m
-                * specialization.heads_per_sample
-                * specialization.k
-            )
-            right_size = (
-                sample_count
-                * specialization.n
-                * specialization.heads_per_sample
-                * specialization.k
-            )
-            output_size = (
-                specialization.batch_count * specialization.m * specialization.n
-            )
-        else:
-            left_size = specialization.batch_count * specialization.m * specialization.k
-            right_size = (
-                specialization.batch_count * specialization.n * specialization.k
-            )
-            output_size = specialization.batch_count * _POLICY_RECORD_SIZE
-        output = torch.empty(output_size, dtype=torch.float16, device="cuda")
-        left = torch.zeros(left_size, dtype=torch.float16, device="cuda")
-        right = torch.zeros(right_size, dtype=torch.float16, device="cuda")
         scale = torch.ones(1, dtype=torch.float16, device="cuda")
         compiled = _qk_kernel[_autotune_grid](
             output,
@@ -373,11 +308,7 @@ def compile_batched_matmul(
             specialization.m,
             specialization.n,
             specialization.k,
-            (
-                _POLICY_RECORD_SIZE
-                if specialization.operation == "policy_qk"
-                else specialization.m * specialization.n
-            ),
+            output_batch_stride,
         )
         selected = _qk_kernel.best_config
         parameters = (_POINTER, _POINTER, _POINTER, _POINTER)
@@ -405,25 +336,12 @@ def batched_matmul(
     scale: Buffer | None = None,
 ) -> None:
     """Append one indexed batched matrix multiplication."""
-    scaled = specialization.operation != "body_attention_v"
-    if scaled != (scale is not None):
-        message = "QK operations require scale; attention-times-V does not"
-        raise ValueError(message)
-    if output is left or output is right or output is scale:
-        message = "batched GEMM output cannot alias an input"
-        raise ValueError(message)
-
     builder.set_target(
         lc0ex_pb2.Target.VENDOR_NVIDIA,
         f"sm_{specialization.architecture}",
     )
     kernel = kernels.get(compile_batched_matmul, specialization)
-    readonly = [left]
-    if right is not left:
-        readonly.append(right)
+    arguments: tuple[Buffer, ...] = (output, left, right)
     if scale is not None:
-        if all(scale is not source for source in readonly):
-            readonly.append(scale)
-        builder.call(kernel, output, left, right, scale, readonly=readonly)
-    else:
-        builder.call(kernel, output, left, right, readonly=readonly)
+        arguments += (scale,)
+    builder.call(kernel, *arguments, readonly=arguments[1:])
