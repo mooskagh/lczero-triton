@@ -1,6 +1,6 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-proto_sources := "lc0ex.proto net.proto"
+proto_sources := "lc0ex.proto lc0ex_metadata.proto net.proto"
 proto_output := "packages/lc0ex/src/lc0ex/proto"
 python_paths := "packages"
 

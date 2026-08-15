@@ -20,7 +20,7 @@ import lczero_triton.bt4.kernels.softmax_64 as softmax_64_module
 import lczero_triton.bt4.network as network_module
 import pytest
 from lc0ex import Buffer, ExecutableBuilder, KernelArtifact, SymbolArtifact
-from lc0ex.proto import lc0ex_pb2, net_pb2
+from lc0ex.proto import lc0ex_metadata_pb2, lc0ex_pb2, net_pb2
 from lczero_triton.bt4.kernels.add_bias_batched import (
     AddBiasBatchedSpecialization,
 )
@@ -672,6 +672,12 @@ def test_build_can_emit_multiple_program_specific_batch_allocations(
     executable = builder.build()
 
     assert [program.name for program in executable.programs] == ["batch-1", "batch-3"]
+    metadata: list[int] = []
+    for program in executable.programs:
+        program_metadata = lc0ex_metadata_pb2.ProgramMetadata()
+        program_metadata.ParseFromString(program.metadata)
+        metadata.append(program_metadata.batch_size)
+    assert metadata == [1, 3]
     assert [tuple(program.buffers[0].shape) for program in executable.programs] == [
         (1, 112),
         (3, 112),

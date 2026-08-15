@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from lc0ex import Buffer, ExecutableBuilder, ProgramBuilder
-from lc0ex.proto import lc0ex_pb2, net_pb2
+from lc0ex.proto import lc0ex_metadata_pb2, lc0ex_pb2, net_pb2
 
 from lczero_triton.bt4._format import (
     normalize_network,
@@ -118,7 +118,12 @@ def build(
     for size in batch_sizes:
         program_name = "main" if len(batch_sizes) == 1 else f"batch-{size}"
         _LOGGER.info("building program %s for batch size %d", program_name, size)
-        program = builder.program(name=program_name)
+        program = builder.program(
+            name=program_name,
+            metadata=lc0ex_metadata_pb2.ProgramMetadata(
+                batch_size=size,
+            ).SerializeToString(deterministic=True),
+        )
         context = _BuildContext(
             builder=program,
             kernels=kernels,

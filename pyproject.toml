@@ -80,6 +80,7 @@ disable_error_code = [
 
 [[tool.mypy.overrides]]
 module = [
+    "lc0ex.proto.lc0ex_metadata_pb2",
     "lc0ex.proto.lc0ex_pb2",
     "lc0ex.proto.net_pb2",
 ]
