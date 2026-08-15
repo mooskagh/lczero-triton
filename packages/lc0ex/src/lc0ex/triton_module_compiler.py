@@ -10,6 +10,11 @@ from triton.backends.nvidia.compiler import get_ptxas
 from lc0ex.kernel_builder import KernelArtifact
 from lc0ex.proto import lc0ex_pb2
 
+_TRITON_SCRATCH_PARAMETERS = (
+    lc0ex_pb2.PARAMETER_TYPE_NULL_POINTER,
+    lc0ex_pb2.PARAMETER_TYPE_NULL_POINTER,
+)
+
 
 def compile_ptx(ptx: str, *, architecture: str) -> bytes:
     """Assemble PTX for *architecture* with Triton's configured ptxas."""
@@ -42,11 +47,17 @@ def artifact_from_triton(
         1,
         1,
     )
+    if (
+        getattr(compiled.metadata, "global_scratch_size", 0) != 0
+        or getattr(compiled.metadata, "profile_scratch_size", 0) != 0
+    ):
+        message = "Triton scratch allocations are not supported in lc0ex artifacts."
+        raise ValueError(message)
     return KernelArtifact(
         binary_format=lc0ex_pb2.Binary.FORMAT_CUBIN,
         binary_data=compiled.asm["cubin"],
         function=compiled.name,
-        parameters=parameters,
+        parameters=parameters + _TRITON_SCRATCH_PARAMETERS,
         grid=grid,
         block=block,
         dynamic_shared_memory_bytes=compiled.metadata.shared,

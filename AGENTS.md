@@ -34,4 +34,5 @@ printf 'uci\nquit\n' | \
 ```
 
 The preload check verifies lc0ex loading, CUDA initialization, and network
-fingerprint compatibility; graph inference is not wired into the backend yet.
+fingerprint compatibility; a UCI search additionally exercises graph inference
+and result decoding.

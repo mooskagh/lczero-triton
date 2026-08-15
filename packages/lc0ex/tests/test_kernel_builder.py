@@ -14,6 +14,7 @@ from lc0ex.proto import lc0ex_pb2
 
 F16 = lc0ex_pb2.Buffer.DATA_TYPE_F16
 POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
+NULL_POINTER = lc0ex_pb2.PARAMETER_TYPE_NULL_POINTER
 TARGET_ARCHITECTURE = "sm_80"
 
 
@@ -75,6 +76,22 @@ def test_add_kernel_and_call_serializes_generic_metadata() -> None:
         argument.allocation.offset
         for argument in executable.programs[0].nodes[0].arguments
     ] == [0, 2, 4]
+
+
+def test_null_pointer_parameters_are_omitted_from_node_arguments() -> None:
+    """Null pointer ABI slots are supplied by the runtime, not the graph."""
+    builder = _builder()
+    program = builder.program(name="main")
+    kernel = builder.add_kernel(_artifact(parameters=(POINTER, NULL_POINTER, POINTER)))
+    first = _external(builder, "first")
+    second = _external(builder, "second")
+    program.call(kernel, first, second)
+
+    executable = builder.build()
+    node = executable.programs[0].nodes[0]
+
+    assert list(executable.kernels[0].parameters) == [POINTER, NULL_POINTER, POINTER]
+    assert [argument.allocation.offset for argument in node.arguments] == [0, 2]
 
 
 def test_readonly_external_buffers_have_no_dependency() -> None:

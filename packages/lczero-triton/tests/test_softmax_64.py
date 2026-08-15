@@ -25,6 +25,7 @@ _CUDA_REQUIRED = pytest.mark.skipif(
     reason="CUDA is unavailable",
 )
 _FIXED_ROW_COUNT = 169 * 32 * 64
+_NULL_POINTERS = (lc0ex_pb2.PARAMETER_TYPE_NULL_POINTER,) * 2
 
 
 def _architecture() -> int:
@@ -191,7 +192,10 @@ def test_compilation_captures_selected_launch_and_pointer_abi() -> None:
     assert artifact.binary_format == lc0ex_pb2.Binary.FORMAT_CUBIN
     assert artifact.binary_data
     assert artifact.function
-    assert artifact.parameters == (lc0ex_pb2.PARAMETER_TYPE_POINTER,) * 3
+    assert artifact.parameters == (
+        *(lc0ex_pb2.PARAMETER_TYPE_POINTER,) * 3,
+        *_NULL_POINTERS,
+    )
     assert artifact.grid == _artifact_grid(selected.kwargs, 17)
     assert artifact.block == (selected.num_warps * 32, 1, 1)
 

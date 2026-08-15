@@ -79,6 +79,7 @@ pytestmark = [
 ]
 
 _THREE_POINTERS = 3
+_NULL_POINTERS = (lc0ex_pb2.PARAMETER_TYPE_NULL_POINTER,) * 2
 _WARP_SIZE = 32
 
 
@@ -101,6 +102,7 @@ def test_real_compilation_produces_pointer_abi_and_static_launch() -> None:
     assert artifact.parameters == (
         lc0ex_pb2.PARAMETER_TYPE_POINTER,
         lc0ex_pb2.PARAMETER_TYPE_POINTER,
+        *_NULL_POINTERS,
     )
     assert artifact.grid == copy_artifact_grid(selected.kwargs, 257)
     assert artifact.block == (selected.num_warps * _WARP_SIZE, 1, 1)
@@ -175,7 +177,8 @@ def test_remaining_step_five_families_capture_autotuned_artifacts() -> None:
         (policy_artifact, _policy_map_kernel, _THREE_POINTERS),
     )
     for artifact, kernel, pointer_count in artifacts_and_kernels:
-        assert len(artifact.parameters) == pointer_count
+        assert len(artifact.parameters) == pointer_count + len(_NULL_POINTERS)
+        assert tuple(artifact.parameters[-len(_NULL_POINTERS) :]) == _NULL_POINTERS
         assert artifact.binary_data
         assert artifact.block == (kernel.best_config.num_warps * _WARP_SIZE, 1, 1)
 

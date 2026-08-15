@@ -24,6 +24,7 @@ from lczero_triton.bt4.kernels.batched_matmul import (
 _FP16_ATOL = 3e-2
 _FP16_RTOL = 2e-2
 _TEST_HEADS = 2
+_NULL_POINTERS = (lc0ex_pb2.PARAMETER_TYPE_NULL_POINTER,) * 2
 _CUDA_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA is unavailable",
@@ -285,7 +286,10 @@ def test_compilation_captures_selected_launch_and_abi(
     assert artifact.binary_format == lc0ex_pb2.Binary.FORMAT_CUBIN
     assert artifact.binary_data
     assert artifact.function
-    assert artifact.parameters == (lc0ex_pb2.PARAMETER_TYPE_POINTER,) * pointer_count
+    assert artifact.parameters == (
+        *((lc0ex_pb2.PARAMETER_TYPE_POINTER,) * pointer_count),
+        *_NULL_POINTERS,
+    )
     assert artifact.grid == _artifact_grid(
         selected.kwargs,
         specialization.m,

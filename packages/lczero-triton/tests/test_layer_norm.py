@@ -28,6 +28,7 @@ _CUDA_REQUIRED = pytest.mark.skipif(
 _FP16_ATOL = 8e-3
 _FP16_RTOL = 8e-3
 _MISH_BRANCH = -0.6
+_NULL_POINTERS = (lc0ex_pb2.PARAMETER_TYPE_NULL_POINTER,) * 2
 
 
 def _architecture() -> int:
@@ -331,8 +332,9 @@ def test_compilation_captures_variant_abi_and_launch(variant: str) -> None:
     assert artifact.binary_format == lc0ex_pb2.Binary.FORMAT_CUBIN
     assert artifact.binary_data
     assert artifact.function
-    assert artifact.parameters == (lc0ex_pb2.PARAMETER_TYPE_POINTER,) * (
-        7 if has_skip else 5
+    assert artifact.parameters == (
+        *((lc0ex_pb2.PARAMETER_TYPE_POINTER,) * (7 if has_skip else 5)),
+        *_NULL_POINTERS,
     )
     assert artifact.grid == _artifact_grid(2)
     assert artifact.block == (kernel.best_config.num_warps * 32, 1, 1)

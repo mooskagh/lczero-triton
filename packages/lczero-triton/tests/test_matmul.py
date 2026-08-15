@@ -38,6 +38,7 @@ _BT4_DENSE_SHAPES = (
     (169, 2048, 128),
     (169, 128, 1),
 )
+_NULL_POINTERS = (lc0ex_pb2.PARAMETER_TYPE_NULL_POINTER,) * 2
 _FP16_ATOL = 2e-2
 _FP16_RTOL = 1e-2
 
@@ -118,6 +119,7 @@ def test_compilation_captures_selected_configuration_and_static_launch() -> None
         lc0ex_pb2.PARAMETER_TYPE_POINTER,
         lc0ex_pb2.PARAMETER_TYPE_POINTER,
         lc0ex_pb2.PARAMETER_TYPE_POINTER,
+        *_NULL_POINTERS,
     )
     assert artifact.grid == _artifact_grid(selected.kwargs, 169, 3)
     assert artifact.block == (selected.num_warps * 32, 1, 1)

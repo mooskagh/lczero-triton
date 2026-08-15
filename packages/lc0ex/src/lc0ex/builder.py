@@ -119,6 +119,17 @@ class ProgramBuilder:
     ) -> None:
         """Append a call to this program."""
         buffers = self._owner._buffers  # noqa: SLF001
+        artifact = self._owner._kernels[kernel]  # noqa: SLF001
+        expected_argument_count = sum(
+            parameter != lc0ex_pb2.PARAMETER_TYPE_NULL_POINTER
+            for parameter in artifact.parameters
+        )
+        if len(arguments) != expected_argument_count:
+            message = (
+                f"Kernel call has {len(arguments)} arguments; expected "
+                f"{expected_argument_count}."
+            )
+            raise ValueError(message)
         self._invocations.append(
             _KernelInvocation(
                 kernel=kernel,

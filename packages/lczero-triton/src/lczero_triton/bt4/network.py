@@ -427,6 +427,7 @@ def _embedding(
         name="/attn_body/ffn/alpha/w",
         shape=(1,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+        alignment_bytes=256,
     )
     ffn_gammas = _vector_f16(
         context,
@@ -919,11 +920,13 @@ def _attention(  # noqa: PLR0913
         name=f"{prefix}/mha/QK/scale/w",
         shape=(1,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+        alignment_bytes=256,
     )
     alpha = context.builder.persistent_buffer(
         name=f"{prefix}/alpha*input/w",
         shape=(1,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+        alignment_bytes=256,
     )
 
     token_rows = context.batch_size * _SQUARE_COUNT
@@ -1097,6 +1100,7 @@ def _ffn(
         name=f"{prefix}/ffn/alpha/w",
         shape=(1,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+        alignment_bytes=256,
     )
 
     token_rows = context.batch_size * _SQUARE_COUNT
@@ -1215,6 +1219,7 @@ def _policy_head(
         name="/policy/scale/w",
         shape=(1,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+        alignment_bytes=256,
     )
     output = context.builder.buffer(
         name="/output/policy",
@@ -1579,6 +1584,7 @@ def _vector_f16(
         name=name,
         shape=(width,),
         dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+        alignment_bytes=256,
     )
 
 
@@ -1599,6 +1605,7 @@ def _matrix_f16(
             name=name,
             shape=(input_width, output_width),
             dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+            alignment_bytes=256,
         ),
         output_width,
     )
