@@ -14,6 +14,8 @@ from lc0ex.triton_module_compiler import artifact_from_triton
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
+# Set this to false when the FP32 accumulator path is required for comparison.
+_USE_FP16_ACCUMULATOR = tl.constexpr(value=True)
 _GROUP_SIZES_M = (1, 4, 8)
 _TILE_CONFIGS = (
     (128, 256, 64, 8, 3),
@@ -24,6 +26,11 @@ _TILE_CONFIGS = (
     (128, 32, 32, 4, 4),
     (64, 32, 32, 2, 5),
     (32, 64, 32, 2, 5),
+    (128, 128, 32, 8, 4),
+    (128, 128, 64, 8, 3),
+    (128, 128, 64, 8, 4),
+    (128, 64, 64, 8, 3),
+    (64, 128, 64, 8, 3),
 )
 _MATMUL_CONFIGS = tuple(
     triton.Config(
@@ -72,26 +79,33 @@ def _matmul_kernel(
     )
     program_n = (program_id % programs_per_group) // group_program_count_m
 
-    offsets_m = (program_m * block_m + tl.arange(0, block_m)) % m
-    offsets_n = (program_n * block_n + tl.arange(0, block_n)) % n
+    offsets_m = program_m * block_m + tl.arange(0, block_m)
+    offsets_n = program_n * block_n + tl.arange(0, block_n)
     offsets_k = tl.arange(0, block_k)
     activation_pointers = activations + offsets_m[:, None] * k + offsets_k[None, :]
     weight_pointers = weights + offsets_k[:, None] * n + offsets_n[None, :]
-    accumulator = tl.zeros((block_m, block_n), dtype=tl.float32)
-
+    accumulator = tl.zeros(
+        (block_m, block_n),
+        dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
+    )
     for k_block in range(tl.cdiv(k, block_k)):
         remaining_k = k - k_block * block_k
         activation_values = tl.load(
             activation_pointers,
-            mask=offsets_k[None, :] < remaining_k,
+            mask=(offsets_m[:, None] < m) & (offsets_k[None, :] < remaining_k),
             other=0.0,
         )
         weight_values = tl.load(
             weight_pointers,
-            mask=offsets_k[:, None] < remaining_k,
+            mask=(offsets_k[:, None] < remaining_k) & (offsets_n[None, :] < n),
             other=0.0,
         )
-        accumulator = tl.dot(activation_values, weight_values, accumulator)
+        accumulator = tl.dot(
+            activation_values,
+            weight_values,
+            accumulator,
+            out_dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
+        )
         activation_pointers += block_k
         weight_pointers += block_k * n
 

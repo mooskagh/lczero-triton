@@ -94,7 +94,40 @@ def test_matmul_matches_torch_for_every_bt4_specialization(
     )
     result = torch.empty((m, n), dtype=torch.float16, device="cuda")
 
-    _matmul_kernel[_autotune_grid](result, activations, weights, m, n, k)
+    _matmul_kernel[_autotune_grid](
+        result,
+        activations,
+        weights,
+        m,
+        n,
+        k,
+    )
+
+    expected = torch.matmul(activations, weights)
+    torch.testing.assert_close(
+        result,
+        expected,
+        rtol=_FP16_RTOL,
+        atol=_FP16_ATOL,
+    )
+
+
+def test_matmul_masks_non_divisible_m_n_and_k() -> None:
+    """Tail tiles do not wrap around into valid rows or columns."""
+    torch.manual_seed(37)
+    m, k, n = 7, 37, 11
+    activations = torch.randn((m, k), dtype=torch.float16, device="cuda") * 0.05
+    weights = torch.randn((k, n), dtype=torch.float16, device="cuda") * 0.05
+    result = torch.empty((m, n), dtype=torch.float16, device="cuda")
+
+    _matmul_kernel[_autotune_grid](
+        result,
+        activations,
+        weights,
+        m,
+        n,
+        k,
+    )
 
     expected = torch.matmul(activations, weights)
     torch.testing.assert_close(
