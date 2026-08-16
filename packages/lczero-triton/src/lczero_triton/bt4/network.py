@@ -34,6 +34,12 @@ from lczero_triton.bt4.kernels.expand_planes import (
     ExpandPlanesSpecialization,
     expand_planes,
 )
+from lczero_triton.bt4.kernels.fused_qkv import (
+    FusedQkvBiasSpecialization,
+    FusedQkvProjectionSpecialization,
+    fused_qkv_bias,
+    fused_qkv_projection,
+)
 from lczero_triton.bt4.kernels.input_gating import (
     InputGatingSpecialization,
     input_gating,
@@ -947,28 +953,50 @@ def _attention(  # noqa: PLR0913
             context.architecture,
         ),
     )
-    projected: list[Buffer] = []
-    for weights, bias, width in projections:
-        value = _temporary_f16(context, element_count=token_rows * width)
-        matmul(
-            context.builder,
-            context.kernels,
-            value,
-            body,
-            weights,
-            MatmulSpecialization(token_rows, width, body_width, context.architecture),
-        )
-        add_bias_batched(
-            context.builder,
-            context.kernels,
-            value,
-            value,
-            bias,
-            AddBiasBatchedSpecialization(
-                1, token_rows, width, "none", context.architecture
-            ),
-        )
-        projected.append(value)
+    projected = [
+        _temporary_f16(context, element_count=token_rows * width)
+        for _weights, _bias, width in projections
+    ]
+    # Keep these as independent buffers until the executable supports packed views.
+    fused_qkv_projection(
+        context.builder,
+        context.kernels,
+        projected[0],
+        projected[1],
+        projected[2],
+        body,
+        projections[0][0],
+        projections[1][0],
+        projections[2][0],
+        FusedQkvProjectionSpecialization(
+            token_rows,
+            projections[0][2],
+            projections[1][2],
+            projections[2][2],
+            body_width,
+            context.architecture,
+        ),
+    )
+    fused_qkv_bias(
+        context.builder,
+        context.kernels,
+        projected[0],
+        projected[0],
+        projections[0][1],
+        projected[1],
+        projected[1],
+        projections[1][1],
+        projected[2],
+        projected[2],
+        projections[2][1],
+        FusedQkvBiasSpecialization(
+            token_rows,
+            projections[0][2],
+            projections[1][2],
+            projections[2][2],
+            context.architecture,
+        ),
+    )
     queries, keys, values = projected
     qk = _temporary_f16(
         context, element_count=attention_batches * expected_smolgen_width

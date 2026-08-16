@@ -8,6 +8,7 @@ import lczero_triton.bt4.kernels.add_vectors as add_vectors_module
 import lczero_triton.bt4.kernels.batched_matmul as batched_matmul_module
 import lczero_triton.bt4.kernels.copy_type_converted as copy_type_converted_module
 import lczero_triton.bt4.kernels.expand_planes as expand_planes_module
+import lczero_triton.bt4.kernels.fused_qkv as fused_qkv_module
 import lczero_triton.bt4.kernels.input_gating as input_gating_module
 import lczero_triton.bt4.kernels.layer_norm as layer_norm_module
 import lczero_triton.bt4.kernels.mapping_table as mapping_table_module
@@ -30,6 +31,10 @@ from lczero_triton.bt4.kernels.copy_type_converted import (
     CopyTypeConvertedSpecialization,
 )
 from lczero_triton.bt4.kernels.expand_planes import ExpandPlanesSpecialization
+from lczero_triton.bt4.kernels.fused_qkv import (
+    FusedQkvBiasSpecialization,
+    FusedQkvProjectionSpecialization,
+)
 from lczero_triton.bt4.kernels.input_gating import InputGatingSpecialization
 from lczero_triton.bt4.kernels.layer_norm import LayerNormSpecialization
 from lczero_triton.bt4.kernels.matmul import MatmulSpecialization
@@ -255,6 +260,16 @@ def _stub_compilers(
         add_bias_batched_module,
         "compile_add_bias_batched",
         _compiler(records, "add_bias_batched", 3),
+    )
+    monkeypatch.setattr(
+        fused_qkv_module,
+        "compile_fused_qkv_projection",
+        _compiler(records, "fused_qkv_projection", 7),
+    )
+    monkeypatch.setattr(
+        fused_qkv_module,
+        "compile_fused_qkv_bias",
+        _compiler(records, "fused_qkv_bias", 9),
     )
 
     def compile_batched_matmul(
@@ -772,12 +787,8 @@ def test_encoder_builds_names_order_and_specializations(
         "matmul",
         "layer_norm",
         "matmul",
-        "matmul",
-        "add_bias_batched",
-        "matmul",
-        "add_bias_batched",
-        "matmul",
-        "add_bias_batched",
+        "fused_qkv_projection",
+        "fused_qkv_bias",
         "body_qk",
         "softmax_64",
         "body_attention_v",
@@ -822,12 +833,16 @@ def test_encoder_builds_names_order_and_specializations(
         BatchedMatmulSpecialization("body_attention_v", 4, 64, 8, 64, 2, _ARCHITECTURE)
         in specializations
     )
+    assert FusedQkvProjectionSpecialization(128, 16, 16, 16, 16, _ARCHITECTURE) in (
+        specializations
+    )
+    assert FusedQkvBiasSpecialization(128, 16, 16, 16, _ARCHITECTURE) in specializations
     assert Softmax64Specialization(4 * 64, _ARCHITECTURE) in specializations
 
     arguments = [[_location(argument) for argument in node.arguments] for node in nodes]
     encoder_start = 12
-    ln1 = arguments[encoder_start + 16]
-    ln2 = arguments[encoder_start + 20]
+    ln1 = arguments[encoder_start + 12]
+    ln2 = arguments[encoder_start + 16]
     assert ln1[3] == arguments[11][0]
     assert ln2[3] == ln1[0]
     assert arguments[-1][0] == ln2[0]
