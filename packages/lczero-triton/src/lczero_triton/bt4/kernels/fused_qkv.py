@@ -35,6 +35,9 @@ def _fused_qkv_projection_kernel(
     weights_q,
     weights_k,
     weights_v,
+    bias_q,
+    bias_k,
+    bias_v,
     m: tl.constexpr,
     query_width: tl.constexpr,
     key_width: tl.constexpr,
@@ -45,7 +48,7 @@ def _fused_qkv_projection_kernel(
     block_k: tl.constexpr,
     group_size_m: tl.constexpr,
 ) -> None:
-    """Compute three independent row-major GEMMs in one three-dimensional launch."""
+    """Compute three independent row-major GEMMs with bias in one three-dimensional launch."""
     program_id = tl.program_id(0)
     projection = tl.program_id(2)
     program_count_m = tl.cdiv(m, block_m)
@@ -72,6 +75,11 @@ def _fused_qkv_projection_kernel(
         is_query,
         weights_q,
         tl.where(is_key, weights_k, weights_v),
+    )
+    selected_bias = tl.where(
+        is_query,
+        bias_q,
+        tl.where(is_key, bias_k, bias_v),
     )
     selected_width = tl.where(
         is_query,
@@ -112,13 +120,20 @@ def _fused_qkv_projection_kernel(
         activation_pointers += block_k
         weight_pointers += block_k * selected_width
 
+    bias_values = tl.load(
+        selected_bias + offsets_n,
+        mask=offsets_n < selected_width,
+        other=0.0,
+    ).to(tl.float32)
+    final_values = accumulator.to(tl.float32) + bias_values[None, :]
+
     output_mask_m = offsets_m[:, None] < m
     output_pointers = (
         selected_output + offsets_m[:, None] * selected_width + offsets_n[None, :]
     )
     tl.store(
         output_pointers,
-        accumulator.to(tl.float16),
+        final_values.to(tl.float16),
         mask=output_mask_m & (offsets_n[None, :] < selected_width),
     )
 
@@ -308,6 +323,9 @@ def compile_fused_qkv_projection(
         dtype=torch.float16,
         device="cuda",
     )
+    bias_q = torch.zeros(specialization.query_width, dtype=torch.float16, device="cuda")
+    bias_k = torch.zeros(specialization.key_width, dtype=torch.float16, device="cuda")
+    bias_v = torch.zeros(specialization.value_width, dtype=torch.float16, device="cuda")
     compiled = _fused_qkv_projection_kernel[_projection_autotune_grid](
         output_q,
         output_k,
@@ -316,6 +334,9 @@ def compile_fused_qkv_projection(
         weights_q,
         weights_k,
         weights_v,
+        bias_q,
+        bias_k,
+        bias_v,
         specialization.m,
         specialization.query_width,
         specialization.key_width,
@@ -332,7 +353,7 @@ def compile_fused_qkv_projection(
             specialization.key_width,
             specialization.value_width,
         ),
-        parameters=(_POINTER,) * 7,
+        parameters=(_POINTER,) * 10,
     )
 
 
@@ -400,6 +421,9 @@ def fused_qkv_projection(
     weights_q: Buffer,
     weights_k: Buffer,
     weights_v: Buffer,
+    bias_q: Buffer,
+    bias_k: Buffer,
+    bias_v: Buffer,
     specialization: FusedQkvProjectionSpecialization,
 ) -> None:
     """Append one QKV projection while retaining independent buffer pointers."""
@@ -417,7 +441,18 @@ def fused_qkv_projection(
         weights_q,
         weights_k,
         weights_v,
-        readonly=[activations, weights_q, weights_k, weights_v],
+        bias_q,
+        bias_k,
+        bias_v,
+        readonly=[
+            activations,
+            weights_q,
+            weights_k,
+            weights_v,
+            bias_q,
+            bias_k,
+            bias_v,
+        ],
     )
 
 

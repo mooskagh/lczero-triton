@@ -268,7 +268,7 @@ def _stub_compilers(
     monkeypatch.setattr(
         fused_qkv_module,
         "compile_fused_qkv_projection",
-        _compiler(records, "fused_qkv_projection", 7),
+        _compiler(records, "fused_qkv_projection", 10),
     )
     monkeypatch.setattr(
         fused_qkv_module,
@@ -797,7 +797,6 @@ def test_encoder_builds_names_order_and_specializations(
         "layer_norm",
         "matmul",
         "fused_qkv_projection",
-        "fused_qkv_bias",
         "fused_attention",
         "matmul",
         "layer_norm_skip",
@@ -839,8 +838,8 @@ def test_encoder_builds_names_order_and_specializations(
 
     arguments = [[_location(argument) for argument in node.arguments] for node in nodes]
     encoder_start = 12
-    ln1 = arguments[encoder_start + 10]
-    ln2 = arguments[encoder_start + 14]
+    ln1 = arguments[encoder_start + 9]
+    ln2 = arguments[encoder_start + 13]
     assert ln1[3] == arguments[11][0]
     assert ln2[3] == ln1[0]
     assert arguments[-1][0] == ln2[0]

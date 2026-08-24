@@ -961,7 +961,6 @@ def _attention(  # noqa: PLR0913
         _temporary_f16(context, element_count=token_rows * width)
         for _weights, _bias, width in projections
     ]
-    # Keep these as independent buffers until the executable supports packed views.
     fused_qkv_projection(
         context.builder,
         context.kernels,
@@ -972,32 +971,15 @@ def _attention(  # noqa: PLR0913
         projections[0][0],
         projections[1][0],
         projections[2][0],
+        projections[0][1],
+        projections[1][1],
+        projections[2][1],
         FusedQkvProjectionSpecialization(
             token_rows,
             projections[0][2],
             projections[1][2],
             projections[2][2],
             body_width,
-            context.architecture,
-        ),
-    )
-    fused_qkv_bias(
-        context.builder,
-        context.kernels,
-        projected[0],
-        projected[0],
-        projections[0][1],
-        projected[1],
-        projected[1],
-        projections[1][1],
-        projected[2],
-        projected[2],
-        projections[2][1],
-        FusedQkvBiasSpecialization(
-            token_rows,
-            projections[0][2],
-            projections[1][2],
-            projections[2][2],
             context.architecture,
         ),
     )

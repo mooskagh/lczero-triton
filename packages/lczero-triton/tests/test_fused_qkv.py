@@ -42,6 +42,9 @@ def test_fused_qkv_projection_matches_three_torch_matmuls() -> None:
     weights_q = torch.randn((k, query_width), dtype=torch.float16, device="cuda") * 0.05
     weights_k = torch.randn((k, key_width), dtype=torch.float16, device="cuda") * 0.05
     weights_v = torch.randn((k, value_width), dtype=torch.float16, device="cuda") * 0.05
+    bias_q = torch.randn(query_width, dtype=torch.float16, device="cuda") * 0.05
+    bias_k = torch.randn(key_width, dtype=torch.float16, device="cuda") * 0.05
+    bias_v = torch.randn(value_width, dtype=torch.float16, device="cuda") * 0.05
     output_q = torch.empty((m, query_width), dtype=torch.float16, device="cuda")
     output_k = torch.empty((m, key_width), dtype=torch.float16, device="cuda")
     output_v = torch.empty((m, value_width), dtype=torch.float16, device="cuda")
@@ -54,6 +57,9 @@ def test_fused_qkv_projection_matches_three_torch_matmuls() -> None:
         weights_q,
         weights_k,
         weights_v,
+        bias_q,
+        bias_k,
+        bias_v,
         m,
         query_width,
         key_width,
@@ -62,9 +68,9 @@ def test_fused_qkv_projection_matches_three_torch_matmuls() -> None:
     )
 
     expected = (
-        torch.matmul(activations, weights_q),
-        torch.matmul(activations, weights_k),
-        torch.matmul(activations, weights_v),
+        torch.matmul(activations, weights_q) + bias_q,
+        torch.matmul(activations, weights_k) + bias_k,
+        torch.matmul(activations, weights_v) + bias_v,
     )
     for result, reference in zip((output_q, output_k, output_v), expected, strict=True):
         torch.testing.assert_close(
@@ -137,7 +143,7 @@ def test_fused_qkv_artifacts_capture_all_pointer_arguments() -> None:
     projection = FusedQkvProjectionSpecialization(169, 32, 32, 32, 128, architecture)
     projection_artifact = compile_fused_qkv_projection(projection)
     projection_selected = _fused_qkv_projection_kernel.best_config
-    assert projection_artifact.parameters == (_POINTER,) * 7 + _NULL_POINTERS
+    assert projection_artifact.parameters == (_POINTER,) * 10 + _NULL_POINTERS
     assert projection_artifact.grid == _projection_artifact_grid(
         projection_selected.kwargs,
         projection.m,
