@@ -34,6 +34,10 @@ from lczero_triton.bt4.kernels.expand_planes import (
     ExpandPlanesSpecialization,
     expand_planes,
 )
+from lczero_triton.bt4.kernels.fused_attention import (
+    FusedAttentionSpecialization,
+    fused_attention,
+)
 from lczero_triton.bt4.kernels.fused_qkv import (
     FusedQkvBiasSpecialization,
     FusedQkvProjectionSpecialization,
@@ -998,51 +1002,22 @@ def _attention(  # noqa: PLR0913
         ),
     )
     queries, keys, values = projected
-    qk = _temporary_f16(
-        context, element_count=attention_batches * expected_smolgen_width
-    )
-    batched_matmul(
-        context.builder,
-        context.kernels,
-        qk,
-        queries,
-        keys,
-        BatchedMatmulSpecialization(
-            "body_qk",
-            attention_batches,
-            _SQUARE_COUNT,
-            _SQUARE_COUNT,
-            head_depth,
-            head_count,
-            context.architecture,
-        ),
-        scale=scale,
-    )
-    softmax_64(
-        context.builder,
-        context.kernels,
-        qk,
-        qk,
-        smolgen_logits,
-        Softmax64Specialization(
-            attention_batches * _SQUARE_COUNT, context.architecture
-        ),
-    )
     merged = _temporary_f16(context, element_count=token_rows * model_width)
-    batched_matmul(
+    fused_attention(
         context.builder,
         context.kernels,
         merged,
-        qk,
+        queries,
+        keys,
         values,
-        BatchedMatmulSpecialization(
-            "body_attention_v",
-            attention_batches,
-            _SQUARE_COUNT,
-            head_depth,
-            _SQUARE_COUNT,
-            head_count,
-            context.architecture,
+        smolgen_logits,
+        scale,
+        FusedAttentionSpecialization(
+            batch_count=attention_batches,
+            model_width=model_width,
+            head_depth=head_depth,
+            heads_per_sample=head_count,
+            architecture=context.architecture,
         ),
     )
     branch = _temporary_f16(context, element_count=token_rows * body_width)
