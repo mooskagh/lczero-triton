@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, cast
 
 import torch
 import triton
@@ -12,6 +12,19 @@ from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
 from lczero_triton.bt4.kernels._cache import KernelCache
+
+Activation = Literal["none", "mish", "relu", "swish"]
+_ACTIVATION_NONE = tl.constexpr(0)
+_ACTIVATION_MISH = tl.constexpr(1)
+_ACTIVATION_RELU = tl.constexpr(2)
+_ACTIVATION_SWISH = tl.constexpr(3)
+_ACTIVATION_CODES: dict[Activation, int] = {
+    "none": 0,
+    "mish": 1,
+    "relu": 2,
+    "swish": 3,
+}
+_MISH_BRANCH = tl.constexpr(-0.6)
 
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
 # Set this to false when the FP32 accumulator path is required for comparison.
@@ -63,7 +76,7 @@ _MATMUL_CONFIGS = tuple(
 
 @triton.autotune(
     configs=list(_MATMUL_CONFIGS),
-    key=["m", "n", "k"],
+    key=["m", "n", "k", "has_bias", "activation"],
     cache_results=True,
 )
 @triton.jit
@@ -71,15 +84,18 @@ def _matmul_kernel(
     output,
     activations,
     weights,
+    bias,
     m: tl.constexpr,
     n: tl.constexpr,
     k: tl.constexpr,
+    has_bias: tl.constexpr,
+    activation: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     group_size_m: tl.constexpr,
 ) -> None:
-    """Compute one grouped-M tile of a contiguous row-major GEMM."""
+    """Compute one grouped-M tile of a contiguous row-major GEMM with optional bias and activation."""
     program_id = tl.program_id(0)
     program_count_m = tl.cdiv(m, block_m)
     program_count_n = tl.cdiv(n, block_n)
@@ -122,11 +138,34 @@ def _matmul_kernel(
         activation_pointers += block_k
         weight_pointers += block_k * n
 
+    values = accumulator.to(tl.float32)
+    if has_bias:
+        bias_values = tl.load(
+            bias + offsets_n,
+            mask=offsets_n < n,
+            other=0.0,
+        ).to(tl.float32)
+        values += bias_values[None, :]
+
+    if activation == _ACTIVATION_MISH:
+        exponential = tl.exp(values)
+        numerator = exponential * exponential + 2.0 * exponential
+        division = values / (numerator + 2.0)
+        values = tl.where(
+            values <= _MISH_BRANCH,
+            numerator * division,
+            values - 2.0 * division,
+        )
+    elif activation == _ACTIVATION_RELU:
+        values = tl.maximum(values, 0.0)
+    elif activation == _ACTIVATION_SWISH:
+        values = values / (1.0 + tl.exp(-values))
+
     output_offsets_m = program_m * block_m + tl.arange(0, block_m)
     output_offsets_n = program_n * block_n + tl.arange(0, block_n)
     output_pointers = output + output_offsets_m[:, None] * n + output_offsets_n[None, :]
     output_mask = (output_offsets_m[:, None] < m) & (output_offsets_n[None, :] < n)
-    tl.store(output_pointers, accumulator.to(tl.float16), mask=output_mask)
+    tl.store(output_pointers, values.to(tl.float16), mask=output_mask)
 
 
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
@@ -161,6 +200,8 @@ class MatmulSpecialization:
     n: int
     k: int
     architecture: int
+    has_bias: bool = False
+    activation: Activation = "none"
 
 
 def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
@@ -180,13 +221,22 @@ def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
         dtype=torch.float16,
         device="cuda",
     )
+    bias = torch.zeros(
+        specialization.n,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    activation_code = _ACTIVATION_CODES[specialization.activation]
     compiled = _matmul_kernel[_autotune_grid](
         output,
         activations,
         weights,
+        bias,
         specialization.m,
         specialization.n,
         specialization.k,
+        specialization.has_bias,
+        activation_code,
     )
     selected = _matmul_kernel.best_config
     return artifact_from_triton(
@@ -196,7 +246,7 @@ def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
             specialization.m,
             specialization.n,
         ),
-        parameters=(_POINTER, _POINTER, _POINTER),
+        parameters=(_POINTER,) * 4,
     )
 
 
@@ -207,6 +257,7 @@ def matmul(
     activations: Buffer,
     weights: Buffer,
     specialization: MatmulSpecialization,
+    bias: Buffer | None = None,
 ) -> None:
     """Append one contiguous row-major dense matrix multiplication."""
     builder.set_target(
@@ -214,10 +265,24 @@ def matmul(
         f"sm_{specialization.architecture}",
     )
     kernel = kernels.get(compile_matmul, specialization)
-    builder.call(
-        kernel,
-        output,
-        activations,
-        weights,
-        readonly=[activations, weights],
-    )
+    if specialization.has_bias:
+        if bias is None:
+            raise ValueError("Bias buffer is required when specialization.has_bias is True")
+        builder.call(
+            kernel,
+            output,
+            activations,
+            weights,
+            bias,
+            readonly=[activations, weights, bias],
+        )
+    else:
+        builder.call(
+            kernel,
+            output,
+            activations,
+            weights,
+            output,
+            readonly=[activations, weights],
+        )
+

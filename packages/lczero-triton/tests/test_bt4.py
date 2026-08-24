@@ -240,10 +240,14 @@ def _stub_compilers(
         "compile_nchw_to_nhwc",
         _compiler(records, "nchw_to_nhwc", 2),
     )
+    def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
+        records.append(("matmul", specialization))
+        return _artifact("matmul", 4)
+
     monkeypatch.setattr(
         matmul_module,
         "compile_matmul",
-        _compiler(records, "matmul", 3),
+        compile_matmul,
     )
     monkeypatch.setattr(
         add_vectors_module,
@@ -801,7 +805,6 @@ def test_encoder_builds_names_order_and_specializations(
         "matmul",
         "layer_norm_skip",
         "matmul",
-        "add_bias_batched",
         "matmul",
         "layer_norm_skip",
     ]
@@ -839,7 +842,7 @@ def test_encoder_builds_names_order_and_specializations(
     arguments = [[_location(argument) for argument in node.arguments] for node in nodes]
     encoder_start = 12
     ln1 = arguments[encoder_start + 9]
-    ln2 = arguments[encoder_start + 13]
+    ln2 = arguments[encoder_start + 12]
     assert ln1[3] == arguments[11][0]
     assert ln2[3] == ln1[0]
     assert arguments[-1][0] == ln2[0]
@@ -1052,28 +1055,19 @@ def test_output_heads_build_contracts_and_independent_branches(
 
     assert head_functions == [
         "matmul",
-        "add_bias_batched",
         "matmul",
-        "add_bias_batched",
         "matmul",
-        "add_bias_batched",
         "policy_qk",
         "promotion_logits",
         "policy_map",
         "copy_type_converted",
         "matmul",
-        "add_vectors",
         "matmul",
-        "add_vectors",
         "matmul",
-        "add_vectors",
         "copy_type_converted",
         "matmul",
-        "add_vectors",
         "matmul",
-        "add_vectors",
         "matmul",
-        "add_vectors",
         "copy_type_converted",
     ]
     assert "softmax_64" not in head_functions
@@ -1129,25 +1123,25 @@ def test_output_heads_build_contracts_and_independent_branches(
     assert CopyTypeConvertedSpecialization(2 * 1858, _ARCHITECTURE) in (
         head_specializations
     )
-    assert AddVectorsSpecialization(2, 1, "relu", _ARCHITECTURE) in (
-        head_specializations
-    )
+    assert MatmulSpecialization(
+        2, 1, 5, _ARCHITECTURE, has_bias=True, activation="relu"
+    ) in head_specializations
 
     arguments = [[_location(argument) for argument in node.arguments] for node in nodes]
     head_start = 12
     final_body = arguments[11][0]
     assert arguments[head_start][1] == final_body
-    assert arguments[head_start + 10][1] == final_body
-    assert arguments[head_start + 17][1] == final_body
-    assert arguments[head_start + 6][0] == arguments[head_start + 7][0]
-    assert arguments[head_start + 7][0] == arguments[head_start + 8][1]
-    assert nodes[head_start + 8].arguments[2].HasField("symbol")
+    assert arguments[head_start + 7][1] == final_body
+    assert arguments[head_start + 11][1] == final_body
+    assert arguments[head_start + 3][0] == arguments[head_start + 4][0]
+    assert arguments[head_start + 4][0] == arguments[head_start + 5][1]
+    assert nodes[head_start + 5].arguments[2].HasField("symbol")
     assert (
-        nodes[head_start + 8].arguments[2].symbol.symbol_name
+        nodes[head_start + 5].arguments[2].symbol.symbol_name
         == "lczero_bt4_mapping_table"
     )
-    assert head_start + 9 not in nodes[head_start + 10].dependencies
-    assert head_start + 16 not in nodes[head_start + 17].dependencies
+    assert head_start + 6 not in nodes[head_start + 7].dependencies
+    assert head_start + 10 not in nodes[head_start + 11].dependencies
 
 
 def test_policy_embedding_prefers_head_local_weights(

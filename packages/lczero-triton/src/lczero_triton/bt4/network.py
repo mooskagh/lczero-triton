@@ -1097,18 +1097,14 @@ def _ffn(
         body,
         dense1_weights,
         MatmulSpecialization(
-            token_rows, hidden_width, body_width, context.architecture
+            token_rows,
+            hidden_width,
+            body_width,
+            context.architecture,
+            has_bias=True,
+            activation="mish",
         ),
-    )
-    add_bias_batched(
-        context.builder,
-        context.kernels,
-        hidden,
-        hidden,
-        dense1_bias,
-        AddBiasBatchedSpecialization(
-            1, token_rows, hidden_width, "mish", context.architecture
-        ),
+        bias=dense1_bias,
     )
     branch = _temporary_f16(context, element_count=token_rows * body_width)
     matmul(
@@ -1222,18 +1218,14 @@ def _policy_head(
         body,
         embedding_weights,
         MatmulSpecialization(
-            token_rows, policy_width, body_width, context.architecture
+            token_rows,
+            policy_width,
+            body_width,
+            context.architecture,
+            has_bias=True,
+            activation="mish",
         ),
-    )
-    add_bias_batched(
-        context.builder,
-        context.kernels,
-        embedded,
-        embedded,
-        embedding_bias,
-        AddBiasBatchedSpecialization(
-            1, token_rows, policy_width, "mish", context.architecture
-        ),
+        bias=embedding_bias,
     )
     query = _temporary_f16(context, element_count=token_rows * model_width)
     key = _temporary_f16(context, element_count=token_rows * model_width)
@@ -1248,18 +1240,14 @@ def _policy_head(
             embedded,
             projection_weights,
             MatmulSpecialization(
-                token_rows, model_width, policy_width, context.architecture
+                token_rows,
+                model_width,
+                policy_width,
+                context.architecture,
+                has_bias=True,
+                activation="none",
             ),
-        )
-        add_bias_batched(
-            context.builder,
-            context.kernels,
-            projected,
-            projected,
-            bias,
-            AddBiasBatchedSpecialization(
-                1, token_rows, model_width, "none", context.architecture
-            ),
+            bias=bias,
         )
 
     records = _temporary_f16(context, element_count=context.batch_size * 4288)
@@ -1436,17 +1424,15 @@ def _dense_output_head(  # noqa: PLR0913
         embedded,
         body,
         embed_weights,
-        MatmulSpecialization(token_rows, embed_width, body_width, context.architecture),
-    )
-    add_vectors(
-        context.builder,
-        context.kernels,
-        embedded,
-        embedded,
-        embed_bias_buffer,
-        AddVectorsSpecialization(
-            token_rows * embed_width, embed_width, "mish", context.architecture
+        MatmulSpecialization(
+            token_rows,
+            embed_width,
+            body_width,
+            context.architecture,
+            has_bias=True,
+            activation="mish",
         ),
+        bias=embed_bias_buffer,
     )
     hidden = _temporary_f16(context, element_count=context.batch_size * hidden_width)
     matmul(
@@ -1456,21 +1442,14 @@ def _dense_output_head(  # noqa: PLR0913
         embedded,
         hidden_weights,
         MatmulSpecialization(
-            context.batch_size, hidden_width, flattened_width, context.architecture
-        ),
-    )
-    add_vectors(
-        context.builder,
-        context.kernels,
-        hidden,
-        hidden,
-        hidden_bias,
-        AddVectorsSpecialization(
-            context.batch_size * hidden_width,
+            context.batch_size,
             hidden_width,
-            "mish",
+            flattened_width,
             context.architecture,
+            has_bias=True,
+            activation="mish",
         ),
+        bias=hidden_bias,
     )
     result = _temporary_f16(context, element_count=context.batch_size * output_width)
     matmul(
@@ -1480,21 +1459,14 @@ def _dense_output_head(  # noqa: PLR0913
         hidden,
         result_weights,
         MatmulSpecialization(
-            context.batch_size, output_width, hidden_width, context.architecture
-        ),
-    )
-    add_vectors(
-        context.builder,
-        context.kernels,
-        result,
-        result,
-        result_bias,
-        AddVectorsSpecialization(
-            context.batch_size * output_width,
+            context.batch_size,
             output_width,
-            final_activation,
+            hidden_width,
             context.architecture,
+            has_bias=True,
+            activation=final_activation,
         ),
+        bias=result_bias,
     )
     copy_type_converted(
         context.builder,

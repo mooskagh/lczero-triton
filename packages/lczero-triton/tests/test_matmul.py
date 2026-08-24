@@ -62,7 +62,7 @@ def test_group_size_m_is_autotuned_for_every_tile_configuration() -> None:
         )
         groups_by_tile.setdefault(tile, set()).add(configuration.kwargs["group_size_m"])
 
-    assert _matmul_kernel.keys == ["m", "n", "k"]
+    assert _matmul_kernel.keys == ["m", "n", "k", "has_bias", "activation"]
     assert _matmul_kernel.cache_results
     assert set(groups_by_tile) == set(_TILE_CONFIGS)
     assert all(groups == set(_GROUP_SIZES_M) for groups in groups_by_tile.values())
@@ -92,15 +92,19 @@ def test_matmul_matches_torch_for_every_bt4_specialization(
         )
         * 0.05
     )
+    bias = torch.zeros(n, dtype=torch.float16, device="cuda")
     result = torch.empty((m, n), dtype=torch.float16, device="cuda")
 
     _matmul_kernel[_autotune_grid](
         result,
         activations,
         weights,
+        bias,
         m,
         n,
         k,
+        False,
+        0,
     )
 
     expected = torch.matmul(activations, weights)
@@ -118,15 +122,19 @@ def test_matmul_masks_non_divisible_m_n_and_k() -> None:
     m, k, n = 7, 37, 11
     activations = torch.randn((m, k), dtype=torch.float16, device="cuda") * 0.05
     weights = torch.randn((k, n), dtype=torch.float16, device="cuda") * 0.05
+    bias = torch.zeros(n, dtype=torch.float16, device="cuda")
     result = torch.empty((m, n), dtype=torch.float16, device="cuda")
 
     _matmul_kernel[_autotune_grid](
         result,
         activations,
         weights,
+        bias,
         m,
         n,
         k,
+        False,
+        0,
     )
 
     expected = torch.matmul(activations, weights)
@@ -149,6 +157,7 @@ def test_compilation_captures_selected_configuration_and_static_launch() -> None
     assert artifact.binary_data
     assert artifact.function
     assert artifact.parameters == (
+        lc0ex_pb2.PARAMETER_TYPE_POINTER,
         lc0ex_pb2.PARAMETER_TYPE_POINTER,
         lc0ex_pb2.PARAMETER_TYPE_POINTER,
         lc0ex_pb2.PARAMETER_TYPE_POINTER,
@@ -205,4 +214,5 @@ def test_graph_call_preserves_output_activation_weight_order() -> None:
         locations["output"],
         locations["activations"],
         locations["weights"],
+        locations["output"],
     ]
