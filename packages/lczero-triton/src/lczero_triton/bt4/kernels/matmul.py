@@ -29,47 +29,28 @@ _MISH_BRANCH = tl.constexpr(-0.6)
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
 # Set this to false when the FP32 accumulator path is required for comparison.
 _USE_FP16_ACCUMULATOR = tl.constexpr(value=True)
-_GROUP_SIZES_M = (1, 4, 8, 16)
+_GROUP_SIZES_M = (1, 8)
 _TILE_CONFIGS = (
-    (256, 128, 64, 8, 3),
+    # Large high-throughput tiles (for M>=1024, N>=1024, K>=512)
+    (128, 256, 32, 8, 3),
     (256, 128, 32, 8, 3),
-    (256, 64, 64, 8, 3),
-    (256, 64, 32, 8, 4),
-    (256, 32, 64, 4, 3),
-    (128, 256, 64, 8, 3),
-    (128, 256, 32, 8, 4),
-    (128, 128, 128, 8, 3),
-    (128, 128, 64, 8, 3),
-    (128, 128, 64, 8, 4),
     (128, 128, 64, 4, 3),
-    (128, 128, 32, 8, 3),
-    (128, 128, 32, 8, 4),
+    (128, 128, 64, 8, 3),
     (128, 128, 32, 4, 3),
     (128, 128, 32, 4, 4),
-    (128, 64, 128, 8, 3),
-    (128, 64, 64, 8, 3),
-    (128, 64, 64, 4, 4),
-    (128, 64, 32, 4, 3),
-    (128, 64, 32, 4, 4),
-    (128, 32, 64, 4, 4),
-    (128, 32, 32, 4, 4),
-    (64, 256, 32, 4, 4),
-    (64, 128, 128, 8, 3),
-    (64, 128, 64, 8, 3),
-    (64, 128, 64, 4, 4),
+    (128, 64, 64, 4, 3),
+    (64, 128, 64, 4, 3),
     (64, 128, 32, 4, 3),
-    (64, 128, 32, 4, 4),
-    (64, 64, 128, 8, 3),
+    (128, 64, 32, 4, 3),
+    # Medium tiles
     (64, 64, 64, 4, 3),
     (64, 64, 32, 4, 3),
-    (64, 32, 128, 4, 3),
-    (64, 32, 128, 4, 2),
     (64, 32, 64, 4, 3),
-    (64, 32, 32, 4, 3),
-    (64, 32, 32, 2, 5),
-    (32, 64, 128, 8, 3),
-    (32, 64, 32, 2, 5),
+    # Small / narrow tiles (for M<=256 or N<=256 or K<=256 or deep K)
+    (32, 64, 64, 4, 3),
     (32, 32, 128, 8, 4),
+    (32, 32, 64, 4, 3),
+    (32, 32, 32, 2, 3),
 )
 _MATMUL_CONFIGS = tuple(
     triton.Config(
@@ -87,9 +68,60 @@ _MATMUL_CONFIGS = tuple(
 )
 
 
+_MIN_GROUPED_M = 512
+_MIN_GROUP_TILES = 4
+_MAX_SMEM_BYTES = 128 * 1024
+_SMALL_DIM_32 = 32
+_SMALL_DIM_128 = 128
+_SMALL_DIM_256 = 256
+_MAX_K_BLOCK_FOR_SMALL_K = 64
+
+
+def _prune_matmul_configs(
+    configs: list[triton.Config],
+    named_args: Mapping[str, object],
+    **kwargs: object,
+) -> list[triton.Config]:
+    """Prune tile and grouping candidates incompatible with operand dimensions."""
+    m = named_args.get("m") or kwargs.get("m")
+    n = named_args.get("n") or kwargs.get("n")
+    k = named_args.get("k") or kwargs.get("k")
+    if m is None or n is None or k is None:
+        return configs
+
+    m_val = cast("int", m)
+    n_val = cast("int", n)
+    k_val = cast("int", k)
+
+    pruned: list[triton.Config] = []
+    for conf in configs:
+        bm = cast("int", conf.kwargs["block_m"])
+        bn = cast("int", conf.kwargs["block_n"])
+        bk = cast("int", conf.kwargs["block_k"])
+        gm = cast("int", conf.kwargs["group_size_m"])
+
+        if gm > 1 and (m_val < _MIN_GROUPED_M or m_val < bm * _MIN_GROUP_TILES):
+            continue
+        if n_val <= _SMALL_DIM_32 and bn > _SMALL_DIM_32:
+            continue
+        if n_val <= _SMALL_DIM_128 and bn > _SMALL_DIM_128:
+            continue
+        if m_val <= _SMALL_DIM_256 and bm > _SMALL_DIM_128:
+            continue
+        if k_val <= _SMALL_DIM_256 and bk > _MAX_K_BLOCK_FOR_SMALL_K:
+            continue
+        smem_bytes = 2 * (bm * bk + bk * bn) * conf.num_stages
+        if smem_bytes > _MAX_SMEM_BYTES:
+            continue
+        pruned.append(conf)
+
+    return pruned or [configs[0]]
+
+
 @triton.autotune(
     configs=list(_MATMUL_CONFIGS),
     key=["m", "n", "k", "has_bias", "activation"],
+    prune_configs_by={"early_config_prune": _prune_matmul_configs},
     cache_results=True,
 )
 @triton.jit
@@ -184,6 +216,7 @@ def _matmul_kernel(
 @triton.autotune(
     configs=list(_MATMUL_CONFIGS),
     key=["m", "n", "k", "has_bias", "activation"],
+    prune_configs_by={"early_config_prune": _prune_matmul_configs},
     cache_results=True,
 )
 @triton.jit

@@ -78,6 +78,7 @@ class _BuildContext:
     architecture: int
     fingerprint: net_pb2.Net
     fingerprint_layers: dict[str, net_pb2.Weights.Layer]
+    shared_buffers: dict[str, Buffer]
 
 
 def build(
@@ -106,6 +107,7 @@ def build(
         smolgen_activation=smolgen_activation,
     )
     kernels = KernelCache(builder)
+    shared_buffers: dict[str, Buffer] = {}
     _LOGGER.info(
         "building BT4 graph for batch sizes %s with %d encoder layers",
         batch_sizes,
@@ -127,6 +129,7 @@ def build(
             architecture=active_architecture(),
             fingerprint=fingerprint,
             fingerprint_layers=fingerprint_layers,
+            shared_buffers=shared_buffers,
         )
         _network(context, network.weights)
         _LOGGER.info("finished program %s", program_name)
@@ -870,26 +873,35 @@ def _attention(  # noqa: PLR0913
     model_width = element_count // body_width
     head_depth = model_width // head_count
 
-    qkv_weights = context.builder.persistent_tensor(
-        shape=(body_width, 3, model_width),
-        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
-        alignment_bytes=256,
-    )
-    qkv_weights[:, 0, :].external(f"{prefix}/mha/Q/w/w")
-    qkv_weights[:, 1, :].external(f"{prefix}/mha/K/w/w")
-    qkv_weights[:, 2, :].external(f"{prefix}/mha/V/w/w")
+    weights_key = f"{prefix}/mha/qkv_weights"
+    bias_key = f"{prefix}/mha/qkv_bias"
+    if weights_key in context.shared_buffers:
+        qkv_weights = context.shared_buffers[weights_key]
+        qkv_bias = context.shared_buffers[bias_key]
+    else:
+        qkv_weights = context.builder.persistent_tensor(
+            shape=(body_width, 3, model_width),
+            dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+            alignment_bytes=256,
+        )
+        qkv_weights[:, 0, :].external(f"{prefix}/mha/Q/w/w")
+        qkv_weights[:, 1, :].external(f"{prefix}/mha/K/w/w")
+        qkv_weights[:, 2, :].external(f"{prefix}/mha/V/w/w")
+        context.shared_buffers[weights_key] = qkv_weights
+
+        qkv_bias = context.builder.persistent_tensor(
+            shape=(3, model_width),
+            dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+            alignment_bytes=256,
+        )
+        qkv_bias[0, :].external(f"{prefix}/mha/Q/b/w")
+        qkv_bias[1, :].external(f"{prefix}/mha/K/b/w")
+        qkv_bias[2, :].external(f"{prefix}/mha/V/b/w")
+        context.shared_buffers[bias_key] = qkv_bias
+
     _fingerprint_layer(context, f"{path}.mha.q_w")
     _fingerprint_layer(context, f"{path}.mha.k_w")
     _fingerprint_layer(context, f"{path}.mha.v_w")
-
-    qkv_bias = context.builder.persistent_tensor(
-        shape=(3, model_width),
-        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
-        alignment_bytes=256,
-    )
-    qkv_bias[0, :].external(f"{prefix}/mha/Q/b/w")
-    qkv_bias[1, :].external(f"{prefix}/mha/K/b/w")
-    qkv_bias[2, :].external(f"{prefix}/mha/V/b/w")
     _fingerprint_layer(context, f"{path}.mha.q_b")
     _fingerprint_layer(context, f"{path}.mha.k_b")
     _fingerprint_layer(context, f"{path}.mha.v_b")
