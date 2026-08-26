@@ -5,19 +5,20 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+import triton.backends.nvidia.compiler as nv_compiler
+
 from lc0ex.kernel_builder import KernelArtifact
 from lc0ex.proto import lc0ex_pb2
 
-try:
-    from triton.backends.nvidia.compiler import get_ptxas  # type: ignore[attr-defined]
 
-    def _ptxas_path(architecture: str) -> str:
-        return get_ptxas(int(architecture[3:].removesuffix("a"))).path
-except ImportError:
-    from triton.backends.nvidia.compiler import _path_to_binary  # type: ignore[attr-defined]
+def _ptxas_path(architecture: str) -> str:
+    if hasattr(nv_compiler, "get_ptxas"):
+        return str(nv_compiler.get_ptxas(int(architecture[3:].removesuffix("a"))).path)
+    if hasattr(nv_compiler, "_path_to_binary"):
+        return str(nv_compiler._path_to_binary("ptxas")[0])  # noqa: SLF001
+    msg = f"Failed to locate ptxas for architecture {architecture}"
+    raise RuntimeError(msg)
 
-    def _ptxas_path(_architecture: str) -> str:
-        return str(_path_to_binary("ptxas")[0])
 
 _TRITON_SCRATCH_PARAMETERS = (
     lc0ex_pb2.PARAMETER_TYPE_NULL_POINTER,

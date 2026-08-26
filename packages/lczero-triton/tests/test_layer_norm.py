@@ -85,6 +85,7 @@ def _launch(  # noqa: PLR0913, PLR0917
     *,
     skip: torch.Tensor | None = None,
     alpha: torch.Tensor | None = None,
+    has_bias: bool = True,
 ) -> None:
     """Launch the physical kernel variant selected by optional operands."""
     row_count, width = input_.shape
@@ -100,6 +101,7 @@ def _launch(  # noqa: PLR0913, PLR0917
             width,
             epsilon,
             _ACTIVATIONS[activation],
+            has_bias,
             block_size,
         )
     else:
@@ -115,6 +117,7 @@ def _launch(  # noqa: PLR0913, PLR0917
             width,
             epsilon,
             _ACTIVATIONS[activation],
+            has_bias,
             block_size,
         )
 
@@ -302,7 +305,7 @@ def test_deepnorm_allows_cuda_safe_in_place_output(alias: str) -> None:
 
 def test_autotune_contract_covers_semantics_and_warp_candidates() -> None:
     """Persistent tuning keys every workload decision but not launch choices."""
-    expected_keys = ["row_count", "width", "epsilon", "activation"]
+    expected_keys = ["row_count", "width", "epsilon", "activation", "has_bias"]
     assert _layer_norm_kernel.keys == expected_keys
     assert _layer_norm_skip_kernel.keys == expected_keys
     assert _layer_norm_kernel.cache_results
@@ -412,4 +415,54 @@ def test_graph_call_preserves_deepnorm_argument_order() -> None:
     assert arguments == [
         locations[name]
         for name in ("output", "input", "bias", "skip", "gammas", "betas", "alpha")
+    ]
+
+
+@pytest.mark.gpu
+@_CUDA_REQUIRED
+def test_layer_norm_no_bias_graph_call() -> None:
+    """When has_bias=False, dummy bias pointer is passed and not loaded."""
+    builder = ExecutableBuilder()
+    program = builder.program(name="main")
+    output = _external_buffer(program, "output", (2, 256), writable=True)
+    input_ = _external_buffer(program, "input", (2, 256))
+    gammas = _external_buffer(program, "gammas", (256,), persistent=True)
+    betas = _external_buffer(program, "betas", (256,), persistent=True)
+
+    layer_norm(
+        program,
+        KernelCache(builder),
+        output,
+        input_,
+        None,
+        gammas,
+        betas,
+        LayerNormSpecialization(
+            2,
+            256,
+            "none",
+            has_skip=False,
+            has_bias=False,
+            architecture=_architecture(),
+        ),
+    )
+
+    executable = builder.build()
+    node = executable.programs[0].nodes[0]
+    locations = {
+        buffer.name: (buffer.offset,)
+        for buffer in (
+            *executable.buffers,
+            *executable.programs[0].buffers,
+        )
+    }
+    arguments = [(argument.allocation.offset,) for argument in node.arguments]
+
+    assert executable.target.architecture == f"sm_{_architecture()}"
+    assert arguments == [
+        locations["output"],
+        locations["input"],
+        locations["output"],
+        locations["gammas"],
+        locations["betas"],
     ]

@@ -13,6 +13,7 @@ from lczero_triton.bt4.kernels.matmul import (
     _artifact_grid,
     _autotune_grid,
     _matmul_kernel,
+    _matmul_skip_kernel,
     compile_matmul,
     matmul,
 )
@@ -215,4 +216,123 @@ def test_graph_call_preserves_output_activation_weight_order() -> None:
         locations["activations"],
         locations["weights"],
         locations["output"],
+    ]
+
+
+def test_matmul_fused_skip_numerical_accuracy() -> None:
+    """Fused skip kernel computes alpha * (X @ W + b) + skip accurately."""
+    torch.manual_seed(42)
+    m, k, n = 32, 64, 48
+    activations = torch.randn((m, k), dtype=torch.float16, device="cuda") * 0.05
+    weights = torch.randn((k, n), dtype=torch.float16, device="cuda") * 0.05
+    bias = torch.randn(n, dtype=torch.float16, device="cuda") * 0.05
+    skip = torch.randn((m, n), dtype=torch.float16, device="cuda") * 0.05
+    alpha = torch.tensor([0.75], dtype=torch.float16, device="cuda")
+    result = torch.empty((m, n), dtype=torch.float16, device="cuda")
+
+    specialization = MatmulSpecialization(
+        m, n, k, _architecture(), has_bias=True, has_skip=True
+    )
+    artifact = compile_matmul(specialization)
+    assert artifact.parameters == (
+        lc0ex_pb2.PARAMETER_TYPE_POINTER,
+        lc0ex_pb2.PARAMETER_TYPE_POINTER,
+        lc0ex_pb2.PARAMETER_TYPE_POINTER,
+        lc0ex_pb2.PARAMETER_TYPE_POINTER,
+        lc0ex_pb2.PARAMETER_TYPE_POINTER,
+        lc0ex_pb2.PARAMETER_TYPE_POINTER,
+        *_NULL_POINTERS,
+    )
+
+    _matmul_skip_kernel[_autotune_grid](
+        result,
+        activations,
+        weights,
+        bias,
+        skip,
+        alpha,
+        m,
+        n,
+        k,
+        has_bias=True,
+        activation=0,
+    )
+
+    expected = (
+        torch.matmul(activations.float(), weights.float()) + bias.float()
+    ) * alpha.float() + skip.float()
+    torch.testing.assert_close(
+        result,
+        expected.half(),
+        rtol=_FP16_RTOL,
+        atol=_FP16_ATOL,
+    )
+
+
+def test_matmul_fused_skip_graph_call() -> None:
+    """The graph ABI for fused skip passes 6 buffers in expected order."""
+    builder = ExecutableBuilder()
+    program = builder.program(name="main")
+    output = program.buffer(
+        name="output",
+        shape=(16, 32),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+        writable=True,
+    )
+    activations = program.buffer(
+        name="activations",
+        shape=(16, 64),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+    )
+    weights = builder.persistent_buffer(
+        name="weights",
+        shape=(64, 32),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+    )
+    bias = builder.persistent_buffer(
+        name="bias",
+        shape=(32,),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+    )
+    skip = program.buffer(
+        name="skip",
+        shape=(16, 32),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+    )
+    alpha = builder.persistent_buffer(
+        name="alpha",
+        shape=(1,),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+    )
+
+    matmul(
+        program,
+        KernelCache(builder),
+        output,
+        activations,
+        weights,
+        MatmulSpecialization(16, 32, 64, _architecture(), has_bias=True, has_skip=True),
+        bias=bias,
+        skip=skip,
+        alpha=alpha,
+    )
+
+    executable = builder.build()
+    node = executable.programs[0].nodes[0]
+    locations = {
+        buffer.name: (buffer.offset,)
+        for buffer in (
+            *executable.buffers,
+            *executable.programs[0].buffers,
+        )
+    }
+    arguments = [(argument.allocation.offset,) for argument in node.arguments]
+
+    assert arguments == [
+        locations["output"],
+        locations["activations"],
+        locations["weights"],
+        locations["bias"],
+        locations["skip"],
+        locations["alpha"],
     ]

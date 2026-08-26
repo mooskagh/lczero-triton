@@ -181,6 +181,109 @@ def _matmul_kernel(
     tl.store(output_pointers, values.to(tl.float16), mask=output_mask)
 
 
+@triton.autotune(
+    configs=list(_MATMUL_CONFIGS),
+    key=["m", "n", "k", "has_bias", "activation"],
+    cache_results=True,
+)
+@triton.jit
+def _matmul_skip_kernel(
+    output,
+    activations,
+    weights,
+    bias,
+    skip,
+    alpha,
+    m: tl.constexpr,
+    n: tl.constexpr,
+    k: tl.constexpr,
+    has_bias: tl.constexpr,
+    activation: tl.constexpr,
+    block_m: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    group_size_m: tl.constexpr,
+) -> None:
+    """Compute GEMM with optional bias, activation, alpha scaling, and residual skip."""
+    program_id = tl.program_id(0)
+    program_count_m = tl.cdiv(m, block_m)
+    program_count_n = tl.cdiv(n, block_n)
+    programs_per_group = group_size_m * program_count_n
+    group_id = program_id // programs_per_group
+    first_program_m = group_id * group_size_m
+    group_program_count_m = min(program_count_m - first_program_m, group_size_m)
+    program_m = first_program_m + (
+        (program_id % programs_per_group) % group_program_count_m
+    )
+    program_n = (program_id % programs_per_group) // group_program_count_m
+
+    offsets_m = program_m * block_m + tl.arange(0, block_m)
+    offsets_n = program_n * block_n + tl.arange(0, block_n)
+    offsets_k = tl.arange(0, block_k)
+    activation_pointers = activations + offsets_m[:, None] * k + offsets_k[None, :]
+    weight_pointers = weights + offsets_k[:, None] * n + offsets_n[None, :]
+    accumulator = tl.zeros(
+        (block_m, block_n),
+        dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
+    )
+    for k_block in range(tl.cdiv(k, block_k)):
+        remaining_k = k - k_block * block_k
+        activation_values = tl.load(
+            activation_pointers,
+            mask=(offsets_m[:, None] < m) & (offsets_k[None, :] < remaining_k),
+            other=0.0,
+        )
+        weight_values = tl.load(
+            weight_pointers,
+            mask=(offsets_k[:, None] < remaining_k) & (offsets_n[None, :] < n),
+            other=0.0,
+        )
+        accumulator = tl.dot(
+            activation_values,
+            weight_values,
+            accumulator,
+            out_dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
+        )
+        activation_pointers += block_k
+        weight_pointers += block_k * n
+
+    values = accumulator.to(tl.float32)
+    if has_bias:
+        bias_values = tl.load(
+            bias + offsets_n,
+            mask=offsets_n < n,
+            other=0.0,
+        ).to(tl.float32)
+        values += bias_values[None, :]
+
+    if activation == _ACTIVATION_MISH:
+        exponential = tl.exp(values)
+        numerator = exponential * exponential + 2.0 * exponential
+        division = values / (numerator + 2.0)
+        values = tl.where(
+            values <= _MISH_BRANCH,
+            numerator * division,
+            values - 2.0 * division,
+        )
+    elif activation == _ACTIVATION_RELU:
+        values = tl.maximum(values, 0.0)
+    elif activation == _ACTIVATION_SWISH:
+        values = values / (1.0 + tl.exp(-values))
+
+    alpha_val = tl.load(alpha).to(tl.float32)
+    values = values * alpha_val
+    output_offsets_m = program_m * block_m + tl.arange(0, block_m)
+    output_offsets_n = program_n * block_n + tl.arange(0, block_n)
+    skip_pointers = skip + output_offsets_m[:, None] * n + output_offsets_n[None, :]
+    skip_mask = (output_offsets_m[:, None] < m) & (output_offsets_n[None, :] < n)
+    skip_values = tl.load(skip_pointers, mask=skip_mask, other=0.0).to(tl.float32)
+    values = values + skip_values
+
+    output_pointers = output + output_offsets_m[:, None] * n + output_offsets_n[None, :]
+    output_mask = (output_offsets_m[:, None] < m) & (output_offsets_n[None, :] < n)
+    tl.store(output_pointers, values.to(tl.float16), mask=output_mask)
+
+
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
     """Return the grouped one-dimensional launch grid for a tuning candidate."""
     m = cast("int", configuration["m"])
@@ -214,6 +317,7 @@ class MatmulSpecialization:
     k: int
     architecture: int
     has_bias: bool = False
+    has_skip: bool = False
     activation: Activation = "none"
 
 
@@ -240,18 +344,44 @@ def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
         device="cuda",
     )
     activation_code = _ACTIVATION_CODES[specialization.activation]
-    compiled = _matmul_kernel[_autotune_grid](
-        output,
-        activations,
-        weights,
-        bias,
-        specialization.m,
-        specialization.n,
-        specialization.k,
-        specialization.has_bias,
-        activation_code,
-    )
-    selected = _matmul_kernel.best_config
+    parameters: tuple[int, ...]
+    if specialization.has_skip:
+        skip = torch.zeros(
+            (specialization.m, specialization.n),
+            dtype=torch.float16,
+            device="cuda",
+        )
+        alpha = torch.ones(1, dtype=torch.float16, device="cuda")
+        compiled = _matmul_skip_kernel[_autotune_grid](
+            output,
+            activations,
+            weights,
+            bias,
+            skip,
+            alpha,
+            specialization.m,
+            specialization.n,
+            specialization.k,
+            specialization.has_bias,
+            activation_code,
+        )
+        selected = _matmul_skip_kernel.best_config
+        parameters = (_POINTER,) * 6
+    else:
+        compiled = _matmul_kernel[_autotune_grid](
+            output,
+            activations,
+            weights,
+            bias,
+            specialization.m,
+            specialization.n,
+            specialization.k,
+            specialization.has_bias,
+            activation_code,
+        )
+        selected = _matmul_kernel.best_config
+        parameters = (_POINTER,) * 4
+
     return artifact_from_triton(
         compiled,
         grid=_artifact_grid(
@@ -259,7 +389,7 @@ def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
             specialization.m,
             specialization.n,
         ),
-        parameters=(_POINTER,) * 4,
+        parameters=parameters,
     )
 
 
@@ -271,6 +401,9 @@ def matmul(
     weights: Buffer,
     specialization: MatmulSpecialization,
     bias: Buffer | None = None,
+    *,
+    skip: Buffer | None = None,
+    alpha: Buffer | None = None,
 ) -> None:
     """Append one contiguous row-major dense matrix multiplication."""
     builder.set_target(
@@ -278,7 +411,28 @@ def matmul(
         f"sm_{specialization.architecture}",
     )
     kernel = kernels.get(compile_matmul, specialization)
-    if specialization.has_bias:
+    if specialization.has_skip:
+        if skip is None or alpha is None:
+            message = (
+                "Skip and alpha buffers are required when "
+                "specialization.has_skip is True"
+            )
+            raise ValueError(message)
+        bias_buffer = bias if (bias is not None and specialization.has_bias) else output
+        readonly = [activations, weights, skip, alpha]
+        if bias is not None and specialization.has_bias:
+            readonly.append(bias)
+        builder.call(
+            kernel,
+            output,
+            activations,
+            weights,
+            bias_buffer,
+            skip,
+            alpha,
+            readonly=readonly,
+        )
+    elif specialization.has_bias:
         if bias is None:
             message = "Bias buffer is required when specialization.has_bias is True"
             raise ValueError(message)

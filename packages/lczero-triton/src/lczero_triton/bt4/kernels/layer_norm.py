@@ -46,6 +46,7 @@ def _layer_norm_row(
     width: tl.constexpr,
     epsilon: tl.constexpr,
     activation: tl.constexpr,
+    has_bias: tl.constexpr,
     has_skip: tl.constexpr,
     block_size: tl.constexpr,
 ) -> None:
@@ -55,8 +56,9 @@ def _layer_norm_row(
     pointers = row * width + offsets
 
     values = tl.load(input_ + pointers, mask=valid, other=0.0).to(tl.float32)
-    biases = tl.load(bias + offsets, mask=valid, other=0.0).to(tl.float32)
-    values += biases
+    if has_bias:
+        biases = tl.load(bias + offsets, mask=valid, other=0.0).to(tl.float32)
+        values += biases
 
     if activation == _ACTIVATION_MISH:
         exponential = tl.exp(values)
@@ -84,12 +86,12 @@ def _layer_norm_row(
     gamma_values = tl.load(gammas + offsets, mask=valid, other=0.0).to(tl.float32)
     beta_values = tl.load(betas + offsets, mask=valid, other=0.0).to(tl.float32)
     result = normalized * gamma_values + beta_values
-    tl.store(output + pointers, result, mask=valid)
+    tl.store(output + pointers, result.to(tl.float16), mask=valid)
 
 
 @triton.autotune(
     configs=_layer_norm_configs(),
-    key=["row_count", "width", "epsilon", "activation"],
+    key=["row_count", "width", "epsilon", "activation", "has_bias"],
     cache_results=True,
 )
 @triton.jit
@@ -103,6 +105,7 @@ def _layer_norm_kernel(
     width: tl.constexpr,
     epsilon: tl.constexpr,
     activation: tl.constexpr,
+    has_bias: tl.constexpr,
     block_size: tl.constexpr,
 ) -> None:
     """Normalize rows without a residual connection or runtime alpha."""
@@ -118,6 +121,7 @@ def _layer_norm_kernel(
         width,
         epsilon,
         activation,
+        has_bias,
         0,
         block_size,
     )
@@ -125,7 +129,7 @@ def _layer_norm_kernel(
 
 @triton.autotune(
     configs=_layer_norm_configs(),
-    key=["row_count", "width", "epsilon", "activation"],
+    key=["row_count", "width", "epsilon", "activation", "has_bias"],
     cache_results=True,
 )
 @triton.jit
@@ -141,6 +145,7 @@ def _layer_norm_skip_kernel(
     width: tl.constexpr,
     epsilon: tl.constexpr,
     activation: tl.constexpr,
+    has_bias: tl.constexpr,
     block_size: tl.constexpr,
 ) -> None:
     """Normalize rows after alpha scaling and a residual connection."""
@@ -156,6 +161,7 @@ def _layer_norm_skip_kernel(
         width,
         epsilon,
         activation,
+        has_bias,
         1,
         block_size,
     )
@@ -170,6 +176,7 @@ class LayerNormSpecialization:
     activation: Activation
     has_skip: bool
     architecture: int
+    has_bias: bool = True
     epsilon: float = 1e-3
 
 
@@ -212,6 +219,7 @@ def compile_layer_norm(
             specialization.width,
             specialization.epsilon,
             activation,
+            specialization.has_bias,
             block_size,
         )
         parameters = (_POINTER,) * 7
@@ -226,6 +234,7 @@ def compile_layer_norm(
             specialization.width,
             specialization.epsilon,
             activation,
+            specialization.has_bias,
             block_size,
         )
         parameters = (_POINTER,) * 5
@@ -242,7 +251,7 @@ def layer_norm(
     kernels: KernelCache,
     output: Buffer,
     input_: Buffer,
-    bias: Buffer,
+    bias: Buffer | None,
     gammas: Buffer,
     betas: Buffer,
     specialization: LayerNormSpecialization,
@@ -256,11 +265,19 @@ def layer_norm(
         f"sm_{specialization.architecture}",
     )
     kernel = kernels.get(compile_layer_norm, specialization)
-    arguments = [output, input_, bias]
-    if skip is not None:
+    bias_buffer = bias if (bias is not None and specialization.has_bias) else output
+    arguments = [output, input_, bias_buffer]
+    if specialization.has_skip:
+        if skip is None or alpha is None:
+            message = (
+                "Skip and alpha buffers are required when "
+                "specialization.has_skip is True"
+            )
+            raise ValueError(message)
         arguments.append(skip)
-    arguments.extend((gammas, betas))
-    if alpha is not None:
+        arguments.extend((gammas, betas))
         arguments.append(alpha)
+    else:
+        arguments.extend((gammas, betas))
     readonly = [source for source in arguments[1:] if source is not output]
     builder.call(kernel, *arguments, readonly=readonly)

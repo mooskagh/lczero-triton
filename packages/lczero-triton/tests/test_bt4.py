@@ -23,9 +23,6 @@ import lczero_triton.bt4.network as network_module
 import pytest
 from lc0ex import Buffer, ExecutableBuilder, KernelArtifact, SymbolArtifact
 from lc0ex.proto import lc0ex_metadata_pb2, lc0ex_pb2, net_pb2
-from lczero_triton.bt4.kernels.add_bias_batched import (
-    AddBiasBatchedSpecialization,
-)
 from lczero_triton.bt4.kernels.add_vectors import AddVectorsSpecialization
 from lczero_triton.bt4.kernels.batched_matmul import BatchedMatmulSpecialization
 from lczero_triton.bt4.kernels.copy_type_converted import (
@@ -238,7 +235,7 @@ def _stub_compilers(
 
     def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
         records.append(("matmul", specialization))
-        return _artifact("matmul", 4)
+        return _artifact("matmul", 6 if specialization.has_skip else 4)
 
     monkeypatch.setattr(
         matmul_module,
@@ -787,7 +784,7 @@ def test_encoder_builds_names_order_and_specializations(
     executable = builder.build()
     nodes = executable.programs[0].nodes
     functions = [executable.kernels[node.kernel_idx].function for node in nodes]
-    encoder_functions = functions[12:-1]
+    encoder_functions = functions[11:-1]
 
     assert encoder_functions == [
         "matmul",
@@ -799,10 +796,10 @@ def test_encoder_builds_names_order_and_specializations(
         "matmul",
         "fused_attention",
         "matmul",
-        "layer_norm_skip",
+        "layer_norm",
         "matmul",
         "matmul",
-        "layer_norm_skip",
+        "layer_norm",
     ]
     buffers = {
         buffer.name: tuple(buffer.shape)
@@ -826,6 +823,7 @@ def test_encoder_builds_names_order_and_specializations(
             width=32,
             activation="swish",
             has_skip=False,
+            has_bias=False,
             architecture=_ARCHITECTURE,
         )
         in specializations
@@ -833,11 +831,13 @@ def test_encoder_builds_names_order_and_specializations(
     assert FusedAttentionSpecialization(4, 16, 8, 2, _ARCHITECTURE) in specializations
 
     arguments = [[_location(argument) for argument in node.arguments] for node in nodes]
-    encoder_start = 12
+    encoder_start = 11
+    dense_out = arguments[encoder_start + 8]
     ln1 = arguments[encoder_start + 9]
+    dense2 = arguments[encoder_start + 11]
     ln2 = arguments[encoder_start + 12]
-    assert ln1[3] == arguments[11][0]
-    assert ln2[3] == ln1[0]
+    assert dense_out[4] == arguments[10][0]
+    assert dense2[4] == ln1[0]
     assert arguments[-1][0] == ln2[0]
 
 
@@ -939,9 +939,8 @@ def test_embedding_builds_expected_operations_and_specializations(
         "layer_norm",
         "input_gating",
         "matmul",
-        "add_bias_batched",
         "matmul",
-        "layer_norm_skip",
+        "layer_norm",
         "consume_body",
     ]
     assert [specialization for _name, specialization in records] == [
@@ -950,23 +949,28 @@ def test_embedding_builds_expected_operations_and_specializations(
         MatmulSpecialization(2, 64 * 3, 64 * 12, _ARCHITECTURE),
         AddVectorsSpecialization(2 * 64 * 3, 64 * 3, "none", _ARCHITECTURE),
         PreprocessAttentionBodySpecialization(2, 112, 3, _ARCHITECTURE),
-        MatmulSpecialization(2 * 64, 32, 112 + 3, _ARCHITECTURE),
+        MatmulSpecialization(2 * 64, 32, 112 + 3, _ARCHITECTURE, has_bias=True),
         LayerNormSpecialization(
             row_count=2 * 64,
             width=32,
             activation="mish",
             has_skip=False,
+            has_bias=False,
             architecture=_ARCHITECTURE,
         ),
         InputGatingSpecialization(2, 64, 32, _ARCHITECTURE),
-        MatmulSpecialization(2 * 64, 48, 32, _ARCHITECTURE),
-        AddBiasBatchedSpecialization(1, 2 * 64, 48, "mish", _ARCHITECTURE),
-        MatmulSpecialization(2 * 64, 32, 48, _ARCHITECTURE),
+        MatmulSpecialization(
+            2 * 64, 48, 32, _ARCHITECTURE, has_bias=True, activation="mish"
+        ),
+        MatmulSpecialization(
+            2 * 64, 32, 48, _ARCHITECTURE, has_bias=True, has_skip=True
+        ),
         LayerNormSpecialization(
             row_count=2 * 64,
             width=32,
             activation="none",
-            has_skip=True,
+            has_skip=False,
+            has_bias=False,
             architecture=_ARCHITECTURE,
         ),
     ]
@@ -999,24 +1003,25 @@ def test_embedding_preserves_pointer_reinterpretation_skip_and_reuse(
         [8],
         [9],
         [10],
-        [11],
     ]
     assert arguments[1][0] == arguments[2][1]
     assert arguments[3][0] == arguments[3][1] == arguments[4][2]
     assert arguments[4][0] == arguments[5][1]
-    assert arguments[7][0] == arguments[7][1] == arguments[8][1]
-    assert arguments[9][0] == arguments[9][1] == arguments[10][1]
-    assert arguments[11][3] == arguments[7][0]
-    assert arguments[12][0] == arguments[11][0]
+    assert arguments[5][0] == arguments[6][1]
+    assert arguments[6][0] == arguments[7][0] == arguments[7][1]
+    assert arguments[7][0] == arguments[8][1] == arguments[9][4]
+    assert arguments[8][0] == arguments[9][1]
+    assert arguments[9][0] == arguments[10][1]
+    assert arguments[11][0] == arguments[10][0]
 
-    temporary_outputs = {arguments[index][0] for index in (0, 1, 2, 4, 5, 6, 8, 10, 11)}
+    temporary_outputs = {arguments[index][0] for index in (0, 1, 2, 4, 5, 6, 8, 9, 10)}
     assert len(temporary_outputs) == _REUSED_TEMPORARY_COUNT
     assert (
         len({arguments[4][0], arguments[4][1], arguments[4][2]})
         == _REUSED_TEMPORARY_COUNT
     )
     assert (
-        len({arguments[11][0], arguments[11][1], arguments[11][3]})
+        len({arguments[9][0], arguments[9][1], arguments[9][4]})
         == _REUSED_TEMPORARY_COUNT
     )
 
@@ -1044,7 +1049,7 @@ def test_output_heads_build_contracts_and_independent_branches(
     executable = builder.build()
     nodes = executable.programs[0].nodes
     functions = [executable.kernels[node.kernel_idx].function for node in nodes]
-    head_functions = functions[12:]
+    head_functions = functions[11:]
 
     assert head_functions == [
         "matmul",
@@ -1106,7 +1111,7 @@ def test_output_heads_build_contracts_and_independent_branches(
         assert buffer.name in {item.name for item in executable.programs[0].buffers}
     assert "/const/mapping_table" not in buffers
 
-    head_specializations = [specialization for _name, specialization in records][12:]
+    head_specializations = [specialization for _name, specialization in records][11:]
     assert (
         BatchedMatmulSpecialization("policy_qk", 2, 64, 64, 8, 1, _ARCHITECTURE)
         in head_specializations
@@ -1122,8 +1127,8 @@ def test_output_heads_build_contracts_and_independent_branches(
     )
 
     arguments = [[_location(argument) for argument in node.arguments] for node in nodes]
-    head_start = 12
-    final_body = arguments[11][0]
+    head_start = 11
+    final_body = arguments[10][0]
     assert arguments[head_start][1] == final_body
     assert arguments[head_start + 7][1] == final_body
     assert arguments[head_start + 11][1] == final_body

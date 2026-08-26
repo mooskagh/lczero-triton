@@ -14,10 +14,6 @@ from lczero_triton.bt4._format import (
 )
 from lczero_triton.bt4.kernels._autotune import active_architecture
 from lczero_triton.bt4.kernels._cache import KernelCache
-from lczero_triton.bt4.kernels.add_bias_batched import (
-    AddBiasBatchedSpecialization,
-    add_bias_batched,
-)
 from lczero_triton.bt4.kernels.add_vectors import (
     AddVectorsSpecialization,
     add_vectors,
@@ -538,7 +534,9 @@ def _embedding(
             body_width,
             embedding_input_width,
             context.architecture,
+            has_bias=True,
         ),
+        bias=embedding_bias,
     )
     skip = _temporary_f16(context, element_count=token_rows * body_width)
     layer_norm(
@@ -546,7 +544,7 @@ def _embedding(
         context.kernels,
         skip,
         projected,
-        embedding_bias,
+        None,
         embedding_gammas,
         embedding_betas,
         LayerNormSpecialization(
@@ -554,6 +552,7 @@ def _embedding(
             width=body_width,
             activation="mish",
             has_skip=False,
+            has_bias=False,
             architecture=context.architecture,
         ),
     )
@@ -584,21 +583,10 @@ def _embedding(
             hidden_width,
             body_width,
             context.architecture,
+            has_bias=True,
+            activation="mish",
         ),
-    )
-    add_bias_batched(
-        context.builder,
-        context.kernels,
-        hidden,
-        hidden,
-        dense1_bias,
-        AddBiasBatchedSpecialization(
-            1,
-            token_rows,
-            hidden_width,
-            "mish",
-            context.architecture,
-        ),
+        bias=dense1_bias,
     )
 
     branch = _temporary_f16(context, element_count=token_rows * body_width)
@@ -613,7 +601,12 @@ def _embedding(
             body_width,
             hidden_width,
             context.architecture,
+            has_bias=True,
+            has_skip=True,
         ),
+        bias=dense2_bias,
+        skip=skip,
+        alpha=alpha,
     )
     body = _temporary_f16(context, element_count=token_rows * body_width)
     layer_norm(
@@ -621,18 +614,17 @@ def _embedding(
         context.kernels,
         body,
         branch,
-        dense2_bias,
+        None,
         ffn_gammas,
         ffn_betas,
         LayerNormSpecialization(
             row_count=token_rows,
             width=body_width,
             activation="none",
-            has_skip=True,
+            has_skip=False,
+            has_bias=False,
             architecture=context.architecture,
         ),
-        skip=skip,
-        alpha=alpha,
     )
     return body, body_width
 
@@ -791,14 +783,16 @@ def _smolgen(  # noqa: PLR0913
             hidden_width,
             _SQUARE_COUNT * compression_width,
             context.architecture,
+            has_bias=True,
         ),
+        bias=dense1_bias,
     )
     layer_norm(
         context.builder,
         context.kernels,
         hidden,
         hidden,
-        dense1_bias,
+        None,
         ln1_gammas,
         ln1_betas,
         LayerNormSpecialization(
@@ -806,6 +800,7 @@ def _smolgen(  # noqa: PLR0913
             width=hidden_width,
             activation="swish",
             has_skip=False,
+            has_bias=False,
             architecture=context.architecture,
         ),
     )
@@ -823,14 +818,16 @@ def _smolgen(  # noqa: PLR0913
             generated_total_width,
             hidden_width,
             context.architecture,
+            has_bias=True,
         ),
+        bias=dense2_bias,
     )
     layer_norm(
         context.builder,
         context.kernels,
         generated,
         generated,
-        dense2_bias,
+        None,
         ln2_gammas,
         ln2_betas,
         LayerNormSpecialization(
@@ -838,6 +835,7 @@ def _smolgen(  # noqa: PLR0913
             width=generated_total_width,
             activation="swish",
             has_skip=False,
+            has_bias=False,
             architecture=context.architecture,
         ),
     )
@@ -994,7 +992,17 @@ def _attention(  # noqa: PLR0913
         branch,
         merged,
         output_weights,
-        MatmulSpecialization(token_rows, body_width, model_width, context.architecture),
+        MatmulSpecialization(
+            token_rows,
+            body_width,
+            model_width,
+            context.architecture,
+            has_bias=True,
+            has_skip=True,
+        ),
+        bias=output_bias,
+        skip=body,
+        alpha=alpha,
     )
     attended = _temporary_f16(context, element_count=token_rows * body_width)
     layer_norm(
@@ -1002,18 +1010,17 @@ def _attention(  # noqa: PLR0913
         context.kernels,
         attended,
         branch,
-        output_bias,
+        None,
         gammas,
         betas,
         LayerNormSpecialization(
             row_count=token_rows,
             width=body_width,
             activation="none",
-            has_skip=True,
+            has_skip=False,
+            has_bias=False,
             architecture=context.architecture,
         ),
-        skip=body,
-        alpha=alpha,
     )
     return attended
 
@@ -1099,8 +1106,16 @@ def _ffn(
         hidden,
         dense2_weights,
         MatmulSpecialization(
-            token_rows, body_width, hidden_width, context.architecture
+            token_rows,
+            body_width,
+            hidden_width,
+            context.architecture,
+            has_bias=True,
+            has_skip=True,
         ),
+        bias=dense2_bias,
+        skip=body,
+        alpha=alpha,
     )
     output = _temporary_f16(context, element_count=token_rows * body_width)
     layer_norm(
@@ -1108,18 +1123,17 @@ def _ffn(
         context.kernels,
         output,
         branch,
-        dense2_bias,
+        None,
         gammas,
         betas,
         LayerNormSpecialization(
             row_count=token_rows,
             width=body_width,
             activation="none",
-            has_skip=True,
+            has_skip=False,
+            has_bias=False,
             architecture=context.architecture,
         ),
-        skip=body,
-        alpha=alpha,
     )
     return output
 
