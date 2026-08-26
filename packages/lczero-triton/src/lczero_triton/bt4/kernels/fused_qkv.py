@@ -48,7 +48,7 @@ def _fused_qkv_projection_kernel(
     block_k: tl.constexpr,
     group_size_m: tl.constexpr,
 ) -> None:
-    """Compute three independent row-major GEMMs with bias in one three-dimensional launch."""
+    """Compute three independent row-major GEMMs with bias in one 3D launch."""
     program_id = tl.program_id(0)
     projection = tl.program_id(2)
     program_count_m = tl.cdiv(m, block_m)

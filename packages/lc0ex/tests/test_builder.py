@@ -39,13 +39,70 @@ def _kernel() -> KernelArtifact:
     )
 
 
-def test_buffer_is_an_opaque_storage_identity() -> None:
-    """Buffers intentionally expose no tensor metadata or view operations."""
-    buffer = Buffer()
+def test_tensor_views_and_slicing() -> None:
+    """Tensors expose shape, strides, and slicing views."""
+    builder = _builder()
+    qkv = builder.persistent_tensor(shape=(10, 3, 20), dtype=F16)
 
-    assert not hasattr(buffer, "shape")
-    assert not hasattr(buffer, "dtype")
-    assert not hasattr(buffer, "reshape")
+    assert qkv.shape == (10, 3, 20)
+    assert qkv.strides == (60, 20, 1)
+    assert qkv.is_contiguous()
+    assert qkv.offset == 0
+
+    q = qkv[:, 0, :]
+    k = qkv[:, 1, :]
+    v = qkv[:, 2, :]
+
+    assert q.shape == (10, 20)
+    assert q.strides == (60, 1)
+    assert not q.is_contiguous()
+    assert q.offset == 0
+
+    assert k.shape == (10, 20)
+    assert k.strides == (60, 1)
+    assert not k.is_contiguous()
+    assert k.offset == 20 * 2  # 20 elements * 2 bytes = 40 bytes
+
+    assert v.shape == (10, 20)
+    assert v.strides == (60, 1)
+    assert not v.is_contiguous()
+    assert v.offset == 40 * 2  # 40 elements * 2 bytes = 80 bytes
+
+    # Test transpose
+    transposed = q.transpose(0, 1)
+    assert transposed.shape == (20, 10)
+    assert transposed.strides == (1, 60)
+    assert transposed.offset == 0
+
+
+def test_interleaved_external_buffers_serialize_strided_layout() -> None:
+    """Interleaved buffer slices serialize their strides and offsets."""
+    builder = _builder()
+    qkv = builder.persistent_tensor(shape=(10, 3, 20), dtype=F16, alignment_bytes=16)
+    qkv[:, 0, :].external("q_w")
+    qkv[:, 1, :].external("k_w")
+    qkv[:, 2, :].external("v_w")
+
+    executable = builder.build()
+
+    assert executable.persistent_allocation.size_bytes == 10 * 3 * 20 * 2  # 1200 bytes
+    buffers_by_name = {b.name: b for b in executable.buffers}
+    assert set(buffers_by_name) == {"q_w", "k_w", "v_w"}
+
+    q_b = buffers_by_name["q_w"]
+    assert q_b.offset == 0
+    assert tuple(q_b.shape) == (10, 20)
+    assert list(q_b.layout.strides) == [60, 1]
+
+    k_b = buffers_by_name["k_w"]
+    assert k_b.offset == 40
+    assert tuple(k_b.shape) == (10, 20)
+    assert list(k_b.layout.strides) == [60, 1]
+
+    v_b = buffers_by_name["v_w"]
+    assert v_b.offset == 80
+    assert tuple(v_b.shape) == (10, 20)
+    assert list(v_b.layout.strides) == [60, 1]
 
 
 def test_external_buffer_serializes_in_persistent_allocation() -> None:

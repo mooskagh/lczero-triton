@@ -35,10 +35,6 @@ from lczero_triton.bt4.kernels.expand_planes import ExpandPlanesSpecialization
 from lczero_triton.bt4.kernels.fused_attention import (
     FusedAttentionSpecialization,
 )
-from lczero_triton.bt4.kernels.fused_qkv import (
-    FusedQkvBiasSpecialization,
-    FusedQkvProjectionSpecialization,
-)
 from lczero_triton.bt4.kernels.input_gating import InputGatingSpecialization
 from lczero_triton.bt4.kernels.layer_norm import LayerNormSpecialization
 from lczero_triton.bt4.kernels.matmul import MatmulSpecialization
@@ -50,7 +46,6 @@ from lczero_triton.bt4.kernels.preprocess_attention_body import (
 from lczero_triton.bt4.kernels.promotion_logits import (
     PromotionLogitsSpecialization,
 )
-from lczero_triton.bt4.kernels.softmax_64 import Softmax64Specialization
 from lczero_triton.bt4.network import (
     _BuildContext,
     _default_activation,
@@ -240,6 +235,7 @@ def _stub_compilers(
         "compile_nchw_to_nhwc",
         _compiler(records, "nchw_to_nhwc", 2),
     )
+
     def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
         records.append(("matmul", specialization))
         return _artifact("matmul", 4)
@@ -282,7 +278,7 @@ def _stub_compilers(
     monkeypatch.setattr(
         fused_attention_module,
         "compile_fused_attention",
-        _compiler(records, "fused_attention", 6),
+        _compiler(records, "fused_attention", 4),
     )
 
     def compile_batched_matmul(
@@ -800,7 +796,7 @@ def test_encoder_builds_names_order_and_specializations(
         "matmul",
         "layer_norm",
         "matmul",
-        "fused_qkv_projection",
+        "matmul",
         "fused_attention",
         "matmul",
         "layer_norm_skip",
@@ -834,10 +830,7 @@ def test_encoder_builds_names_order_and_specializations(
         )
         in specializations
     )
-    assert (
-        FusedAttentionSpecialization(4, 16, 8, 2, _ARCHITECTURE)
-        in specializations
-    )
+    assert FusedAttentionSpecialization(4, 16, 8, 2, _ARCHITECTURE) in specializations
 
     arguments = [[_location(argument) for argument in node.arguments] for node in nodes]
     encoder_start = 12
@@ -1123,9 +1116,10 @@ def test_output_heads_build_contracts_and_independent_branches(
     assert CopyTypeConvertedSpecialization(2 * 1858, _ARCHITECTURE) in (
         head_specializations
     )
-    assert MatmulSpecialization(
-        2, 1, 5, _ARCHITECTURE, has_bias=True, activation="relu"
-    ) in head_specializations
+    assert (
+        MatmulSpecialization(2, 1, 5, _ARCHITECTURE, has_bias=True, activation="relu")
+        in head_specializations
+    )
 
     arguments = [[_location(argument) for argument in node.arguments] for node in nodes]
     head_start = 12

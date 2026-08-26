@@ -76,6 +76,54 @@ class ProgramBuilder:
             alignment_bytes=alignment_bytes,
         )
 
+    def tensor(
+        self,
+        *,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+        writable: bool = False,
+        alignment_bytes: int | None = None,
+    ) -> Buffer:
+        """Create an unnamed execution tensor in this program's allocation."""
+        return self._owner._buffers.tensor(  # noqa: SLF001
+            self._allocation,
+            shape=shape,
+            dtype=dtype,
+            writable=writable,
+            alignment_bytes=alignment_bytes,
+        )
+
+    def temporary_tensor(
+        self,
+        *,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+        alignment_bytes: int = 256,
+    ) -> Buffer:
+        """Create an unnamed temporary tensor in this program's allocation."""
+        return self.tensor(
+            shape=shape,
+            dtype=dtype,
+            writable=True,
+            alignment_bytes=alignment_bytes,
+        )
+
+    def persistent_tensor(
+        self,
+        *,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+        writable: bool = False,
+        alignment_bytes: int | None = None,
+    ) -> Buffer:
+        """Create an unnamed persistent tensor in the executable allocation."""
+        return self._owner.persistent_tensor(
+            shape=shape,
+            dtype=dtype,
+            writable=writable,
+            alignment_bytes=alignment_bytes,
+        )
+
     def persistent_buffer(
         self,
         *,
@@ -161,6 +209,22 @@ class ExecutableBuilder:
         self._symbols: dict[SymbolHandle, SymbolArtifact] = {}
         self._symbol_handles: dict[SymbolArtifact, SymbolHandle] = {}
         self._programs: list[ProgramBuilder] = []
+
+    def persistent_tensor(
+        self,
+        *,
+        shape: Sequence[int],
+        dtype: lc0ex_pb2.Buffer.DataType,
+        writable: bool = False,
+        alignment_bytes: int | None = None,
+    ) -> Buffer:
+        """Create an unnamed persistent tensor in the executable allocation."""
+        return self._buffers.persistent_tensor(
+            shape=shape,
+            dtype=dtype,
+            writable=writable,
+            alignment_bytes=alignment_bytes,
+        )
 
     def persistent_buffer(
         self,
@@ -362,12 +426,14 @@ class ExecutableBuilder:
         buffers = destination.buffers
         for buffer, external in plan.external_buffers:
             location = plan.locations[buffer]
-            buffers.add(
+            entry = buffers.add(
                 name=external.name,
                 offset=location.offset,
                 data_type=external.dtype,
                 shape=external.shape,
             )
+            if external.strides is not None and not buffer.is_contiguous():
+                entry.layout.strides.extend(external.strides)
 
     def _build_invocations(
         self,

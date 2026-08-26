@@ -103,8 +103,8 @@ def test_matmul_matches_torch_for_every_bt4_specialization(
         m,
         n,
         k,
-        False,
-        0,
+        has_bias=False,
+        activation=0,
     )
 
     expected = torch.matmul(activations, weights)
@@ -133,8 +133,8 @@ def test_matmul_masks_non_divisible_m_n_and_k() -> None:
         m,
         n,
         k,
-        False,
-        0,
+        has_bias=False,
+        activation=0,
     )
 
     expected = torch.matmul(activations, weights)

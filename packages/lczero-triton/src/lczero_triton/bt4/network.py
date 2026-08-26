@@ -38,12 +38,6 @@ from lczero_triton.bt4.kernels.fused_attention import (
     FusedAttentionSpecialization,
     fused_attention,
 )
-from lczero_triton.bt4.kernels.fused_qkv import (
-    FusedQkvBiasSpecialization,
-    FusedQkvProjectionSpecialization,
-    fused_qkv_bias,
-    fused_qkv_projection,
-)
 from lczero_triton.bt4.kernels.input_gating import (
     InputGatingSpecialization,
     input_gating,
@@ -69,10 +63,6 @@ from lczero_triton.bt4.kernels.preprocess_attention_body import (
 from lczero_triton.bt4.kernels.promotion_logits import (
     PromotionLogitsSpecialization,
     promotion_logits,
-)
-from lczero_triton.bt4.kernels.softmax_64 import (
-    Softmax64Specialization,
-    softmax_64,
 )
 
 _F16_SIZE_BYTES = 2
@@ -878,28 +868,33 @@ def _attention(  # noqa: PLR0913
     )
     expected_smolgen_width = _SQUARE_COUNT * _SQUARE_COUNT
 
-    projections: list[tuple[Buffer, Buffer, int]] = []
-    for label, weight_field, bias_field in (
-        ("Q", mha.q_w, mha.q_b),
-        ("K", mha.k_w, mha.k_b),
-        ("V", mha.v_w, mha.v_b),
-    ):
-        weights, width = _matrix_f16(
-            context,
-            weight_field,
-            input_width=body_width,
-            name=f"{prefix}/mha/{label}/w/w",
-            path=f"{path}.mha.{label.lower()}_w",
-        )
-        bias = _vector_f16(
-            context,
-            bias_field,
-            name=f"{prefix}/mha/{label}/b/w",
-            path=f"{path}.mha.{label.lower()}_b",
-        )
-        projections.append((weights, bias, width))
-    model_width = projections[0][2]
+    element_count = len(mha.q_w.params) // _F16_SIZE_BYTES
+    model_width = element_count // body_width
     head_depth = model_width // head_count
+
+    qkv_weights = context.builder.persistent_tensor(
+        shape=(body_width, 3, model_width),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+        alignment_bytes=256,
+    )
+    qkv_weights[:, 0, :].external(f"{prefix}/mha/Q/w/w")
+    qkv_weights[:, 1, :].external(f"{prefix}/mha/K/w/w")
+    qkv_weights[:, 2, :].external(f"{prefix}/mha/V/w/w")
+    _fingerprint_layer(context, f"{path}.mha.q_w")
+    _fingerprint_layer(context, f"{path}.mha.k_w")
+    _fingerprint_layer(context, f"{path}.mha.v_w")
+
+    qkv_bias = context.builder.persistent_tensor(
+        shape=(3, model_width),
+        dtype=lc0ex_pb2.Buffer.DATA_TYPE_F16,
+        alignment_bytes=256,
+    )
+    qkv_bias[0, :].external(f"{prefix}/mha/Q/b/w")
+    qkv_bias[1, :].external(f"{prefix}/mha/K/b/w")
+    qkv_bias[2, :].external(f"{prefix}/mha/V/b/w")
+    _fingerprint_layer(context, f"{path}.mha.q_b")
+    _fingerprint_layer(context, f"{path}.mha.k_b")
+    _fingerprint_layer(context, f"{path}.mha.v_b")
 
     output_weights, _ = _matrix_f16(
         context,
@@ -957,41 +952,31 @@ def _attention(  # noqa: PLR0913
             context.architecture,
         ),
     )
-    projected = [
-        _temporary_f16(context, element_count=token_rows * width)
-        for _weights, _bias, width in projections
-    ]
-    fused_qkv_projection(
+    qkv_activations = _temporary_f16(
+        context, element_count=token_rows * (3 * model_width)
+    )
+    matmul(
         context.builder,
         context.kernels,
-        projected[0],
-        projected[1],
-        projected[2],
+        qkv_activations,
         body,
-        projections[0][0],
-        projections[1][0],
-        projections[2][0],
-        projections[0][1],
-        projections[1][1],
-        projections[2][1],
-        FusedQkvProjectionSpecialization(
+        qkv_weights,
+        MatmulSpecialization(
             token_rows,
-            projections[0][2],
-            projections[1][2],
-            projections[2][2],
+            3 * model_width,
             body_width,
             context.architecture,
+            has_bias=True,
+            activation="none",
         ),
+        bias=qkv_bias,
     )
-    queries, keys, values = projected
     merged = _temporary_f16(context, element_count=token_rows * model_width)
     fused_attention(
         context.builder,
         context.kernels,
         merged,
-        queries,
-        keys,
-        values,
+        qkv_activations,
         smolgen_logits,
         scale,
         FusedAttentionSpecialization(

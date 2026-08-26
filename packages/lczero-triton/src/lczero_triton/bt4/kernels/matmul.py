@@ -108,7 +108,7 @@ def _matmul_kernel(
     block_k: tl.constexpr,
     group_size_m: tl.constexpr,
 ) -> None:
-    """Compute one grouped-M tile of a contiguous row-major GEMM with optional bias and activation."""
+    """Compute one grouped-M tile of GEMM with optional bias and activation."""
     program_id = tl.program_id(0)
     program_count_m = tl.cdiv(m, block_m)
     program_count_n = tl.cdiv(n, block_n)
@@ -280,7 +280,8 @@ def matmul(
     kernel = kernels.get(compile_matmul, specialization)
     if specialization.has_bias:
         if bias is None:
-            raise ValueError("Bias buffer is required when specialization.has_bias is True")
+            message = "Bias buffer is required when specialization.has_bias is True"
+            raise ValueError(message)
         builder.call(
             kernel,
             output,
@@ -298,4 +299,3 @@ def matmul(
             output,
             readonly=[activations, weights],
         )
-

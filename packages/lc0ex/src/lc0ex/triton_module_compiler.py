@@ -5,10 +5,19 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from triton.backends.nvidia.compiler import get_ptxas
-
 from lc0ex.kernel_builder import KernelArtifact
 from lc0ex.proto import lc0ex_pb2
+
+try:
+    from triton.backends.nvidia.compiler import get_ptxas  # type: ignore[attr-defined]
+
+    def _ptxas_path(architecture: str) -> str:
+        return get_ptxas(int(architecture[3:].removesuffix("a"))).path
+except ImportError:
+    from triton.backends.nvidia.compiler import _path_to_binary  # type: ignore[attr-defined]
+
+    def _ptxas_path(_architecture: str) -> str:
+        return str(_path_to_binary("ptxas")[0])
 
 _TRITON_SCRATCH_PARAMETERS = (
     lc0ex_pb2.PARAMETER_TYPE_NULL_POINTER,
@@ -24,7 +33,7 @@ def compile_ptx(ptx: str, *, architecture: str) -> bytes:
         source_path.write_text(ptx, encoding="utf-8")
         subprocess.run(  # noqa: S603  # ptxas path is selected by Triton.
             (
-                get_ptxas(int(architecture[3:].removesuffix("a"))).path,
+                _ptxas_path(architecture),
                 f"--gpu-name={architecture}",
                 str(source_path),
                 "--output-file",

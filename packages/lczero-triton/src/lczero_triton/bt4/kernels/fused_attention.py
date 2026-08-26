@@ -32,9 +32,7 @@ _ATTENTION_CONFIGS = (
 @triton.jit
 def _fused_attention_kernel(
     output,
-    queries,
-    keys,
-    values,
+    qkv,
     smolgen,
     scale_ptr,
     batch_count: tl.constexpr,
@@ -52,14 +50,20 @@ def _fused_attention_kernel(
     head = matrix % heads_per_sample
     scale = tl.load(scale_ptr).to(tl.float32)
 
+    stride_row: tl.constexpr = 3 * model_width
+
     offs_m = tl.arange(0, _SQUARE_COUNT)
     offs_d = tl.arange(0, block_d)
     mask_d = offs_d < head_depth
 
     # Base pointers
-    head_offset = sample * (_SQUARE_COUNT * model_width) + head * head_depth
-    q_ptrs = queries + head_offset + offs_m[:, None] * model_width + offs_d[None, :]
-    k_ptrs = keys + head_offset + offs_m[:, None] * model_width + offs_d[None, :]
+    sample_offset = sample * (_SQUARE_COUNT * stride_row) + head * head_depth
+    q_base = qkv + sample_offset + 0 * model_width
+    k_base = qkv + sample_offset + 1 * model_width
+    v_base = qkv + sample_offset + 2 * model_width
+
+    q_ptrs = q_base + offs_m[:, None] * stride_row + offs_d[None, :]
+    k_ptrs = k_base + offs_m[:, None] * stride_row + offs_d[None, :]
 
     q = tl.load(q_ptrs, mask=mask_d[None, :], other=0.0).to(tl.float16)
     k = tl.load(k_ptrs, mask=mask_d[None, :], other=0.0).to(tl.float16)
@@ -89,11 +93,14 @@ def _fused_attention_kernel(
     probs = (exp_val / sum_val[:, None]).to(tl.float16)
 
     # Load V and compute output: (64, 64) @ (64, block_d) -> (64, block_d)
-    v_ptrs = values + head_offset + offs_m[:, None] * model_width + offs_d[None, :]
+    v_ptrs = v_base + offs_m[:, None] * stride_row + offs_d[None, :]
     v = tl.load(v_ptrs, mask=mask_d[None, :], other=0.0).to(tl.float16)
     out_val = tl.dot(probs, v, out_dtype=tl.float32).to(tl.float16)
 
-    out_ptrs = output + head_offset + offs_m[:, None] * model_width + offs_d[None, :]
+    out_head_offset = sample * (_SQUARE_COUNT * model_width) + head * head_depth
+    out_ptrs = (
+        output + out_head_offset + offs_m[:, None] * model_width + offs_d[None, :]
+    )
     tl.store(out_ptrs, out_val, mask=mask_d[None, :])
 
 
@@ -119,13 +126,21 @@ def compile_fused_attention(
 ) -> KernelArtifact:
     """Autotune and compile one fused attention specialization."""
     output = torch.empty(
-        (specialization.batch_count // specialization.heads_per_sample * 64, specialization.model_width),
+        (
+            specialization.batch_count // specialization.heads_per_sample * 64,
+            specialization.model_width,
+        ),
         dtype=torch.float16,
         device="cuda",
     )
-    queries = torch.zeros_like(output)
-    keys = torch.zeros_like(output)
-    values = torch.zeros_like(output)
+    qkv = torch.empty(
+        (
+            specialization.batch_count // specialization.heads_per_sample * 64,
+            3 * specialization.model_width,
+        ),
+        dtype=torch.float16,
+        device="cuda",
+    )
     smolgen = torch.zeros(
         (specialization.batch_count, 64, 64),
         dtype=torch.float16,
@@ -136,9 +151,7 @@ def compile_fused_attention(
 
     compiled = _fused_attention_kernel[_autotune_grid](
         output,
-        queries,
-        keys,
-        values,
+        qkv,
         smolgen,
         scale,
         specialization.batch_count,
@@ -150,17 +163,15 @@ def compile_fused_attention(
     return artifact_from_triton(
         compiled,
         grid=(specialization.batch_count, 1, 1),
-        parameters=(_POINTER, _POINTER, _POINTER, _POINTER, _POINTER, _POINTER),
+        parameters=(_POINTER, _POINTER, _POINTER, _POINTER),
     )
 
 
-def fused_attention(  # noqa: PLR0913
+def fused_attention(
     builder: ProgramBuilder,
     kernels: KernelCache,
     output: Buffer,
-    queries: Buffer,
-    keys: Buffer,
-    values: Buffer,
+    qkv: Buffer,
     smolgen: Buffer,
     scale: Buffer,
     specialization: FusedAttentionSpecialization,
@@ -174,10 +185,8 @@ def fused_attention(  # noqa: PLR0913
     builder.call(
         kernel,
         output,
-        queries,
-        keys,
-        values,
+        qkv,
         smolgen,
         scale,
-        readonly=[queries, keys, values, smolgen, scale],
+        readonly=[qkv, smolgen, scale],
     )
