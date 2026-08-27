@@ -65,8 +65,12 @@ def _fused_attention_kernel(
     q_ptrs = q_base + offs_m[:, None] * stride_row + offs_d[None, :]
     k_ptrs = k_base + offs_m[:, None] * stride_row + offs_d[None, :]
 
-    q = tl.load(q_ptrs, mask=mask_d[None, :], other=0.0).to(tl.float16)
-    k = tl.load(k_ptrs, mask=mask_d[None, :], other=0.0).to(tl.float16)
+    if block_d == head_depth:
+        q = tl.load(q_ptrs).to(tl.float16)
+        k = tl.load(k_ptrs).to(tl.float16)
+    else:
+        q = tl.load(q_ptrs, mask=mask_d[None, :], other=0.0).to(tl.float16)
+        k = tl.load(k_ptrs, mask=mask_d[None, :], other=0.0).to(tl.float16)
 
     # Q @ K^T: (64, block_d) @ (block_d, 64) -> (64, 64)
     k_t = tl.trans(k)
@@ -94,14 +98,20 @@ def _fused_attention_kernel(
 
     # Load V and compute output: (64, 64) @ (64, block_d) -> (64, block_d)
     v_ptrs = v_base + offs_m[:, None] * stride_row + offs_d[None, :]
-    v = tl.load(v_ptrs, mask=mask_d[None, :], other=0.0).to(tl.float16)
+    if block_d == head_depth:
+        v = tl.load(v_ptrs).to(tl.float16)
+    else:
+        v = tl.load(v_ptrs, mask=mask_d[None, :], other=0.0).to(tl.float16)
     out_val = tl.dot(probs, v, out_dtype=tl.float32).to(tl.float16)
 
     out_head_offset = sample * (_SQUARE_COUNT * model_width) + head * head_depth
     out_ptrs = (
         output + out_head_offset + offs_m[:, None] * model_width + offs_d[None, :]
     )
-    tl.store(out_ptrs, out_val, mask=mask_d[None, :])
+    if block_d == head_depth:
+        tl.store(out_ptrs, out_val)
+    else:
+        tl.store(out_ptrs, out_val, mask=mask_d[None, :])
 
 
 @dataclass(frozen=True, slots=True)

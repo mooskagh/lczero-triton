@@ -29,7 +29,7 @@ _MISH_BRANCH = tl.constexpr(-0.6)
 _POINTER = lc0ex_pb2.PARAMETER_TYPE_POINTER
 # Set this to false when the FP32 accumulator path is required for comparison.
 _USE_FP16_ACCUMULATOR = tl.constexpr(value=True)
-_GROUP_SIZES_M = (1, 8)
+_GROUP_SIZES_M = (1, 4, 8, 16)
 _TILE_CONFIGS = (
     # Large high-throughput tiles (for M>=1024, N>=1024, K>=512)
     (128, 256, 32, 8, 3),

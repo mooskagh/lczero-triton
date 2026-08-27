@@ -25,9 +25,6 @@ from lc0ex import Buffer, ExecutableBuilder, KernelArtifact, SymbolArtifact
 from lc0ex.proto import lc0ex_metadata_pb2, lc0ex_pb2, net_pb2
 from lczero_triton.bt4.kernels.add_vectors import AddVectorsSpecialization
 from lczero_triton.bt4.kernels.batched_matmul import BatchedMatmulSpecialization
-from lczero_triton.bt4.kernels.copy_type_converted import (
-    CopyTypeConvertedSpecialization,
-)
 from lczero_triton.bt4.kernels.expand_planes import ExpandPlanesSpecialization
 from lczero_triton.bt4.kernels.fused_attention import (
     FusedAttentionSpecialization,
@@ -1058,7 +1055,6 @@ def test_output_heads_build_contracts_and_independent_branches(
         "policy_qk",
         "promotion_logits",
         "policy_map",
-        "copy_type_converted",
         "matmul",
         "matmul",
         "matmul",
@@ -1118,9 +1114,6 @@ def test_output_heads_build_contracts_and_independent_branches(
     )
     assert PromotionLogitsSpecialization(2, 8, _ARCHITECTURE) in head_specializations
     assert PolicyMapSpecialization(2, _ARCHITECTURE) in head_specializations
-    assert CopyTypeConvertedSpecialization(2 * 1858, _ARCHITECTURE) in (
-        head_specializations
-    )
     assert (
         MatmulSpecialization(2, 1, 5, _ARCHITECTURE, has_bias=True, activation="relu")
         in head_specializations
@@ -1130,8 +1123,8 @@ def test_output_heads_build_contracts_and_independent_branches(
     head_start = 11
     final_body = arguments[10][0]
     assert arguments[head_start][1] == final_body
-    assert arguments[head_start + 7][1] == final_body
-    assert arguments[head_start + 11][1] == final_body
+    assert arguments[head_start + 6][1] == final_body
+    assert arguments[head_start + 10][1] == final_body
     assert arguments[head_start + 3][0] == arguments[head_start + 4][0]
     assert arguments[head_start + 4][0] == arguments[head_start + 5][1]
     assert nodes[head_start + 5].arguments[2].HasField("symbol")
@@ -1139,8 +1132,8 @@ def test_output_heads_build_contracts_and_independent_branches(
         nodes[head_start + 5].arguments[2].symbol.symbol_name
         == "lczero_bt4_mapping_table"
     )
-    assert head_start + 6 not in nodes[head_start + 7].dependencies
-    assert head_start + 10 not in nodes[head_start + 11].dependencies
+    assert head_start + 5 not in nodes[head_start + 6].dependencies
+    assert head_start + 9 not in nodes[head_start + 10].dependencies
 
 
 def test_policy_embedding_prefers_head_local_weights(

@@ -1289,26 +1289,16 @@ def _policy_head(
             context.batch_size, model_width, context.architecture
         ),
     )
-    mapped = _temporary_f16(context, element_count=context.batch_size * 1858)
     mapping = context.builder.add_symbol(
         compile_symbol(architecture=f"sm_{context.architecture}")
     )
     policy_map(
         context.builder,
         context.kernels,
-        mapped,
+        output,
         records,
         mapping,
         PolicyMapSpecialization(context.batch_size, context.architecture),
-    )
-    copy_type_converted(
-        context.builder,
-        context.kernels,
-        output,
-        mapped,
-        CopyTypeConvertedSpecialization(
-            context.batch_size * 1858, context.architecture
-        ),
     )
 
 
