@@ -78,13 +78,18 @@ _MATMUL_CONFIGS = tuple(
 _MIN_GROUPED_M = 512
 _MIN_GROUP_TILES = 4
 _MAX_SMEM_BYTES = 128 * 1024
-_SMALL_DIM_32 = 32
-_SMALL_DIM_128 = 128
-_SMALL_DIM_256 = 256
-_MAX_K_BLOCK_FOR_SMALL_K = 64
+_DIM_32 = 32
+_DIM_64 = 64
+_DIM_128 = 128
+_DIM_256 = 256
+_DIM_512 = 512
+_DIM_1024 = 1024
+_DEEP_K_THRESHOLD = 2048
+_MAX_LARGE_WARPS = 4
+_MAX_LARGE_STAGES = 3
 
 
-def _prune_matmul_configs(
+def _prune_matmul_configs(  # noqa: C901, PLR0912
     configs: list[triton.Config],
     named_args: Mapping[str, object],
     **kwargs: object,
@@ -106,18 +111,36 @@ def _prune_matmul_configs(
         bn = cast("int", conf.kwargs["block_n"])
         bk = cast("int", conf.kwargs["block_k"])
         gm = cast("int", conf.kwargs["group_size_m"])
+        warps = conf.num_warps
+        stages = conf.num_stages
 
         if gm > 1 and (m_val < _MIN_GROUPED_M or m_val < bm * _MIN_GROUP_TILES):
             continue
-        if n_val <= _SMALL_DIM_32 and bn > _SMALL_DIM_32:
+        if n_val <= _DIM_32 and bn > _DIM_32:
             continue
-        if n_val <= _SMALL_DIM_128 and bn > _SMALL_DIM_128:
+        if n_val <= _DIM_128 and bn > _DIM_128:
             continue
-        if m_val <= _SMALL_DIM_256 and bm > _SMALL_DIM_128:
+        if m_val <= _DIM_256 and bm > _DIM_128:
             continue
-        if k_val <= _SMALL_DIM_256 and bk > _MAX_K_BLOCK_FOR_SMALL_K:
+        if k_val <= _DIM_256 and bk > _DIM_64:
             continue
-        smem_bytes = 2 * (bm * bk + bk * bn) * conf.num_stages
+
+        # Deep-K tiles (bk=128) are specialized for K >= 2048.
+        if k_val < _DEEP_K_THRESHOLD and bk > _DIM_64:
+            continue
+        if k_val >= _DEEP_K_THRESHOLD and bk < _DIM_64:
+            continue
+
+        # For large matrices, prune undersized tiles and suboptimal warp counts.
+        if m_val >= _DIM_1024 and n_val >= _DIM_1024 and k_val >= _DIM_512:
+            if bm < _DIM_64 or bn < _DIM_64 or bk < _DIM_32:
+                continue
+            if warps > _MAX_LARGE_WARPS or stages > _MAX_LARGE_STAGES:
+                continue
+            if bm > _DIM_128 or bn > _DIM_128:
+                continue
+
+        smem_bytes = 2 * (bm * bk + bk * bn) * stages
         if smem_bytes > _MAX_SMEM_BYTES:
             continue
         pruned.append(conf)
