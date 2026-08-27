@@ -52,41 +52,74 @@ def _layer_norm_row(
 ) -> None:
     row = tl.program_id(0)
     offsets = tl.arange(0, block_size)
-    valid = (row < row_count) & (offsets < width)
     pointers = row * width + offsets
 
-    values = tl.load(input_ + pointers, mask=valid, other=0.0).to(tl.float32)
-    if has_bias:
-        biases = tl.load(bias + offsets, mask=valid, other=0.0).to(tl.float32)
-        values += biases
+    if width == block_size:
+        values = tl.load(input_ + pointers).to(tl.float32)
+        if has_bias:
+            biases = tl.load(bias + offsets).to(tl.float32)
+            values += biases
 
-    if activation == _ACTIVATION_MISH:
-        exponential = tl.exp(values)
-        numerator = exponential * exponential + 2.0 * exponential
-        division = values / (numerator + 2.0)
-        values = tl.where(
-            values <= _MISH_BRANCH,
-            numerator * division,
-            values - 2.0 * division,
-        )
-    elif activation == _ACTIVATION_SWISH:
-        values /= 1.0 + tl.exp(-values)
+        if activation == _ACTIVATION_MISH:
+            exponential = tl.exp(values)
+            numerator = exponential * exponential + 2.0 * exponential
+            division = values / (numerator + 2.0)
+            values = tl.where(
+                values <= _MISH_BRANCH,
+                numerator * division,
+                values - 2.0 * division,
+            )
+        elif activation == _ACTIVATION_SWISH:
+            values /= 1.0 + tl.exp(-values)
 
-    if has_skip:
-        alpha_value = tl.load(alpha).to(tl.float32)
-        skip_values = tl.load(skip + pointers, mask=valid, other=0.0).to(tl.float32)
-        values = alpha_value * values + skip_values
+        if has_skip:
+            alpha_value = tl.load(alpha).to(tl.float32)
+            skip_values = tl.load(skip + pointers).to(tl.float32)
+            values = alpha_value * values + skip_values
 
-    values = tl.where(valid, values, 0.0)
-    mean = tl.sum(values, axis=0) / width
-    centered = tl.where(valid, values - mean, 0.0)
-    variance = tl.sum(centered * centered, axis=0) / width
-    normalized = centered / tl.sqrt(variance + epsilon)
+        mean = tl.sum(values, axis=0) / width
+        centered = values - mean
+        variance = tl.sum(centered * centered, axis=0) / width
+        normalized = centered / tl.sqrt(variance + epsilon)
 
-    gamma_values = tl.load(gammas + offsets, mask=valid, other=0.0).to(tl.float32)
-    beta_values = tl.load(betas + offsets, mask=valid, other=0.0).to(tl.float32)
-    result = normalized * gamma_values + beta_values
-    tl.store(output + pointers, result.to(tl.float16), mask=valid)
+        gamma_values = tl.load(gammas + offsets).to(tl.float32)
+        beta_values = tl.load(betas + offsets).to(tl.float32)
+        result = normalized * gamma_values + beta_values
+        tl.store(output + pointers, result.to(tl.float16))
+    else:
+        valid = (row < row_count) & (offsets < width)
+        values = tl.load(input_ + pointers, mask=valid, other=0.0).to(tl.float32)
+        if has_bias:
+            biases = tl.load(bias + offsets, mask=valid, other=0.0).to(tl.float32)
+            values += biases
+
+        if activation == _ACTIVATION_MISH:
+            exponential = tl.exp(values)
+            numerator = exponential * exponential + 2.0 * exponential
+            division = values / (numerator + 2.0)
+            values = tl.where(
+                values <= _MISH_BRANCH,
+                numerator * division,
+                values - 2.0 * division,
+            )
+        elif activation == _ACTIVATION_SWISH:
+            values /= 1.0 + tl.exp(-values)
+
+        if has_skip:
+            alpha_value = tl.load(alpha).to(tl.float32)
+            skip_values = tl.load(skip + pointers, mask=valid, other=0.0).to(tl.float32)
+            values = alpha_value * values + skip_values
+
+        values = tl.where(valid, values, 0.0)
+        mean = tl.sum(values, axis=0) / width
+        centered = tl.where(valid, values - mean, 0.0)
+        variance = tl.sum(centered * centered, axis=0) / width
+        normalized = centered / tl.sqrt(variance + epsilon)
+
+        gamma_values = tl.load(gammas + offsets, mask=valid, other=0.0).to(tl.float32)
+        beta_values = tl.load(betas + offsets, mask=valid, other=0.0).to(tl.float32)
+        result = normalized * gamma_values + beta_values
+        tl.store(output + pointers, result.to(tl.float16), mask=valid)
 
 
 @triton.autotune(

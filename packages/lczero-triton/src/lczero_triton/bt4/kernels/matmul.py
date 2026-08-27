@@ -33,10 +33,13 @@ _GROUP_SIZES_M = (1, 4, 8, 16)
 _TILE_CONFIGS = (
     # Large high-throughput tiles (for M>=1024, N>=1024, K>=512)
     (128, 256, 32, 8, 3),
+    (128, 256, 32, 8, 4),
     (256, 128, 32, 8, 3),
+    (256, 128, 32, 8, 4),
     (128, 128, 64, 4, 3),
     (128, 128, 64, 4, 4),
     (128, 128, 64, 8, 3),
+    (128, 128, 64, 8, 4),
     (128, 128, 32, 4, 3),
     (128, 128, 32, 4, 4),
     (128, 64, 64, 4, 3),
@@ -85,8 +88,8 @@ _DIM_256 = 256
 _DIM_512 = 512
 _DIM_1024 = 1024
 _DEEP_K_THRESHOLD = 2048
-_MAX_LARGE_WARPS = 4
-_MAX_LARGE_STAGES = 3
+_MAX_LARGE_WARPS = 8
+_MAX_LARGE_STAGES = 4
 
 
 def _prune_matmul_configs(  # noqa: C901, PLR0912
@@ -137,7 +140,7 @@ def _prune_matmul_configs(  # noqa: C901, PLR0912
                 continue
             if warps > _MAX_LARGE_WARPS or stages > _MAX_LARGE_STAGES:
                 continue
-            if bm > _DIM_128 or bn > _DIM_128:
+            if bm > _DIM_256 or bn > _DIM_256:
                 continue
 
         smem_bytes = 2 * (bm * bk + bk * bn) * stages
@@ -193,34 +196,50 @@ def _matmul_kernel(
         (block_m, block_n),
         dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
     )
-    for k_block in range(tl.cdiv(k, block_k)):
-        remaining_k = k - k_block * block_k
-        activation_values = tl.load(
-            activation_pointers,
-            mask=(offsets_m[:, None] < m) & (offsets_k[None, :] < remaining_k),
-            other=0.0,
-        )
-        weight_values = tl.load(
-            weight_pointers,
-            mask=(offsets_k[:, None] < remaining_k) & (offsets_n[None, :] < n),
-            other=0.0,
-        )
-        accumulator = tl.dot(
-            activation_values,
-            weight_values,
-            accumulator,
-            out_dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
-        )
-        activation_pointers += block_k
-        weight_pointers += block_k * n
+    if m % block_m == 0 and n % block_n == 0 and k % block_k == 0:
+        for _ in range(0, k // block_k):
+            activation_values = tl.load(activation_pointers)
+            weight_values = tl.load(weight_pointers)
+            accumulator = tl.dot(
+                activation_values,
+                weight_values,
+                accumulator,
+                out_dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
+            )
+            activation_pointers += block_k
+            weight_pointers += block_k * n
+    else:
+        for k_block in range(tl.cdiv(k, block_k)):
+            remaining_k = k - k_block * block_k
+            activation_values = tl.load(
+                activation_pointers,
+                mask=(offsets_m[:, None] < m) & (offsets_k[None, :] < remaining_k),
+                other=0.0,
+            )
+            weight_values = tl.load(
+                weight_pointers,
+                mask=(offsets_k[:, None] < remaining_k) & (offsets_n[None, :] < n),
+                other=0.0,
+            )
+            accumulator = tl.dot(
+                activation_values,
+                weight_values,
+                accumulator,
+                out_dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
+            )
+            activation_pointers += block_k
+            weight_pointers += block_k * n
 
     values = accumulator.to(tl.float32)
     if has_bias:
-        bias_values = tl.load(
-            bias + offsets_n,
-            mask=offsets_n < n,
-            other=0.0,
-        ).to(tl.float32)
+        if n % block_n == 0:
+            bias_values = tl.load(bias + offsets_n).to(tl.float32)
+        else:
+            bias_values = tl.load(
+                bias + offsets_n,
+                mask=offsets_n < n,
+                other=0.0,
+            ).to(tl.float32)
         values += bias_values[None, :]
 
     if activation == _ACTIVATION_MISH:
@@ -240,11 +259,17 @@ def _matmul_kernel(
     output_offsets_m = program_m * block_m + tl.arange(0, block_m)
     output_offsets_n = program_n * block_n + tl.arange(0, block_n)
     output_pointers = output + output_offsets_m[:, None] * n + output_offsets_n[None, :]
-    output_mask = (output_offsets_m[:, None] < m) & (output_offsets_n[None, :] < n)
-    if output_f32:
-        tl.store(output_pointers, values.to(tl.float32), mask=output_mask)
+    if m % block_m == 0 and n % block_n == 0:
+        if output_f32:
+            tl.store(output_pointers, values.to(tl.float32))
+        else:
+            tl.store(output_pointers, values.to(tl.float16))
     else:
-        tl.store(output_pointers, values.to(tl.float16), mask=output_mask)
+        output_mask = (output_offsets_m[:, None] < m) & (output_offsets_n[None, :] < n)
+        if output_f32:
+            tl.store(output_pointers, values.to(tl.float32), mask=output_mask)
+        else:
+            tl.store(output_pointers, values.to(tl.float16), mask=output_mask)
 
 
 @triton.autotune(
@@ -294,34 +319,50 @@ def _matmul_skip_kernel(
         (block_m, block_n),
         dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
     )
-    for k_block in range(tl.cdiv(k, block_k)):
-        remaining_k = k - k_block * block_k
-        activation_values = tl.load(
-            activation_pointers,
-            mask=(offsets_m[:, None] < m) & (offsets_k[None, :] < remaining_k),
-            other=0.0,
-        )
-        weight_values = tl.load(
-            weight_pointers,
-            mask=(offsets_k[:, None] < remaining_k) & (offsets_n[None, :] < n),
-            other=0.0,
-        )
-        accumulator = tl.dot(
-            activation_values,
-            weight_values,
-            accumulator,
-            out_dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
-        )
-        activation_pointers += block_k
-        weight_pointers += block_k * n
+    if m % block_m == 0 and n % block_n == 0 and k % block_k == 0:
+        for _ in range(0, k // block_k):
+            activation_values = tl.load(activation_pointers)
+            weight_values = tl.load(weight_pointers)
+            accumulator = tl.dot(
+                activation_values,
+                weight_values,
+                accumulator,
+                out_dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
+            )
+            activation_pointers += block_k
+            weight_pointers += block_k * n
+    else:
+        for k_block in range(tl.cdiv(k, block_k)):
+            remaining_k = k - k_block * block_k
+            activation_values = tl.load(
+                activation_pointers,
+                mask=(offsets_m[:, None] < m) & (offsets_k[None, :] < remaining_k),
+                other=0.0,
+            )
+            weight_values = tl.load(
+                weight_pointers,
+                mask=(offsets_k[:, None] < remaining_k) & (offsets_n[None, :] < n),
+                other=0.0,
+            )
+            accumulator = tl.dot(
+                activation_values,
+                weight_values,
+                accumulator,
+                out_dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
+            )
+            activation_pointers += block_k
+            weight_pointers += block_k * n
 
     values = accumulator.to(tl.float32)
     if has_bias:
-        bias_values = tl.load(
-            bias + offsets_n,
-            mask=offsets_n < n,
-            other=0.0,
-        ).to(tl.float32)
+        if n % block_n == 0:
+            bias_values = tl.load(bias + offsets_n).to(tl.float32)
+        else:
+            bias_values = tl.load(
+                bias + offsets_n,
+                mask=offsets_n < n,
+                other=0.0,
+            ).to(tl.float32)
         values += bias_values[None, :]
 
     if activation == _ACTIVATION_MISH:
@@ -343,16 +384,25 @@ def _matmul_skip_kernel(
     output_offsets_m = program_m * block_m + tl.arange(0, block_m)
     output_offsets_n = program_n * block_n + tl.arange(0, block_n)
     skip_pointers = skip + output_offsets_m[:, None] * n + output_offsets_n[None, :]
-    skip_mask = (output_offsets_m[:, None] < m) & (output_offsets_n[None, :] < n)
-    skip_values = tl.load(skip_pointers, mask=skip_mask, other=0.0).to(tl.float32)
+    if m % block_m == 0 and n % block_n == 0:
+        skip_values = tl.load(skip_pointers).to(tl.float32)
+    else:
+        skip_mask = (output_offsets_m[:, None] < m) & (output_offsets_n[None, :] < n)
+        skip_values = tl.load(skip_pointers, mask=skip_mask, other=0.0).to(tl.float32)
     values = values + skip_values
 
     output_pointers = output + output_offsets_m[:, None] * n + output_offsets_n[None, :]
-    output_mask = (output_offsets_m[:, None] < m) & (output_offsets_n[None, :] < n)
-    if output_f32:
-        tl.store(output_pointers, values.to(tl.float32), mask=output_mask)
+    if m % block_m == 0 and n % block_n == 0:
+        if output_f32:
+            tl.store(output_pointers, values.to(tl.float32))
+        else:
+            tl.store(output_pointers, values.to(tl.float16))
     else:
-        tl.store(output_pointers, values.to(tl.float16), mask=output_mask)
+        output_mask = (output_offsets_m[:, None] < m) & (output_offsets_n[None, :] < n)
+        if output_f32:
+            tl.store(output_pointers, values.to(tl.float32), mask=output_mask)
+        else:
+            tl.store(output_pointers, values.to(tl.float16), mask=output_mask)
 
 
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
