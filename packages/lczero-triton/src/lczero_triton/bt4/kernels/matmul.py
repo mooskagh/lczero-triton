@@ -169,6 +169,7 @@ def _matmul_kernel(
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     group_size_m: tl.constexpr,
+    output_f32: tl.constexpr = False,
 ) -> None:
     """Compute one grouped-M tile of GEMM with optional bias and activation."""
     program_id = tl.program_id(0)
@@ -240,7 +241,10 @@ def _matmul_kernel(
     output_offsets_n = program_n * block_n + tl.arange(0, block_n)
     output_pointers = output + output_offsets_m[:, None] * n + output_offsets_n[None, :]
     output_mask = (output_offsets_m[:, None] < m) & (output_offsets_n[None, :] < n)
-    tl.store(output_pointers, values.to(tl.float16), mask=output_mask)
+    if output_f32:
+        tl.store(output_pointers, values.to(tl.float32), mask=output_mask)
+    else:
+        tl.store(output_pointers, values.to(tl.float16), mask=output_mask)
 
 
 @triton.autotune(
@@ -266,6 +270,7 @@ def _matmul_skip_kernel(
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     group_size_m: tl.constexpr,
+    output_f32: tl.constexpr = False,
 ) -> None:
     """Compute GEMM with optional bias, activation, alpha scaling, and residual skip."""
     program_id = tl.program_id(0)
@@ -344,7 +349,10 @@ def _matmul_skip_kernel(
 
     output_pointers = output + output_offsets_m[:, None] * n + output_offsets_n[None, :]
     output_mask = (output_offsets_m[:, None] < m) & (output_offsets_n[None, :] < n)
-    tl.store(output_pointers, values.to(tl.float16), mask=output_mask)
+    if output_f32:
+        tl.store(output_pointers, values.to(tl.float32), mask=output_mask)
+    else:
+        tl.store(output_pointers, values.to(tl.float16), mask=output_mask)
 
 
 def _autotune_grid(configuration: Mapping[str, object]) -> tuple[int]:
@@ -382,13 +390,14 @@ class MatmulSpecialization:
     has_bias: bool = False
     has_skip: bool = False
     activation: Activation = "none"
+    output_f32: bool = False
 
 
 def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
-    """Autotune and compile one contiguous FP16 dense GEMM specialization."""
+    """Autotune and compile one contiguous dense GEMM specialization."""
     output = torch.empty(
         (specialization.m, specialization.n),
-        dtype=torch.float16,
+        dtype=torch.float32 if specialization.output_f32 else torch.float16,
         device="cuda",
     )
     activations = torch.empty(
@@ -427,6 +436,7 @@ def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
             specialization.k,
             specialization.has_bias,
             activation_code,
+            output_f32=specialization.output_f32,
         )
         selected = _matmul_skip_kernel.best_config
         parameters = (_POINTER,) * 6
@@ -441,6 +451,7 @@ def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
             specialization.k,
             specialization.has_bias,
             activation_code,
+            output_f32=specialization.output_f32,
         )
         selected = _matmul_kernel.best_config
         parameters = (_POINTER,) * 4

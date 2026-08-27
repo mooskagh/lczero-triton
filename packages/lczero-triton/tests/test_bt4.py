@@ -1058,11 +1058,9 @@ def test_output_heads_build_contracts_and_independent_branches(
         "matmul",
         "matmul",
         "matmul",
-        "copy_type_converted",
         "matmul",
         "matmul",
         "matmul",
-        "copy_type_converted",
     ]
     assert "softmax_64" not in head_functions
 
@@ -1115,7 +1113,9 @@ def test_output_heads_build_contracts_and_independent_branches(
     assert PromotionLogitsSpecialization(2, 8, _ARCHITECTURE) in head_specializations
     assert PolicyMapSpecialization(2, _ARCHITECTURE) in head_specializations
     assert (
-        MatmulSpecialization(2, 1, 5, _ARCHITECTURE, has_bias=True, activation="relu")
+        MatmulSpecialization(
+            2, 1, 5, _ARCHITECTURE, has_bias=True, activation="relu", output_f32=True
+        )
         in head_specializations
     )
 
@@ -1124,7 +1124,7 @@ def test_output_heads_build_contracts_and_independent_branches(
     final_body = arguments[10][0]
     assert arguments[head_start][1] == final_body
     assert arguments[head_start + 6][1] == final_body
-    assert arguments[head_start + 10][1] == final_body
+    assert arguments[head_start + 9][1] == final_body
     assert arguments[head_start + 3][0] == arguments[head_start + 4][0]
     assert arguments[head_start + 4][0] == arguments[head_start + 5][1]
     assert nodes[head_start + 5].arguments[2].HasField("symbol")
@@ -1133,7 +1133,7 @@ def test_output_heads_build_contracts_and_independent_branches(
         == "lczero_bt4_mapping_table"
     )
     assert head_start + 5 not in nodes[head_start + 6].dependencies
-    assert head_start + 9 not in nodes[head_start + 10].dependencies
+    assert head_start + 8 not in nodes[head_start + 9].dependencies
 
 
 def test_policy_embedding_prefers_head_local_weights(

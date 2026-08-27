@@ -1452,11 +1452,10 @@ def _dense_output_head(  # noqa: PLR0913
         ),
         bias=hidden_bias,
     )
-    result = _temporary_f16(context, element_count=context.batch_size * output_width)
     matmul(
         context.builder,
         context.kernels,
-        result,
+        output,
         hidden,
         result_weights,
         MatmulSpecialization(
@@ -1466,17 +1465,9 @@ def _dense_output_head(  # noqa: PLR0913
             context.architecture,
             has_bias=True,
             activation=final_activation,
+            output_f32=True,
         ),
         bias=result_bias,
-    )
-    copy_type_converted(
-        context.builder,
-        context.kernels,
-        output,
-        result,
-        CopyTypeConvertedSpecialization(
-            context.batch_size * output_width, context.architecture
-        ),
     )
 
 
