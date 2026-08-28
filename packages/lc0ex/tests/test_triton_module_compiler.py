@@ -87,3 +87,35 @@ def test_artifact_from_triton_rejects_scratch_allocations() -> None:
             grid=(2, 3, 1),
             parameters=(lc0ex_pb2.PARAMETER_TYPE_POINTER,),
         )
+
+
+def test_artifact_from_triton_extracts_runtime_ns_from_autotuner() -> None:
+    """The adapter extracts runtime_ns in nanoseconds from an autotuner."""
+    compiled = _FakeCompiledKernel(
+        name="kernel_exported",
+        asm={"cubin": b"fake cubin"},
+        metadata=_FakeMetadata(
+            num_warps=4,
+            shared=_SHARED_MEMORY_BYTES,
+            target=_FakeTarget(backend="cuda", arch=120, warp_size=32),
+        ),
+    )
+
+    class _FakeConfig:
+        pass
+
+    cfg = _FakeConfig()
+
+    class _FakeAutotuner:
+        def __init__(self) -> None:
+            self.best_config = cfg
+            self.configs_timings = {cfg: [0.042, 0.040, 0.045]}
+
+    expected_runtime_ns = 42_000
+    artifact = artifact_from_triton(
+        compiled,
+        grid=(1, 1, 1),
+        parameters=(),
+        autotuner=_FakeAutotuner(),
+    )
+    assert artifact.runtime_ns == expected_runtime_ns

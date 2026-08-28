@@ -295,6 +295,7 @@ def compile_batched_matmul(
             specialization.k,
         )
         selected = _attention_v_kernel.best_config
+        autotuner = _attention_v_kernel
         parameters = (_POINTER, _POINTER, _POINTER)
     else:
         scale = torch.ones(1, dtype=torch.float16, device="cuda")
@@ -312,6 +313,7 @@ def compile_batched_matmul(
             output_batch_stride,
         )
         selected = _qk_kernel.best_config
+        autotuner = _qk_kernel
         parameters = (_POINTER, _POINTER, _POINTER, _POINTER)
 
     return artifact_from_triton(
@@ -323,6 +325,7 @@ def compile_batched_matmul(
             specialization.batch_count,
         ),
         parameters=parameters,
+        autotuner=autotuner,
     )
 
 

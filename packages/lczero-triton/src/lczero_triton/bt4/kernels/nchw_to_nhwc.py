@@ -121,6 +121,7 @@ def compile_nchw_to_nhwc(
         compiled,
         grid=_artifact_grid(selected.kwargs, element_count),
         parameters=(_POINTER, _POINTER),
+        autotuner=_nchw_to_nhwc_kernel,
     )
 
 

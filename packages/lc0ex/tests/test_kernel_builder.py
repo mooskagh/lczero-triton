@@ -30,6 +30,7 @@ def _artifact(
     *,
     function: str = "kernel",
     parameters: tuple[lc0ex_pb2.ParameterType, ...] = (POINTER,),
+    runtime_ns: int | None = None,
 ) -> KernelArtifact:
     """Create a small generic pointer-ABI kernel artifact."""
     return KernelArtifact(
@@ -40,6 +41,7 @@ def _artifact(
         grid=(2, 3, 1),
         block=(128, 1, 1),
         dynamic_shared_memory_bytes=256,
+        runtime_ns=runtime_ns,
     )
 
 
@@ -195,3 +197,16 @@ def test_symbol_argument_serializes_as_immutable_module_pointer() -> None:
     assert argument.symbol.binary_idx == 0
     assert argument.symbol.symbol_name == "mapping_table"
     assert not argument.HasField("allocation")
+
+
+def test_kernel_runtime_ns_is_serialized() -> None:
+    """Kernel runtime_ns is serialized into the NeuralExecutable protobuf."""
+    builder = _builder()
+    program = builder.program(name="main")
+    kernel = builder.add_kernel(_artifact(runtime_ns=123_456))
+    first = _external(builder, "first")
+    program.call(kernel, first)
+
+    executable = builder.build()
+
+    assert executable.kernels[0].runtime_ns == 123_456

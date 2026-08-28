@@ -82,6 +82,7 @@ def compile_copy_type_converted(
         compiled,
         grid=_artifact_grid(selected.kwargs, specialization.element_count),
         parameters=(_POINTER, _POINTER),
+        autotuner=_copy_type_converted_kernel,
     )
 
 

@@ -203,6 +203,7 @@ def compile_promotion_logits(
         compiled,
         grid=_artifact_grid(selected.kwargs, specialization.batch_size),
         parameters=(_POINTER, _POINTER, _POINTER),
+        autotuner=_promotion_logits_kernel,
     )
 
 

@@ -45,13 +45,30 @@ def compile_ptx(ptx: str, *, architecture: str) -> bytes:
         return cubin_path.read_bytes()
 
 
+def _runtime_ns_from_autotuner(autotuner: object) -> int | None:
+    """Extract the autotuned runtime of the best config in nanoseconds."""
+    configs_timings = getattr(autotuner, "configs_timings", None)
+    best_config = getattr(autotuner, "best_config", None)
+    if configs_timings and best_config:
+        timing = configs_timings.get(best_config)
+        if timing is not None:
+            ms = timing[0] if isinstance(timing, (list, tuple)) else timing
+            return int(float(ms) * 1e6)
+    return None
+
+
 def artifact_from_triton(
     compiled: Any,
     *,
     grid: tuple[int, int, int],
     parameters: tuple[lc0ex_pb2.ParameterType, ...],
+    runtime_ns: int | None = None,
+    autotuner: object = None,
 ) -> KernelArtifact:
     """Convert one compiled Triton entry point into a linker artifact."""
+    if runtime_ns is None and autotuner is not None:
+        runtime_ns = _runtime_ns_from_autotuner(autotuner)
+
     block = (
         compiled.metadata.num_warps * compiled.metadata.target.warp_size,
         1,
@@ -71,4 +88,5 @@ def artifact_from_triton(
         grid=grid,
         block=block,
         dynamic_shared_memory_bytes=compiled.metadata.shared,
+        runtime_ns=runtime_ns,
     )

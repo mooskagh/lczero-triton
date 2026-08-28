@@ -371,11 +371,13 @@ class ExecutableBuilder:
 
         for handle, artifact in self._kernels.items():
             binary_idx = binary_index(artifact.binary_format, artifact.binary_data)
-            executable.kernels.add(
+            kernel_proto = executable.kernels.add(
                 binary_idx=binary_idx,
                 function=artifact.function,
                 parameters=artifact.parameters,
             )
+            if artifact.runtime_ns is not None:
+                kernel_proto.runtime_ns = artifact.runtime_ns
             kernel_indices[handle] = len(executable.kernels) - 1
         symbol_locations = {
             handle: (

@@ -124,6 +124,7 @@ def compile_add_vectors(
         compiled,
         grid=_artifact_grid(selected.kwargs, specialization.element_count),
         parameters=(_POINTER, _POINTER, _POINTER),
+        autotuner=_add_vectors_kernel,
     )
 
 

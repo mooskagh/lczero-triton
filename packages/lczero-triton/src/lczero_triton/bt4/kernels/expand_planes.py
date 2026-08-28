@@ -106,6 +106,7 @@ def compile_expand_planes(
             specialization.square_count,
         ),
         parameters=(_POINTER, _POINTER, _POINTER),
+        autotuner=_expand_planes_kernel,
     )
 
 

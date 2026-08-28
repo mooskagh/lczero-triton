@@ -149,6 +149,7 @@ def compile_preprocess_attention_body(
             output_channels,
         ),
         parameters=(_POINTER, _POINTER, _POINTER),
+        autotuner=_preprocess_attention_body_kernel,
     )
 
 

@@ -127,6 +127,7 @@ def compile_add_bias_batched(
         compiled,
         grid=_artifact_grid(selected.kwargs, element_count),
         parameters=(_POINTER, _POINTER, _POINTER),
+        autotuner=_add_bias_batched_kernel,
     )
 
 

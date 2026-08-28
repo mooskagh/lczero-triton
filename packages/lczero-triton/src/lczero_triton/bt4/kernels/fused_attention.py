@@ -174,6 +174,7 @@ def compile_fused_attention(
         compiled,
         grid=(specialization.batch_count, 1, 1),
         parameters=(_POINTER, _POINTER, _POINTER, _POINTER),
+        autotuner=_fused_attention_kernel,
     )
 
 

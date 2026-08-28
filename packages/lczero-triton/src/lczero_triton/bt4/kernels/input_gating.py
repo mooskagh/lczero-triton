@@ -117,6 +117,7 @@ def compile_input_gating(
         compiled,
         grid=_artifact_grid(selected.kwargs, element_count),
         parameters=(_POINTER, _POINTER, _POINTER, _POINTER),
+        autotuner=_input_gating_kernel,
     )
 
 

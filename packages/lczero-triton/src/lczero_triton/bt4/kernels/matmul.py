@@ -527,6 +527,7 @@ def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
             output_f32=specialization.output_f32,
         )
         selected = _matmul_skip_kernel.best_config
+        autotuner = _matmul_skip_kernel
         parameters = (_POINTER,) * 6
     else:
         compiled = _matmul_kernel[_autotune_grid](
@@ -542,6 +543,7 @@ def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
             output_f32=specialization.output_f32,
         )
         selected = _matmul_kernel.best_config
+        autotuner = _matmul_kernel
         parameters = (_POINTER,) * 4
 
     return artifact_from_triton(
@@ -552,6 +554,7 @@ def compile_matmul(specialization: MatmulSpecialization) -> KernelArtifact:
             specialization.n,
         ),
         parameters=parameters,
+        autotuner=autotuner,
     )
 
 

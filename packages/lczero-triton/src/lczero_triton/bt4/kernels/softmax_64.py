@@ -114,6 +114,7 @@ def compile_softmax_64(
         compiled,
         grid=_artifact_grid(selected.kwargs, specialization.row_count),
         parameters=(_POINTER, _POINTER, _POINTER),
+        autotuner=_softmax_64_kernel,
     )
 
 

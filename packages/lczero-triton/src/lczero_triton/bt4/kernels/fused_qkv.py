@@ -354,6 +354,7 @@ def compile_fused_qkv_projection(
             specialization.value_width,
         ),
         parameters=(_POINTER,) * 10,
+        autotuner=_fused_qkv_projection_kernel,
     )
 
 
@@ -408,6 +409,7 @@ def compile_fused_qkv_bias(
             specialization.value_width,
         ),
         parameters=(_POINTER,) * 9,
+        autotuner=_fused_qkv_bias_kernel,
     )
 
 

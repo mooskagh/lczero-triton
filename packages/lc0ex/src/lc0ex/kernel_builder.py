@@ -16,6 +16,7 @@ class KernelArtifact:
     grid: tuple[int, int, int]
     block: tuple[int, int, int]
     dynamic_shared_memory_bytes: int
+    runtime_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True, eq=False)

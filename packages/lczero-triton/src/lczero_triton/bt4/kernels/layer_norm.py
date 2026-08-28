@@ -255,6 +255,7 @@ def compile_layer_norm(
             specialization.has_bias,
             block_size,
         )
+        autotuner = _layer_norm_skip_kernel
         parameters = (_POINTER,) * 7
     else:
         compiled = _layer_norm_kernel[_autotune_grid](
@@ -270,12 +271,14 @@ def compile_layer_norm(
             specialization.has_bias,
             block_size,
         )
+        autotuner = _layer_norm_kernel
         parameters = (_POINTER,) * 5
 
     return artifact_from_triton(
         compiled,
         grid=_artifact_grid(specialization.row_count),
         parameters=parameters,
+        autotuner=autotuner,
     )
 
 

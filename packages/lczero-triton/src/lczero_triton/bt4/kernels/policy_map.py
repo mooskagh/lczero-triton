@@ -117,6 +117,7 @@ def compile_policy_map(
         compiled,
         grid=_artifact_grid(selected.kwargs, element_count),
         parameters=(_POINTER, _POINTER, _POINTER),
+        autotuner=_policy_map_kernel,
     )
 
 
