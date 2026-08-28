@@ -11,6 +11,7 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
+from lczero_triton.bt4.kernels._autotune import cold_do_bench
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 Activation = Literal["none", "mish", "relu", "swish"]
@@ -32,6 +33,14 @@ _USE_FP16_ACCUMULATOR = tl.constexpr(value=True)
 _GROUP_SIZES_M = (1, 4, 8, 16)
 _TILE_CONFIGS = (
     # Large high-throughput tiles (for M>=1024, N>=1024, K>=512)
+    (256, 64, 64, 4, 3),
+    (64, 256, 64, 4, 3),
+    (256, 64, 64, 4, 4),
+    (64, 256, 64, 4, 4),
+    (256, 64, 64, 8, 3),
+    (64, 256, 64, 8, 3),
+    (256, 128, 64, 8, 3),
+    (128, 256, 64, 8, 3),
     (128, 256, 32, 8, 3),
     (128, 256, 32, 8, 4),
     (256, 128, 32, 8, 3),
@@ -86,13 +95,14 @@ _MATMUL_CONFIGS = tuple(
 
 _MIN_GROUPED_M = 512
 _MIN_GROUP_TILES = 4
-_MAX_SMEM_BYTES = 128 * 1024
+_MAX_SMEM_BYTES = 160 * 1024
 _DIM_32 = 32
 _DIM_64 = 64
 _DIM_128 = 128
 _DIM_256 = 256
 _DIM_512 = 512
 _DIM_1024 = 1024
+_DIM_4096 = 4096
 _DEEP_K_THRESHOLD = 2048
 _MAX_LARGE_WARPS = 8
 _MAX_LARGE_STAGES = 4
@@ -140,8 +150,8 @@ def _prune_matmul_configs(  # noqa: C901, PLR0912
         if k_val >= _DEEP_K_THRESHOLD and bk < _DIM_64:
             continue
 
-        # For large matrices, prune undersized tiles and suboptimal warp counts.
-        if m_val >= _DIM_1024 and n_val >= _DIM_1024 and k_val >= _DIM_512:
+        # For large matrices, prune undersized tiles and suboptimal warps.
+        if m_val >= _DIM_1024 and n_val >= _DIM_1024 and k_val >= _DIM_256:
             if bm < _DIM_64 or bn < _DIM_64 or bk < _DIM_32:
                 continue
             if warps > _MAX_LARGE_WARPS or stages > _MAX_LARGE_STAGES:
@@ -161,10 +171,11 @@ def _prune_matmul_configs(  # noqa: C901, PLR0912
     configs=list(_MATMUL_CONFIGS),
     key=["m", "n", "k", "has_bias", "activation"],
     prune_configs_by={"early_config_prune": _prune_matmul_configs},
+    do_bench=cold_do_bench,
     cache_results=True,
 )
 @triton.jit
-def _matmul_kernel(
+def _matmul_kernel(  # noqa: C901, PLR0912, PLR0915
     output,
     activations,
     weights,
@@ -178,20 +189,30 @@ def _matmul_kernel(
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     group_size_m: tl.constexpr,
-    output_f32: tl.constexpr = False,
+    output_f32: tl.constexpr = False,  # noqa: FBT002
 ) -> None:
     """Compute one grouped-M tile of GEMM with optional bias and activation."""
     program_id = tl.program_id(0)
-    program_count_m = tl.cdiv(m, block_m)
-    program_count_n = tl.cdiv(n, block_n)
-    programs_per_group = group_size_m * program_count_n
-    group_id = program_id // programs_per_group
-    first_program_m = group_id * group_size_m
-    group_program_count_m = min(program_count_m - first_program_m, group_size_m)
-    program_m = first_program_m + (
-        (program_id % programs_per_group) % group_program_count_m
-    )
-    program_n = (program_id % programs_per_group) // group_program_count_m
+    program_count_m: tl.constexpr = tl.cdiv(m, block_m)
+    program_count_n: tl.constexpr = tl.cdiv(n, block_n)
+    if group_size_m == 1:
+        program_m = program_id // program_count_n
+        program_n = program_id % program_count_n
+    elif program_count_m % group_size_m == 0:
+        programs_per_group: tl.constexpr = group_size_m * program_count_n
+        group_id = program_id // programs_per_group
+        first_program_m = group_id * group_size_m
+        program_m = first_program_m + ((program_id % programs_per_group) % group_size_m)
+        program_n = (program_id % programs_per_group) // group_size_m
+    else:
+        programs_per_group = group_size_m * program_count_n
+        group_id = program_id // programs_per_group
+        first_program_m = group_id * group_size_m
+        group_program_count_m = min(program_count_m - first_program_m, group_size_m)
+        program_m = first_program_m + (
+            (program_id % programs_per_group) % group_program_count_m
+        )
+        program_n = (program_id % programs_per_group) // group_program_count_m
 
     offsets_m = program_m * block_m + tl.arange(0, block_m)
     offsets_n = program_n * block_n + tl.arange(0, block_n)
@@ -203,7 +224,7 @@ def _matmul_kernel(
         dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
     )
     if m % block_m == 0 and n % block_n == 0 and k % block_k == 0:
-        for _ in range(0, k // block_k):
+        for _ in range(k // block_k):
             activation_values = tl.load(activation_pointers)
             weight_values = tl.load(weight_pointers)
             accumulator = tl.dot(
@@ -282,10 +303,11 @@ def _matmul_kernel(
     configs=list(_MATMUL_CONFIGS),
     key=["m", "n", "k", "has_bias", "activation"],
     prune_configs_by={"early_config_prune": _prune_matmul_configs},
+    do_bench=cold_do_bench,
     cache_results=True,
 )
 @triton.jit
-def _matmul_skip_kernel(
+def _matmul_skip_kernel(  # noqa: C901, PLR0912, PLR0915
     output,
     activations,
     weights,
@@ -301,20 +323,30 @@ def _matmul_skip_kernel(
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     group_size_m: tl.constexpr,
-    output_f32: tl.constexpr = False,
+    output_f32: tl.constexpr = False,  # noqa: FBT002
 ) -> None:
     """Compute GEMM with optional bias, activation, alpha scaling, and residual skip."""
     program_id = tl.program_id(0)
-    program_count_m = tl.cdiv(m, block_m)
-    program_count_n = tl.cdiv(n, block_n)
-    programs_per_group = group_size_m * program_count_n
-    group_id = program_id // programs_per_group
-    first_program_m = group_id * group_size_m
-    group_program_count_m = min(program_count_m - first_program_m, group_size_m)
-    program_m = first_program_m + (
-        (program_id % programs_per_group) % group_program_count_m
-    )
-    program_n = (program_id % programs_per_group) // group_program_count_m
+    program_count_m: tl.constexpr = tl.cdiv(m, block_m)
+    program_count_n: tl.constexpr = tl.cdiv(n, block_n)
+    if group_size_m == 1:
+        program_m = program_id // program_count_n
+        program_n = program_id % program_count_n
+    elif program_count_m % group_size_m == 0:
+        programs_per_group: tl.constexpr = group_size_m * program_count_n
+        group_id = program_id // programs_per_group
+        first_program_m = group_id * group_size_m
+        program_m = first_program_m + ((program_id % programs_per_group) % group_size_m)
+        program_n = (program_id % programs_per_group) // group_size_m
+    else:
+        programs_per_group = group_size_m * program_count_n
+        group_id = program_id // programs_per_group
+        first_program_m = group_id * group_size_m
+        group_program_count_m = min(program_count_m - first_program_m, group_size_m)
+        program_m = first_program_m + (
+            (program_id % programs_per_group) % group_program_count_m
+        )
+        program_n = (program_id % programs_per_group) // group_program_count_m
 
     offsets_m = program_m * block_m + tl.arange(0, block_m)
     offsets_n = program_n * block_n + tl.arange(0, block_n)
@@ -326,7 +358,7 @@ def _matmul_skip_kernel(
         dtype=tl.float16 if _USE_FP16_ACCUMULATOR else tl.float32,
     )
     if m % block_m == 0 and n % block_n == 0 and k % block_k == 0:
-        for _ in range(0, k // block_k):
+        for _ in range(k // block_k):
             activation_values = tl.load(activation_pointers)
             weight_values = tl.load(weight_pointers)
             accumulator = tl.dot(

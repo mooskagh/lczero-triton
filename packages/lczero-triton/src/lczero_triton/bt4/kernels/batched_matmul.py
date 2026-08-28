@@ -11,6 +11,7 @@ from lc0ex import Buffer, KernelArtifact, ProgramBuilder
 from lc0ex.proto import lc0ex_pb2
 from lc0ex.triton_module_compiler import artifact_from_triton
 
+from lczero_triton.bt4.kernels._autotune import cold_do_bench
 from lczero_triton.bt4.kernels._cache import KernelCache
 
 BatchedMatmulOperation = Literal["body_qk", "body_attention_v", "policy_qk"]
@@ -62,6 +63,7 @@ def _matmul_configs() -> list[triton.Config]:
         "k",
         "output_batch_stride",
     ],
+    do_bench=cold_do_bench,
     cache_results=True,
 )
 @triton.jit
@@ -144,6 +146,7 @@ def _qk_kernel(
 @triton.autotune(
     configs=_matmul_configs(),
     key=["batch_count", "heads_per_sample", "m", "n", "k"],
+    do_bench=cold_do_bench,
     cache_results=True,
 )
 @triton.jit

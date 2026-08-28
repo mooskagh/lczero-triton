@@ -34,7 +34,7 @@ def _layer_norm_configs() -> list[triton.Config]:
 
 
 @triton.jit
-def _layer_norm_row(
+def _layer_norm_row(  # noqa: PLR0915
     output,
     input_,
     bias,

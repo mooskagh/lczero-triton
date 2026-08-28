@@ -22,10 +22,6 @@ from lczero_triton.bt4.kernels.batched_matmul import (
     BatchedMatmulSpecialization,
     batched_matmul,
 )
-from lczero_triton.bt4.kernels.copy_type_converted import (
-    CopyTypeConvertedSpecialization,
-    copy_type_converted,
-)
 from lczero_triton.bt4.kernels.expand_planes import (
     ExpandPlanesSpecialization,
     expand_planes,
